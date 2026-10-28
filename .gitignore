@@ -1,0 +1,8 @@
+.superpowers/
+.agent/
+.claude/settings.local.json
+*.log
+__pycache__/
+/target/
+.claude/worktrees/
+plugins/thoth/.claude-plugin/types/

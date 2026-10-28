@@ -1,0 +1,26 @@
+{
+  "name": "thoth",
+  "version": "0.1.8",
+  "description": "Dispatch and review implementation work through Thoth.",
+  "author": { "name": "Thoth contributors" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Panel language",
+      "description": "Language of the Thoth panel, its notifications and buttons.",
+      "default": "en",
+      "options": ["en", "zh-TW"]
+    },
+    "thoth_home": {
+      "type": "string",
+      "title": "Thoth state directory",
+      "description": "When set, passed to thoth as THOTH_HOME; leave empty to use thoth's own default."
+    },
+    "thoth_bin": {
+      "type": "string",
+      "title": "thoth executable",
+      "description": "Path of the thoth executable; leave empty to use thoth on PATH."
+    }
+  }
+}

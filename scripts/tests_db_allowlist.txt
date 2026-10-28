@@ -1,0 +1,55 @@
+# tests-no-db allowlist (TESTS-1): how many lines of each test file may still
+# mention rusqlite, Connection::open, state.db or global.db. Checked by
+# scripts/check_tests_no_db.py; regenerate the numbers with --print-counts.
+# A number only goes down: lower it when a file is cleaned up (TESTS-2 reads,
+# TESTS-3 writes); a file not listed here must have no such line.
+# tests/common/mod.rs keeps state_db, state_conn, global_conn and seed_run on
+# purpose (fixture writes; no CLI creates a queued run without a worker).
+tests/antigravity.rs 2
+tests/auto_dispatch.rs 1
+tests/checks.rs 2
+tests/commander_approval.rs 1
+tests/common/mod.rs 8
+tests/control.rs 3
+tests/decision.rs 1
+tests/decision_table.rs 1
+tests/doctor.rs 2
+tests/evidence.rs 3
+tests/failure_classes.rs 3
+tests/handoff.rs 1
+tests/init.rs 1
+tests/launch_choice.rs 1
+tests/live_quota.rs 1
+tests/live_quota_auto.rs 1
+tests/live_quota_claude.rs 1
+tests/live_quota_codex.rs 1
+tests/live_runs.rs 1
+tests/login_restore.rs 1
+tests/models.rs 3
+tests/outcomes.rs 4
+tests/plan_label.rs 2
+tests/profile.rs 2
+tests/profile_check.rs 1
+tests/profile_login.rs 2
+tests/protected.rs 1
+tests/quota_reliability.rs 6
+tests/records.rs 1
+tests/report.rs 1
+tests/report_refresh.rs 3
+tests/report_table.rs 1
+tests/recommend_facts.rs 1
+tests/review.rs 1
+tests/review_packet.rs 1
+tests/rework.rs 2
+tests/run_quota.rs 1
+tests/run_quota_windows.rs 1
+tests/runner.rs 2
+tests/scores_auto_refresh.rs 1
+tests/setup.rs 2
+tests/spec_review.rs 1
+tests/spec_review_start.rs 1
+tests/state_dir.rs 4
+tests/task.rs 1
+tests/transient_retry.rs 3
+tests/usage_recommend.rs 6
+tests/verify_missing.rs 2

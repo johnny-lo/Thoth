@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "version": "1.0.0",
+  "generated_at": "2026-09-29T08:00:00.000Z",
+  "license": "Attribution required — cite aistupidlevel.info as the source.",
+  "period": "latest",
+  "sort_by": "combined",
+  "count": 4,
+  "data": [
+    {"id":"1","name":"claude-sonnet-5","provider":"anthropic","currentScore":88,"trend":"up","status":"good","confidenceLower":86.2,"confidenceUpper":89.4,"lastUpdated":"2026-09-29T07:00:00.000Z"},
+    {"id":"2","name":"claude-opus-5-5","provider":"anthropic","currentScore":85,"trend":"up","status":"warning","confidenceLower":82.1,"confidenceUpper":87.3,"lastUpdated":"2026-09-29T07:01:00.000Z"},
+    {"id":"3","name":"gpt-5.6-luna","provider":"openai","currentScore":91,"trend":"down","status":"good","confidenceLower":89.5,"confidenceUpper":92.2,"lastUpdated":"2026-09-29T07:02:00.000Z"},
+    {"id":"4","name":"gpt-5.6-sol","provider":"openai","currentScore":75,"trend":"up","status":"good","confidenceLower":76.2,"confidenceUpper":84.6,"lastUpdated":"2026-09-29T07:03:00.000Z"}
+  ]
+}

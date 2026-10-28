@@ -1,0 +1,1 @@
+{"event":"result","result":{"conversation_id":"6aa62870-955e-4654-925a-618d41dc7e75","status":"ERROR","response":"","error":"There was a network issue connecting to the server, please try again.","duration_seconds":273.102617378,"num_turns":1,"usage":{"input_tokens":228118,"output_tokens":12690,"thinking_tokens":9488,"cache_read_tokens":429870,"total_tokens":240808}}}

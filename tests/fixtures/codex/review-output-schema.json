@@ -1,0 +1,13 @@
+{"type":"object","additionalProperties":false,"required":["verdict","findings"],
+ "properties":{
+  "verdict":{"type":"string","enum":["PASS","REJECT","UNVERIFIED"]},
+  "findings":{"type":"object","additionalProperties":false,"required":["criteria","extra_findings"],
+   "properties":{
+    "criteria":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","verdict","evidence","note","fix_size","category"],
+      "properties":{"id":{"type":"string"},"verdict":{"type":"string","enum":["met","unmet"]},"evidence":{"type":"array","items":{"type":"string"}},"note":{"type":"string"},
+       "fix_size":{"type":"string","enum":["S","M","L","none"]},
+       "category":{"type":"string","enum":["spec_mismatch","spec_error","test_missing","test_interface","error_path","concurrency","platform","docs","evidence","files","security","other","none"]}}}},
+    "extra_findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","note","evidence","fix_size","category"],
+      "properties":{"severity":{"type":"string"},"note":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},
+       "fix_size":{"type":"string","enum":["S","M","L","none"]},
+       "category":{"type":"string","enum":["spec_mismatch","spec_error","test_missing","test_interface","error_path","concurrency","platform","docs","evidence","files","security","other","none"]}}}}}}}}

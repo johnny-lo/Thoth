@@ -1,0 +1,305 @@
+# Tests and clippy on Windows and Linux for every push and pull request.
+#
+# Every job is guarded by `github.repository == 'johnny-lo/Thoth'`: the
+# workflow file also lives in the private development repo, whose Actions
+# minutes are billed, and GitHub Actions has no workflow-level `if`, so the
+# condition has to sit on each job. 實測待確認: a push to the private repo
+# shows the whole run as skipped (check its Actions page after the push; if the
+# jobs ran instead, turn Actions off in that repo's Settings -> Actions).
+#
+# Marker used below: "實測待確認" (to be confirmed on a real run) marks
+# behaviour of GitHub's runners that has not been observed in a real workflow
+# yet. Each one says how to check it and what to do if it does not hold.
+
+name: CI
+
+on:
+  push:
+    # Branches only: tag pushes are the release workflow's business.
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows:
+    if: github.repository == 'johnny-lo/Thoth'
+    runs-on: windows-latest
+    # The process tests wait on real pings and deadlines for tens of seconds.
+    timeout-minutes: 90
+    defaults:
+      run:
+        # Git Bash: two tests read HOME and fail under PowerShell.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: toolchain
+        run: |
+          rustup show
+          cargo --version
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+  linux:
+    if: github.repository == 'johnny-lo/Thoth'
+    # 24.04 ships systemd 255; Thoth needs 254+ (DelegateSubgroup=). 22.04 has
+    # 249, and ubuntu-slim has no per-user runtime directory.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: toolchain
+        run: |
+          rustup show
+          cargo --version
+
+      # On Linux every run starts its runner as a transient `systemd-run --user`
+      # service (Delegate=yes, DelegateSubgroup=runner) and refuses to run
+      # without a user manager. Whether the runner VM provides one is
+      # environment, not code, so it is probed in three steps that never fail
+      # and only set `steps.probe.outputs.ok`; the test steps below never look
+      # at the environment themselves. Once the probe says ok, any red test is a
+      # code problem.
+
+      # (a) Record the environment as the job finds it, before touching it.
+      # 實測待確認: whether /run/user/<uid>/bus exists with no preparation is
+      # the "bus" row of this step's summary on the first public run.
+      - name: probe-before-prep
+        run: |
+          set +e +o pipefail
+          uid=$(id -u)
+          bus=missing
+          [ -S "/run/user/$uid/bus" ] && bus=present
+          {
+            echo "### Environment before preparation"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| systemctl --version | $(systemctl --version 2>&1 | head -n 1) |"
+            echo "| id -u | $uid |"
+            echo "| XDG_RUNTIME_DIR | ${XDG_RUNTIME_DIR:-(unset)} |"
+            echo "| DBUS_SESSION_BUS_ADDRESS | ${DBUS_SESSION_BUS_ADDRESS:-(unset)} |"
+            echo "| /run/user/$uid/bus | $bus |"
+            echo "| Linger | $(loginctl show-user "$uid" -p Linger --value 2>&1) |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # (b) Make sure the user manager is up and later steps can reach it: the
+      # same preparation runc's CI uses on 24.04, minus its user@.service
+      # delegate.conf. runc needs every controller delegated; Thoth only creates
+      # child cgroups under its own unit and writes cgroup.kill, which the
+      # default delegation of user@.service allows. A bus that never appears is
+      # only a warning here; (c) decides.
+      - name: prep-user-manager
+        run: |
+          set +e +o pipefail
+          uid=$(id -u)
+          sudo loginctl enable-linger "$USER" || echo "::warning::loginctl enable-linger failed"
+          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
+          for _ in $(seq 30); do
+            [ -S "/run/user/$uid/bus" ] && break
+            sleep 1
+          done
+          if [ -S "/run/user/$uid/bus" ]; then
+            echo "user bus is up: /run/user/$uid/bus"
+          else
+            echo "::warning::/run/user/$uid/bus did not appear within 30 seconds"
+          fi
+          exit 0
+
+      # (c) Start a unit the way Thoth starts a runner and check, from inside
+      # it, what the runner relies on: it lives in the `runner` subgroup, it may
+      # write its unit's cgroup.kill, and it may create `worker-<pid>` next to
+      # itself in the unit's cgroup. `-w` only; nothing is written.
+      # `--expand-environment=no` (as Thoth uses) keeps systemd from rewriting
+      # the `$` in the script. The unit must also print PROBE-OK, so the probe
+      # does not depend on `--wait --pipe` passing the unit's exit code through.
+      # 實測待確認: (1) this step's summary says ok=true on ubuntu-24.04;
+      # (2) the "exit code passthrough" row shows 7 (a unit that exits 7 makes
+      # `systemd-run --wait --pipe` exit 7). If either does not hold: first add
+      # /etc/systemd/system/user@.service.d/delegate.conf ([Service]
+      # Delegate=yes) in prep-user-manager, then `sudo systemctl daemon-reload`
+      # and `sudo systemctl restart user@$(id -u)`, and look at the probe again;
+      # if it still fails, the job stays on test-without-user-manager and
+      # running systemd in a VM inside the job is the next step.
+      - name: probe-user-manager
+        id: probe
+        run: |
+          set +e +o pipefail
+          ok=true
+          reasons=()
+
+          version=$(systemctl --version 2>/dev/null | head -n 1 | awk '{print $2}')
+          if ! [[ "$version" =~ ^[0-9]+$ ]]; then
+            ok=false; reasons+=("cannot read the systemd version")
+          elif (( version < 254 )); then
+            ok=false; reasons+=("systemd $version is older than 254 (no DelegateSubgroup=)")
+          fi
+
+          inner='cat /proc/self/cgroup
+          cg=$(sed -n "s/^0:://p" /proc/self/cgroup)
+          dir=/sys/fs/cgroup$cg
+          parent=${dir%/*}
+          case "$cg" in */runner) ;; *) echo "FAIL: cgroup $cg does not end in /runner"; exit 11 ;; esac
+          [ -e "$dir/cgroup.kill" ] && [ -w "$dir/cgroup.kill" ] || { echo "FAIL: $dir/cgroup.kill missing or not writable"; exit 12; }
+          [ -w "$parent" ] || { echo "FAIL: unit cgroup $parent not writable"; exit 13; }
+          echo PROBE-OK'
+          out=$(timeout 60 systemd-run --user --wait --pipe --collect --quiet \
+            --expand-environment=no -p Delegate=yes -p DelegateSubgroup=runner \
+            -- sh -c "$inner" 2>&1)
+          rc=$?
+          echo "$out"
+          if (( rc != 0 )); then
+            ok=false; reasons+=("systemd-run --user exited $rc")
+          fi
+          if ! grep -qx PROBE-OK <<<"$out"; then
+            ok=false
+            fail=$(grep -m 1 '^FAIL:' <<<"$out")
+            reasons+=("${fail:-the unit did not report PROBE-OK}")
+          fi
+
+          # Record only: does `--wait --pipe` hand back the unit's exit code?
+          timeout 60 systemd-run --user --wait --pipe --collect --quiet -- sh -c 'exit 7' >/dev/null 2>&1
+          passthrough=$?
+
+          reason=$(IFS=';'; echo "${reasons[*]}")
+          {
+            echo "### User manager probe"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| ok | $ok |"
+            echo "| systemd version | ${version:-unknown} |"
+            echo "| systemd-run exit code | $rc |"
+            echo "| exit code passthrough (expect 7) | $passthrough |"
+            echo "| failed checks | ${reason:-none} |"
+            echo
+            echo '```'
+            echo "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$ok" != true ]]; then
+            echo "::warning::environment, not code: no usable systemd user manager ($reason)"
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # A probe that left no answer is a bug in this workflow; without this the
+      # job would skip both test steps and pass.
+      - name: probe-result-missing
+        if: steps.probe.outputs.ok != 'true' && steps.probe.outputs.ok != 'false'
+        run: |
+          echo "::error::probe-user-manager set no ok output"
+          exit 1
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test-full
+        if: steps.probe.outputs.ok == 'true'
+        run: cargo test --locked
+
+      # No usable user manager: run everything that does not start a runner.
+      # Any red here is still a code problem.
+      #
+      # The integration-test list is fixed on purpose: computing it here would
+      # turn a new test that starts a runner in some way the pattern misses into
+      # a red that looks like a code bug. Add new test files that never start a
+      # runner by hand. The list is every tests/*.rs (tests/common/ is a shared
+      # module, not a test target) of this public tree that contains none of
+      # the patterns below, sorted; re-derive it here with:
+      #   grep -L -F -e '.dispatch(' -e 'review_start(' -e '"dispatch"' \
+      #     -e '"run-worker"' -e '"resume"' -e '"verify"' -e '"review", "start"' \
+      #     tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort
+      # and then left out by hand, because they start a runner in a way the
+      # patterns miss:
+      #   mcp  (launches through the MCP tool `thoth_dispatch`)
+      - name: test-without-user-manager
+        if: steps.probe.outputs.ok == 'false'
+        env:
+          PROBE_REASON: ${{ steps.probe.outputs.reason }}
+        run: |
+          tests=(
+            checks_hint
+            cli_smoke
+            config_registry
+            decision_table
+            doctor
+            extra_buckets
+            guide
+            init
+            live_quota
+            live_quota_claude
+            live_quota_codex
+            mcp_plugin
+            models
+            plugin
+            plugin_fingerprint
+            process
+            profile
+            profile_check
+            profile_login
+            report
+            settings
+            setup
+            state_dir
+            task
+            task_close
+            transcript
+            usage_recommend
+          )
+          # Written first, so it is there even when a command below fails.
+          {
+            echo "### Tests skipped: no usable systemd user manager"
+            echo
+            echo "Environment, not code. Failed probe checks: ${PROBE_REASON:-unknown}."
+            echo
+            echo "Ran: every test target built (\`--no-run\`); unit tests except \`process::linux::\`;"
+            echo "integration tests that never start a runner: ${tests[*]}."
+            echo
+            echo "Skipped: the \`process::linux::\` unit tests and every other integration test file."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::environment, not code: no usable systemd user manager (${PROBE_REASON:-unknown}); runner tests skipped, see the job summary"
+          cargo test --locked --no-run
+          cargo test --locked --bin thoth -- --skip process::linux::
+          args=()
+          for t in "${tests[@]}"; do args+=(--test "$t"); done
+          cargo test --locked "${args[@]}"

@@ -1,0 +1,53 @@
+[package]
+name = "thoth"
+version = "0.1.8"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+# local-offset: `thoth report` shows times in the machine's time zone
+# (docs/post-phase2/quota-and-report-scope-2026-09-28.md §3).
+time = { version = "0.3.55", features = ["formatting", "parsing", "local-offset"] }
+ulid = "3.0.0"
+uuid = { version = "1.26.1", features = ["v4"] }
+# RJ-2: reads the Agent Arena leaderboard parquet files (SNAPPY, dictionary
+# encoded) through the row API only: no arrow, no async, no other codec.
+parquet = { version = "60.0.0", default-features = false, features = ["snap"] }
+
+# Rider (whole-branch review, Minor 5): moved out of [dependencies] into a
+# Windows-only target table. `src/process/windows.rs` is already
+# `#[cfg(windows)]`-shaped throughout (every `use windows_sys::...` is gated,
+# and a `#[cfg(not(windows))]` stub impl exists), so the dependency itself
+# was the one thing in the module that was not conditional - a future Linux
+# build would have compiled and linked a Windows-only crate for nothing.
+[target.'cfg(windows)'.dependencies]
+# Windows Job Objects for whole-tree kill even after the root process has
+# already exited (tasklist/taskkill's `/T` cannot walk a tree with no root).
+# Latest stable per `cargo search windows-sys` on 2026-09-15.
+# Win32_Security is required in addition to the reviewer's list: windows-sys
+# 0.61.2 gates `CreateJobObjectW` behind it (its `lpJobAttributes` parameter
+# is `*const SECURITY_ATTRIBUTES`), confirmed by inspecting
+# Win32/System/JobObjects/mod.rs in the fetched crate source.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux process control (`src/process/linux.rs`): the async-signal-safe
+# syscalls a worker's `pre_exec` uses to join its own cgroup before `exec`,
+# plus `kill`/`getpgid`. Already in Cargo.lock as a transitive dependency at
+# this version, so this adds no new crate
+# (docs/post-phase2/linux-support-scope-2026-09-26.md §3).
+libc = "0.2.189"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"

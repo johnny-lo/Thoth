@@ -1,0 +1,217 @@
+# Release binaries: pushing a tag vX.Y.Z builds thoth for Windows x64 and
+# Linux x64, adds SHA256SUMS and creates a draft release. A maintainer
+# downloads the draft, checks it locally and publishes it by hand.
+#
+# Asset names carry no version, so
+# https://github.com/johnny-lo/Thoth/releases/latest/download/<asset>
+# always points at the newest published release. The install scripts rely
+# on these names and on the SHA256SUMS format: change them together.
+#
+# Every job runs only in johnny-lo/Thoth. GitHub Actions has no
+# workflow-level `if`, so each job carries the condition itself.
+# 實測待確認: in any other copy of the repository a tag push shows every job
+# as skipped. If it does not, turn Actions off in that copy's settings.
+#
+# Steps marked "實測待確認" depend on GitHub-side behaviour that could not be
+# checked before the workflow first ran on the public repo.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+jobs:
+  version:
+    name: tag matches Cargo.toml
+    if: github.repository == 'johnny-lo/Thoth'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: compare the tag with the package version
+        shell: bash
+        run: |
+          # cargo pkgid prints ...#thoth@X.Y.Z or ...#X.Y.Z depending on the
+          # folder name; keep what follows the last '#' or '@'.
+          pkgid=$(cargo pkgid --locked)
+          version=${pkgid##*[#@]}
+          tag=${GITHUB_REF_NAME#v}
+          echo "tag: $tag"
+          echo "Cargo.toml: $version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  build:
+    name: build ${{ matrix.target }}
+    if: github.repository == 'johnny-lo/Thoth'
+    needs: version
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            built: thoth.exe
+            asset: thoth-x86_64-pc-windows-msvc.exe
+          # glibc 2.39; Thoth on Linux needs systemd 254+, so every distro
+          # it runs on is at least this new.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            built: thoth
+            asset: thoth-x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      # 實測待確認: the runner's preinstalled stable must be at least the
+      # rust-version in Cargo.toml (1.95). If it is not, add a step running
+      # `rustup toolchain install stable` before this one.
+      - name: show the toolchain
+        shell: bash
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      # Panic locations would otherwise carry the build machine's paths.
+      # Windows paths stay in the backslash form rustc sees.
+      #
+      # Known limit: rusqlite's bundled sqlite3.c is compiled by the cc crate
+      # and --remap-path-prefix does not reach C code. Release builds turn
+      # sqlite's asserts off, so no path is expected there (實測待確認). If
+      # the scan below only ever hits paths ending in .c or .h: on Linux add
+      # CFLAGS=-ffile-prefix-map=<path>=/cargo; on Windows (MSVC has no
+      # public equivalent) list those hits for the maintainer and make the
+      # scan fail only on Rust paths (containing .rs or /src/).
+      - name: set path remapping
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            home=$USERPROFILE
+            sep='\'
+          else
+            home=$HOME
+            sep=/
+          fi
+          workspace=$GITHUB_WORKSPACE
+          cargo_home=${CARGO_HOME:-$home$sep.cargo}
+          rustup_home=${RUSTUP_HOME:-$home$sep.rustup}
+          for p in "$workspace" "$cargo_home" "$rustup_home"; do
+            case $p in
+              *" "*) echo "::error::path contains a space: $p"; exit 1 ;;
+            esac
+          done
+          {
+            echo "RUSTFLAGS=--remap-path-prefix=$workspace=/thoth --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$rustup_home=/rustup"
+            echo "SCAN_WORKSPACE=$workspace"
+            echo "SCAN_CARGO_HOME=$cargo_home"
+            echo "SCAN_RUSTUP_HOME=$rustup_home"
+          } >> "$GITHUB_ENV"
+
+      - name: build
+        shell: bash
+        run: |
+          echo "RUSTFLAGS=$RUSTFLAGS"
+          cargo build --release --locked --bin thoth
+
+      - name: scan the binary for build paths
+        shell: bash
+        run: |
+          # head closes the pipes early when printing hits; that is not an error.
+          set +o pipefail
+          bin=target/release/${{ matrix.built }}
+          failed=0
+          for p in "$SCAN_WORKSPACE" "$SCAN_CARGO_HOME" "$SCAN_RUSTUP_HOME"; do
+            variants=("$p")
+            slashed=$(printf '%s' "$p" | tr '\134' /)
+            [ "$slashed" != "$p" ] && variants+=("$slashed")
+            for v in "${variants[@]}"; do
+              n=$(grep -a -c -F -- "$v" "$bin" || true)
+              echo "$v: $n"
+              if [ "$n" != "0" ]; then
+                failed=1
+                grep -a -o -b -F -- "$v" "$bin" | cut -d: -f1 | head -n 20 | while read -r off; do
+                  start=$(( off > 80 ? off - 80 : 0 ))
+                  len=$(( off - start + ${#v} + 80 ))
+                  echo "  at byte $off:"
+                  tail -c +$(( start + 1 )) "$bin" | head -c "$len" | tr -c '[:print:]' '.'
+                  echo
+                done
+              fi
+            done
+          done
+          exit "$failed"
+
+      - name: stage the asset
+        shell: bash
+        run: |
+          mkdir dist
+          cp "target/release/${{ matrix.built }}" "dist/${{ matrix.asset }}"
+          ls -la dist
+          # Only thoth itself ships, never the fake-* test binaries.
+          test "$(ls dist | wc -l)" -eq 1
+          test -f "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    if: github.repository == 'johnny-lo/Thoth'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: write SHA256SUMS
+        shell: bash
+        working-directory: dist
+        run: |
+          ls -la
+          test "$(ls | wc -l)" -eq 2
+          test -f thoth-x86_64-pc-windows-msvc.exe
+          test -f thoth-x86_64-unknown-linux-gnu
+          sha256sum thoth-* > SHA256SUMS
+          cat SHA256SUMS
+          # coreutils format the install scripts read: hash, two spaces, name.
+          test "$(grep -c -E '^[0-9a-f]{64}  thoth-[^/ ]+$' SHA256SUMS)" -eq 2
+          sha256sum -c SHA256SUMS
+
+      # 實測待確認: GITHUB_TOKEN can create a draft, --generate-notes works
+      # on the first tag, and releases/latest/download/<asset> redirects to
+      # the newest published release (drafts do not count). If notes fail,
+      # drop --generate-notes; if the token lacks permission, set the
+      # repository's workflow permissions to read and write and re-run.
+      # An existing release for the tag (draft or published) makes this
+      # fail on purpose: delete the draft by hand before re-running.
+      - name: create the draft release
+        shell: bash
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            thoth-x86_64-pc-windows-msvc.exe \
+            thoth-x86_64-unknown-linux-gnu \
+            SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

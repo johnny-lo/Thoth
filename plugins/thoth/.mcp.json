@@ -1,0 +1,1 @@
+{"mcpServers":{"thoth":{"command":"thoth","args":["mcp","--max-wait","110s","--default-repo","${CLAUDE_PROJECT_DIR}"]}}}

@@ -1,0 +1,11 @@
+{
+  "name": "thoth",
+  "owner": { "name": "Thoth contributors" },
+  "plugins": [
+    {
+      "name": "thoth",
+      "source": "./plugins/thoth",
+      "description": "Dispatch and review implementation work through Thoth."
+    }
+  ]
+}
