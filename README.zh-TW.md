@@ -100,6 +100,8 @@ curl -fsSL https://raw.githubusercontent.com/johnny-lo/Thoth/master/install.sh |
 
 腳本裝到 `~/.local/bin`（Windows 是 `%USERPROFILE%\.local\bin`），驗證 SHA256SUMS，
 有終端機時接著跑 `thoth setup`。重跑同一行就是升級。Windows 會補上使用者 PATH，
+PATH 裡原有的 `%VAR%` 項目保持原樣；PATH 已經用別種寫法（8.3 短檔名、大小寫不同、
+結尾斜線、引號或 `%VAR%` 形式）列了這個資料夾時不會重複加入；
 Linux 會印出要加進 shell 設定檔的那一行。沒有終端機時，之後自行執行 `thoth setup`。
 
 執行檔沒有簽章，安裝腳本用 SHA-256 驗證。從終端機安裝不會跳 SmartScreen；

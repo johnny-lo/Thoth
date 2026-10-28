@@ -110,7 +110,10 @@ curl -fsSL https://raw.githubusercontent.com/johnny-lo/Thoth/master/install.sh |
 
 These install into `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows),
 verify SHA256SUMS, and start `thoth setup` when a terminal is available. Run the
-same command again to upgrade. Windows adds the directory to your user PATH;
+same command again to upgrade. Windows adds the directory to your user PATH,
+keeping its `%VAR%` entries as they are, and does not add it again when the
+PATH already has it in another spelling (short 8.3 name, other letter case,
+trailing slash, quotes or a `%VAR%` form);
 Linux prints the line to add to your shell profile. Without a terminal, run
 `thoth setup` yourself afterwards.
 

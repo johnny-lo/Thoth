@@ -17,11 +17,8 @@ trait AgyFixture {
 
 impl AgyFixture for common::Fixture {
     fn add_agy_profile(&self, id: &str) -> std::path::PathBuf {
-        let cfg = self.home.path().join("profiles").join(id);
-        std::fs::create_dir_all(&cfg).unwrap();
-        self.cmd().args(["profile", "add", id, "--provider", "google", "--harness",
-            "antigravity", "--config-dir"]).arg(&cfg).assert().success();
-        cfg
+        // Through the shared helper, so `seed_run` stores the reported config dir.
+        self.add_profile_with(id, "google", "antigravity")
     }
 }
 

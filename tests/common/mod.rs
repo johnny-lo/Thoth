@@ -40,6 +40,9 @@ fn launch_defaults(extra: &[&str], model: &'static str) -> Vec<&'static str> {
 pub struct Fixture {
     pub home: TempDir,
     pub repo: TempDir,
+    /// `config_dir` as `profile add --json` reported it, per profile id, for
+    /// `seed_run`: thoth stores the long spelling of an 8.3 short temp path.
+    profile_config_dirs: std::cell::RefCell<std::collections::HashMap<String, String>>,
 }
 
 /// A fresh THOTH_HOME plus a throwaway git repo with two commits.
@@ -56,7 +59,7 @@ pub fn fixture() -> Fixture {
     std::fs::write(r.join("b.txt"), "two\n").unwrap();
     git(r, &["add", "b.txt"]);
     git(r, &["commit", "-m", "second"]);
-    Fixture { home, repo }
+    Fixture { home, repo, profile_config_dirs: Default::default() }
 }
 
 impl Fixture {
@@ -277,37 +280,37 @@ impl Fixture {
 
     /// Register a profile whose config dir is a real (empty) directory.
     pub fn add_profile(&self, id: &str) -> PathBuf {
+        self.add_profile_with(id, "anthropic", "claude-code")
+    }
+
+    /// `profile add ID --provider P --harness H --config-dir DIR --json` for a
+    /// fresh directory, remembering the reported `config_dir` for `seed_run`.
+    pub fn add_profile_with(&self, id: &str, provider: &str, harness: &str) -> PathBuf {
         let cfg = self.home.path().join("profiles").join(id);
         std::fs::create_dir_all(&cfg).unwrap();
-        self.cmd()
-            .args([
-                "profile", "add", id,
-                "--provider", "anthropic",
-                "--harness", "claude-code",
-                "--config-dir",
-            ])
+        let out = self
+            .cmd()
+            .args(["profile", "add", id, "--provider", provider, "--harness", harness, "--config-dir"])
             .arg(&cfg)
+            .arg("--json")
             .assert()
-            .success();
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
+        let reported = v["config_dir"].as_str().expect("profile add --json reports config_dir");
+        self.profile_config_dirs
+            .borrow_mut()
+            .insert(id.to_string(), reported.to_string());
         cfg
     }
 
     /// Register a codex profile the way docs/phase1/usage.md tells a human to:
     /// the directory exists first, provider openai, harness codex.
     pub fn add_codex_profile(&self, id: &str) -> PathBuf {
-        let cfg = self.home.path().join("profiles").join(id);
-        std::fs::create_dir_all(&cfg).unwrap();
-        self.cmd()
-            .args([
-                "profile", "add", id,
-                "--provider", "openai",
-                "--harness", "codex",
-                "--config-dir",
-            ])
-            .arg(&cfg)
-            .assert()
-            .success();
-        cfg
+        self.add_profile_with(id, "openai", "codex")
     }
 
     /// Insert a queued run row directly, the way `dispatch` will in Task 9.
@@ -364,7 +367,14 @@ impl Fixture {
             .join("runs")
             .join(&run_id);
         std::fs::create_dir_all(&run_dir).unwrap();
-        let cfg = self.home_path().join("profiles").join(profile_id);
+        // The run's config dir as thoth stored the profile's; a profile added
+        // some other way falls back to the fixture's own spelling.
+        let cfg = self
+            .profile_config_dirs
+            .borrow()
+            .get(profile_id)
+            .cloned()
+            .unwrap_or_else(|| self.home_path().join("profiles").join(profile_id).display().to_string());
 
         let conn = self.state_conn();
         conn.execute(
@@ -378,7 +388,7 @@ impl Fixture {
                 task_id,
                 profile_id,
                 "11111111-2222-3333-4444-555555555555",
-                cfg.display().to_string(),
+                cfg,
                 wt.display().to_string(),
                 base_commit,
                 spec_json,

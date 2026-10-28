@@ -60,8 +60,9 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # --no-fail-fast: one red test binary must not hide the reds of the rest.
       - name: test
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
 
   linux:
     if: github.repository == 'johnny-lo/Thoth'
@@ -235,7 +236,7 @@ jobs:
 
       - name: test-full
         if: steps.probe.outputs.ok == 'true'
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
 
       # No usable user manager: run everything that does not start a runner.
       # Any red here is still a code problem.
@@ -299,7 +300,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::warning::environment, not code: no usable systemd user manager (${PROBE_REASON:-unknown}); runner tests skipped, see the job summary"
           cargo test --locked --no-run
-          cargo test --locked --bin thoth -- --skip process::linux::
+          # Both test commands run even when the first one fails; the step
+          # fails afterwards if either did.
+          failed=0
+          cargo test --locked --no-fail-fast --bin thoth -- --skip process::linux:: || failed=1
           args=()
           for t in "${tests[@]}"; do args+=(--test "$t"); done
-          cargo test --locked "${args[@]}"
+          cargo test --locked --no-fail-fast "${args[@]}" || failed=1
+          exit "$failed"

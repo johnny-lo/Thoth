@@ -2,6 +2,7 @@
 # THOTH_INSTALL_DIR: destination directory; default $env:USERPROFILE\.local\bin.
 # THOTH_INSTALL_NO_SETUP: 1 skips guided setup.
 # THOTH_INSTALL_BASE_URL: releases URL or local release-layout directory.
+# THOTH_INSTALL_USER_ENV_KEY: test-only; a key under HKCU (for example HKCU\Software\thoth-test) whose Path value is read and written instead of HKCU\Environment's, so tests never touch the real user PATH.
 # Do not set THOTH_LOGIN_SKIP_TTY_CHECK; setup needs a real terminal.
 # Offline: put the asset and SHA256SUMS in RELEASE/latest/download, then set
 # $env:THOTH_INSTALL_BASE_URL='./RELEASE'; $env:THOTH_INSTALL_DIR='./BIN'; $env:THOTH_INSTALL_NO_SETUP='1'; & ./install.ps1
@@ -74,21 +75,49 @@
         & $target --version
         if ($LASTEXITCODE -ne 0) { throw 'Installed thoth --version failed' }
 
+        # Comparison key of a folder: the full path without trailing separators,
+        # in its 8.3 short spelling when the folder exists, so that long and
+        # short spellings of the same folder compare equal.
+        $fso = New-Object -ComObject Scripting.FileSystemObject
+        function Get-PathKey([string] $Path) {
+            $full = [IO.Path]::GetFullPath($Path.Replace('/', '\')).TrimEnd('\')
+            if ($fso.FolderExists($full)) { $full = $fso.GetFolder($full).ShortPath.TrimEnd('\') }
+            return $full
+        }
+        $dirKey = Get-PathKey $dir
         function Test-InstallPath([string] $Value) {
             foreach ($entry in ($Value -split ';')) {
-                $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"'))
-                if ($expanded.TrimEnd('\', '/') -ieq $dir.TrimEnd('\', '/')) { return $true }
+                $expanded = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"').Trim())
+                # Empty, relative or invalid entries are simply not the install folder.
+                try {
+                    if ($expanded -and [IO.Path]::IsPathRooted($expanded) -and (Get-PathKey $expanded) -ieq $dirKey) { return $true }
+                } catch { }
             }
             return $false
         }
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        if (-not (Test-InstallPath $userPath) -and -not (Test-InstallPath $env:Path)) {
-            $newPath = $dir
-            if ($userPath) { $newPath = $userPath.TrimEnd(';') + ';' + $dir }
-            [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-            $env:Path = $env:Path.TrimEnd(';') + ';' + $dir
-            Write-Output 'PATH updated; new terminals will pick up the change.'
-        }
+        # The registry value is read and written raw: [Environment]::SetEnvironmentVariable
+        # would expand %VAR% entries and store a plain string.
+        $envKey = 'Environment'
+        if ($env:THOTH_INSTALL_USER_ENV_KEY) { $envKey = $env:THOTH_INSTALL_USER_ENV_KEY -replace '^(HKCU|HKEY_CURRENT_USER)\\', '' }
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($envKey, $true)
+        if (-not $key) { throw "Cannot open HKCU\$envKey" }
+        try {
+            $userPath = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if (-not (Test-InstallPath $userPath) -and -not (Test-InstallPath $env:Path)) {
+                $newPath = $dir
+                if ($userPath) { $newPath = "$userPath;$dir" }
+                $key.SetValue('Path', $newPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+                # Tell running programs (Explorer starts new terminals) that the user environment changed.
+                try {
+                    Add-Type -Namespace ThothInstall -Name NativeMethods -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, UIntPtr wParam, string lParam, uint flags, uint timeout, out UIntPtr result);'
+                    $result = [UIntPtr]::Zero
+                    # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG, 5 seconds.
+                    $null = [ThothInstall.NativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x1a, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
+                } catch { Write-Output 'Could not announce the PATH change; sign out and back in if new terminals do not see it.' }
+                $env:Path = $env:Path.TrimEnd(';') + ';' + $dir
+                Write-Output 'PATH updated; new terminals will pick up the change.'
+            }
+        } finally { $key.Close() }
         if ($env:THOTH_INSTALL_NO_SETUP -eq '1' -or [Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
             Write-Output 'Run later: thoth setup'
             if ($env:THOTH_HOME) { Write-Output "Keep THOTH_HOME set to $env:THOTH_HOME when running thoth setup." }
