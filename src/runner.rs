@@ -130,11 +130,11 @@ pub fn classify_outcome(
 
     if !result.is_error && exit_code == Some(0) {
         return match ingest {
-            IngestOutcome::Ok { summary, claim_count } => Outcome {
+            IngestOutcome::Ok { claim_count, brief, .. } => Outcome {
                 run_status: RunStatus::Completed,
                 task_status: TaskStatus::InReview,
                 interrupted_reason: None,
-                note: format!("ingested {claim_count} claim(s): {summary}"),
+                note: format!("ingested {claim_count} claim(s): {brief}"),
             },
             IngestOutcome::Invalid { reason } => Outcome {
                 run_status: RunStatus::Completed,
@@ -2054,6 +2054,25 @@ fn run_worker_inner(
     // cannot write the file has it written below (`write_review_output`).
     // SR-3: how the spec reviewer run was started; `Review` for every other run.
     let mut spec_review_mode = crate::spec_edits::ReviewMode::Review;
+    // RFIX-1: how a code reviewer run was started (`review start`, `--edit`
+    // or `review confirm`); `Review` for every other run.
+    let code_review_mode = if is_review && !is_spec_review {
+        crate::commands::review_fix::run_mode(conn, &run.run_id)?
+    } else {
+        crate::spec_edits::ReviewMode::Review
+    };
+    let is_confirm = code_review_mode == crate::spec_edits::ReviewMode::Confirm;
+    // A confirmer launches only for the fix it was started for, with its
+    // input written fresh.
+    let confirm_fix_commit = if is_confirm {
+        let (counts, fix) = crate::commands::review_fix::prepare_confirm_launch(conn, repo_root, run, &masker)?;
+        if let Err(e) = crate::redact::record(conn, &run.task_id, Some(&run.run_id), "review_fix_input", &counts, &[]) {
+            log_runner_error(&run_dir, &format!("could not record secret_redacted: {e:#}"));
+        }
+        Some(fix)
+    } else {
+        None
+    };
     let review_output = if is_spec_review {
         // SR-2: the spec as it was when the review was started, and the
         // spec-review schema; every harness gets them (Claude Code ignores
@@ -2130,6 +2149,13 @@ fn run_worker_inner(
             schema,
             output: Path::new(&run.worktree).join(crate::spec_review_prompt::OUTPUT_FILE),
         })
+    } else if is_confirm && adapter.reads_review_packet() {
+        let schema = run_dir.join("review-schema.json");
+        std::fs::write(&schema, serde_json::to_string_pretty(&crate::spec_edits::confirm_output_schema())?)?;
+        Some(crate::adapter::ReviewOutput {
+            schema,
+            output: Path::new(&run.worktree).join(".agent").join("review.json"),
+        })
     } else if is_review && adapter.reads_review_packet() {
         let redactions = crate::commands::review_packet::write_review_input(
             conn,
@@ -2152,6 +2178,8 @@ fn run_worker_inner(
             &schema,
             serde_json::to_string_pretty(&if research {
                 crate::review_json::source_check_schema()
+            } else if code_review_mode == crate::spec_edits::ReviewMode::Edit {
+                crate::review_fix_edits::edit_output_schema()
             } else {
                 crate::review_json::output_schema()
             })?,
@@ -2205,6 +2233,17 @@ fn run_worker_inner(
             &crate::review_json::ac_ids(&spec),
             spec_review_mode,
         )
+    } else if let Some(fix) = &confirm_fix_commit {
+        // RFIX-1: the confirmer's prompt is the same for every harness but
+        // the line saying how the answer comes back.
+        let how = if is_codex {
+            crate::review_fix_edits::How::FinalMessage
+        } else if profile.harness == crate::adapter::antigravity::HARNESS_NAME {
+            crate::review_fix_edits::How::StructuredOutput
+        } else {
+            crate::review_fix_edits::How::ShellRedirect
+        };
+        crate::review_fix_edits::confirm_prompt(&run.task_id, fix, how)
     } else if is_review {
         // Fix round 1 (R1): the empty fallback tells the reviewer "the control
         // plane captured no evidence for this task", which is a sentence it may
@@ -2319,7 +2358,7 @@ fn run_worker_inner(
                 })
                 .collect::<Vec<_>>()
         });
-        adapter.build_review_prompt(
+        let mut prompt = adapter.build_review_prompt(
             &run.task_id,
             &masked_spec(counts),
             &criterion_ids,
@@ -2328,7 +2367,14 @@ fn run_worker_inner(
             &index_rows,
             &protected_changes,
             sources.as_deref(),
-        )
+        );
+        // RFIX-1: an edit-mode reviewer is also told how to attach a fix.
+        if code_review_mode == crate::spec_edits::ReviewMode::Edit {
+            prompt.push_str(&crate::review_fix_edits::edit_prompt_section(
+                profile.harness == crate::adapter::HARNESS_CLAUDE_CODE,
+            ));
+        }
+        prompt
     } else if resume_prompt {
         claude_code::RESUME_PROMPT.to_string()
     } else {
@@ -2844,6 +2890,10 @@ fn run_worker_inner(
     }
 
     let mut review_verdict: Option<crate::review_json::Verdict> = None;
+    // RFIX-1: the commit the ingest left the worktree at, and whether it
+    // wrote (or must not touch) the task's status itself.
+    let mut ingest_candidate: Option<String> = None;
+    let mut review_settled = false;
     let mut spec_verdict: Option<crate::spec_review_json::SpecVerdict> = None;
     let ingest_outcome = if !clean_success {
         IngestOutcome::Skipped
@@ -2912,13 +2962,25 @@ fn run_worker_inner(
                 // A reviewer whose harness cannot write files has its verdict
                 // written here from the result line, for the unchanged ingest.
                 stream.adapter.write_review_output(&review_path, tally.result.as_ref(), &run_dir);
-                let ingested = crate::commands::review::ingest_review_path(
-                    conn,
-                    run,
-                    &task,
-                    &target,
-                    &review_path,
-                );
+                let fix_ctx = crate::commands::review_fix::Ctx { paths, repo_id, root: repo_root };
+                let ingested = match (code_review_mode, std::fs::read_to_string(&review_path)) {
+                    (crate::spec_edits::ReviewMode::Edit, Ok(text)) => {
+                        crate::commands::review_fix::ingest_edit(conn, &fix_ctx, run, &task, &target, &text)
+                    }
+                    (crate::spec_edits::ReviewMode::Confirm, Ok(text)) => {
+                        crate::commands::review_fix::ingest_confirm(conn, &fix_ctx, run, &text)
+                    }
+                    (crate::spec_edits::ReviewMode::Confirm, Err(e)) => crate::commands::review_fix::confirm_read_failed(
+                        conn,
+                        run,
+                        format!("could not read review.json at {}: {e}", review_path.display()),
+                    ),
+                    _ => crate::commands::review::ingest_review_path(conn, run, &task, &target, &review_path),
+                };
+                if ingested.candidate_commit.is_some() {
+                    ingest_candidate = ingested.candidate_commit.clone();
+                }
+                review_settled = ingested.settled;
                 review_verdict = ingested.verdict;
                 if !ingested.unopened_citations.is_empty() {
                     log_runner_error(
@@ -2989,7 +3051,7 @@ fn run_worker_inner(
     // must not have a stale verdict stamped over what the task is doing now;
     // `settle_terminal` records the not-applied verdict instead.
     // SR-2: a spec reviewer never writes the task's status, whatever happened.
-    let task_status: Option<TaskStatusWrite> = if is_spec_review {
+    let task_status: Option<TaskStatusWrite> = if is_spec_review || review_settled {
         None
     } else if is_review {
         review_verdict
@@ -2997,6 +3059,7 @@ fn run_worker_inner(
     } else {
         Some(TaskStatusWrite::unconditional(outcome.task_status))
     };
+    let candidate_commit = ingest_candidate.or(candidate_commit);
     let ended_at = ids::now_rfc3339();
     let finish = RunFinish {
         status: outcome.run_status,
@@ -3152,7 +3215,7 @@ mod tests {
         let o = classify_outcome(
             &ok_result(),
             Some(0),
-            &IngestOutcome::Ok { summary: "s".into(), claim_count: 1 },
+            &IngestOutcome::Ok { summary: "s".into(), claim_count: 1, brief: "s".into() },
             None,
         );
         // T10 #39: assert the full Outcome, not just a couple of fields.
@@ -3331,7 +3394,7 @@ mod tests {
         let o = classify_outcome(
             &ok_result(),
             Some(2),
-            &IngestOutcome::Ok { summary: "s".into(), claim_count: 0 },
+            &IngestOutcome::Ok { summary: "s".into(), claim_count: 0, brief: "s".into() },
             None,
         );
         assert_eq!(o.run_status, RunStatus::Failed);

@@ -8,6 +8,7 @@ macro_rules! masked_eprintln {
 
 mod adapter;
 mod blobs;
+mod brief;
 mod checks;
 mod cli;
 mod commands;
@@ -19,6 +20,7 @@ mod handoff;
 mod ids;
 mod ingest;
 mod lang;
+mod login_name;
 mod mcp;
 mod model;
 mod model_list;
@@ -30,6 +32,7 @@ mod protected;
 mod records;
 mod redact;
 mod result_json;
+mod review_fix_edits;
 mod review_json;
 mod run_quota;
 mod runner;
@@ -126,6 +129,7 @@ fn main() {
         cli::Command::Transcript { json, .. } => *json,
         cli::Command::Review { action } => match action {
             cli::ReviewAction::Start { json, .. } => *json,
+            cli::ReviewAction::Confirm { json, .. } => *json,
             cli::ReviewAction::Show { json, .. } => *json,
             cli::ReviewAction::Record { json, .. } => *json,
             cli::ReviewAction::Packet { json, .. } => *json,
@@ -300,12 +304,12 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                 commands::usage::profile_usage(&paths, id.as_deref(), refresh, json)
             }
         },
-        cli::Command::Recommend { role, task, model, json } => {
+        cli::Command::Recommend { role, task, model, tables, json } => {
             let paths = config::Paths::from_env()?;
             // RJ-2: recommend reads the score caches, so like `report` it may
             // refresh them once a day.
             commands::models::with_auto_refresh(|| {
-                commands::usage::recommend(&paths, &role, task.as_deref(), model.as_deref(), json)
+                commands::usage::recommend(&paths, &role, task.as_deref(), model.as_deref(), tables, json)
             })
         }
         cli::Command::Models { refresh, json } => {
@@ -476,6 +480,7 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                     timeout,
                     effort,
                     reason,
+                    edit,
                     json,
                 } => {
                     let result = commands::review::start(
@@ -488,13 +493,38 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                             timeout_seconds: timeout,
                             effort: effort.as_deref(),
                             reason: reason.as_deref(),
+                            edit,
                             json,
                         },
                     );
                     refreshing(&paths, result)
                 }
-                cli::ReviewAction::Show { task, json } => {
-                    commands::review::show(&paths, &cwd, &task, json)
+                cli::ReviewAction::Confirm {
+                    task,
+                    profile,
+                    model,
+                    timeout,
+                    effort,
+                    reason,
+                    json,
+                } => {
+                    let result = commands::review::confirm(
+                        &paths,
+                        &cwd,
+                        commands::review::ConfirmArgs {
+                            task: &task,
+                            profile: &profile,
+                            model: &model,
+                            timeout_seconds: timeout,
+                            effort: effort.as_deref(),
+                            reason: reason.as_deref(),
+                            json,
+                        },
+                    );
+                    refreshing(&paths, result)
+                }
+                cli::ReviewAction::Show { task, full, json } => {
+                    commands::review::show(&paths, &cwd, &task, full, json)
                 }
                 cli::ReviewAction::Record { task, file, json } => {
                     let result = commands::review::record(

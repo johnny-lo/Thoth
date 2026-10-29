@@ -123,6 +123,9 @@ struct Snapshot {
     counts: Counts,
     /// TIER-1: account id -> bracket text, from this machine's global.db.
     labels: HashMap<String, String>,
+    /// PANEL-3: account id -> stored login name, for the account block only:
+    /// the decision table's rows may come from other machines.
+    login_names: HashMap<String, String>,
 }
 
 impl Snapshot {
@@ -130,6 +133,16 @@ impl Snapshot {
     /// tier or label for. Not yet HTML-escaped.
     fn named(&self, id: &str) -> String {
         plan_label::named(id, self.labels.get(id).map(String::as_str), Lang::ZhTw)
+    }
+
+    /// `claude-a（alice，Max）`: `named` with this machine's login name.
+    fn named_with_login(&self, id: &str) -> String {
+        crate::login_name::named(
+            id,
+            self.login_names.get(id).map(String::as_str),
+            self.labels.get(id).map(String::as_str),
+            Lang::ZhTw,
+        )
     }
 }
 
@@ -197,6 +210,7 @@ impl Snapshot {
         let profiles = crate::db::global::list_profiles(&global)?;
         let repo_ids = usage::registered_repos(&global)?;
         let labels = plan_label::labels(&global);
+        let login_names = crate::login_name::names(&global);
 
         // Only repos whose state.db exists: a registration left behind by a
         // deleted repo is skipped, and nothing is created for it.
@@ -274,6 +288,7 @@ impl Snapshot {
             findings,
             counts,
             labels,
+            login_names,
         })
     }
 }
@@ -773,7 +788,7 @@ fn render_accounts(h: &mut String, s: &Snapshot) {
         let _ = write!(
             h,
             "<span class=\"acct-name\">{}</span><span class=\"acct-prov\">{}</span><span class=\"pill {class}\">{}</span>",
-            esc(&s.named(&a.profile.profile_id)),
+            esc(&s.named_with_login(&a.profile.profile_id)),
             esc(&a.profile.provider),
             esc(&status)
         );

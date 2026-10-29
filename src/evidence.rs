@@ -968,13 +968,52 @@ pub fn record_diff_attributed(
     to: &str,
     attribution: Option<&Attribution<'_>>,
 ) -> Result<String> {
+    record_diff_labelled(conn, ctx, git_dir, from, to, attribution, "")
+}
+
+/// RFIX-1: a label prefix that marks the evidence of an edit review's fix.
+pub const REVIEW_FIX_LABEL_PREFIX: &str = "review fix: ";
+
+/// RFIX-1: the diff from the candidate to an edit review's fix, recorded on
+/// the review run and labelled as the fix.
+pub fn record_review_fix_diff(
+    conn: &Connection,
+    ctx: &EvidenceContext<'_>,
+    git_dir: &Path,
+    from: &str,
+    to: &str,
+) -> Result<String> {
+    record_diff_labelled(conn, ctx, git_dir, from, to, None, REVIEW_FIX_LABEL_PREFIX)
+}
+
+/// RFIX-1: the fix commit, labelled as the fix.
+pub fn record_review_fix_commit(
+    conn: &Connection,
+    ctx: &EvidenceContext<'_>,
+    git_dir: &Path,
+    sha: &str,
+) -> Result<String> {
+    record_commit_labelled(conn, ctx, git_dir, sha, REVIEW_FIX_LABEL_PREFIX)
+}
+
+fn record_diff_labelled(
+    conn: &Connection,
+    ctx: &EvidenceContext<'_>,
+    git_dir: &Path,
+    from: &str,
+    to: &str,
+    attribution: Option<&Attribution<'_>>,
+    label_prefix: &str,
+) -> Result<String> {
     let stat = crate::worktree::diff_stat(git_dir, from, to)?;
     let files = crate::worktree::diff_name_only(git_dir, from, to)?;
     let patch = crate::worktree::diff_patch(git_dir, from, to)?;
     // P7-2: the existing test files and check inputs this diff modified or
     // deleted (and the added files named like a check word), worked out here
     // by the control plane so neither the worker nor the reviewer has to be
-    // trusted to notice. Ingest rule 6 and the review packet read this key.
+    // trusted to notice. The review packet, the reviewer's prompt, `checks
+    // approve --run` and the review gate read this key; since LEAN-1 the
+    // worker does not have to declare any of it.
     let catalogue = crate::protected::Catalogue::load(conn)?;
     let base = attribution.map(|a| a.task_base).unwrap_or(from);
     let own = crate::worktree::diff_name_status(git_dir, base, to)?;
@@ -1001,25 +1040,37 @@ pub fn record_diff_attributed(
         }
         None => None,
     };
-    let protected_changes: Vec<serde_json::Value> = crate::protected::changes(
-        &catalogue,
-        &crate::protected::attributed(&own, keep.as_deref()),
-    )
-    .iter()
-    .map(|c| c.to_json())
-    .collect();
+    let mine = crate::protected::attributed(&own, keep.as_deref());
+    let mut listed = crate::protected::changes(&catalogue, &mine);
+    // LEAN-1: an existing .rs file the path rules leave out is read at the
+    // task's base and at the candidate, and listed as `inline_test` when its
+    // test region changed; a file that cannot be read is listed too, with
+    // the reason in `inline_test_errors`.
+    let (inline, inline_errors) = crate::protected::inline_changes(&catalogue, &mine, |path, at_candidate| {
+        let commit = if at_candidate { to } else { base };
+        crate::worktree::blob_at(git_dir, commit, path).map_err(|e| format!("{e:#}"))
+    });
+    listed.extend(inline);
+    listed.sort_by(|a, b| a.path.cmp(&b.path));
+    let protected_changes: Vec<serde_json::Value> = listed.iter().map(|c| c.to_json()).collect();
+    let inline_test_errors: Vec<serde_json::Value> =
+        inline_errors.iter().map(|e| e.to_json()).collect();
     let (sha, bytes, path) = crate::blobs::put_bytes(ctx.paths, ctx.repo_id, &patch)?;
-    let detail = serde_json::json!({
+    #[allow(unused_mut)]
+    let mut detail = serde_json::json!({
         "from_commit": from,
         "to_commit": to,
         "files_changed": files,
         "touches_tests": touches_tests(&files),
         "protected_changes": protected_changes,
+        "inline_test_errors": inline_test_errors,
         "stat": stat,
         "protected_base": base,
         "integration_tip": tip_used,
     });
-    let label = format!("git diff {}..{}", short_sha(from), short_sha(to));
+    #[cfg(debug_assertions)]
+    test_pre_lean(&mut detail);
+    let label = format!("{label_prefix}git diff {}..{}", short_sha(from), short_sha(to));
     insert_row(
         conn,
         ctx,
@@ -1032,6 +1083,24 @@ pub fn record_diff_attributed(
     )
 }
 
+/// Test seam (GATE-1), debug builds only, so a release build has no such
+/// switch. When `THOTH_TEST_DIFF_PRE_LEAN` is set, a diff evidence row is
+/// written as a thoth before LEAN-1 wrote it: no `inline_test` entries and no
+/// `inline_test_errors` key, so a test can make one through the CLI and check
+/// how the gates read it.
+#[cfg(debug_assertions)]
+fn test_pre_lean(d: &mut serde_json::Value) {
+    if std::env::var_os("THOTH_TEST_DIFF_PRE_LEAN").is_none() {
+        return;
+    }
+    if let Some(a) = d["protected_changes"].as_array_mut() {
+        a.retain(|c| c["kind"] != crate::protected::Kind::InlineTest.as_str());
+    }
+    if let Some(o) = d.as_object_mut() {
+        o.remove("inline_test_errors");
+    }
+}
+
 /// brief §2: the candidate commit itself. The blob is `git show --stat`, which
 /// is what an operator wants when they ask "what is this commit".
 pub fn record_commit(
@@ -1039,6 +1108,16 @@ pub fn record_commit(
     ctx: &EvidenceContext<'_>,
     git_dir: &Path,
     sha: &str,
+) -> Result<String> {
+    record_commit_labelled(conn, ctx, git_dir, sha, "")
+}
+
+fn record_commit_labelled(
+    conn: &Connection,
+    ctx: &EvidenceContext<'_>,
+    git_dir: &Path,
+    sha: &str,
+    label_prefix: &str,
 ) -> Result<String> {
     let (subject, author_date) = crate::worktree::commit_meta(git_dir, sha)?;
     let stat = crate::worktree::show_stat(git_dir, sha)?;
@@ -1053,7 +1132,7 @@ pub fn record_commit(
         "author_date": author_date,
     });
     let label = format!(
-        "commit {} {}",
+        "{label_prefix}commit {} {}",
         short_sha(sha),
         label_from_command(&subject)
     );

@@ -78,9 +78,9 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "thoth_recommend",
-        description: "List every profile's quota facts for an implementer or reviewer run (eligible or not, and why) and the models it can run; the three external tables filtered to the organizations with an account here (Artificial Analysis indexes, Agent Arena ranks, AI Stupid Level's recent degradation); Thoth's own usage per account, model, effort and task type (average tokens and quota points, how many runs are left); and with task, the task's attempts and reject history. It does not choose a profile, model or effort for you.",
+        description: "For every account, its quota facts and windows for an implementer or reviewer run (eligible or not, and why), the models it can run now with each model's matching scores in the three external tables (Artificial Analysis indexes, Agent Arena ranks, AI Stupid Level's recent degradation), Thoth's own usage of that account and model (average tokens and quota points, how many runs are left), and the model names no table matched; with tables true the three full filtered tables too; with task the task's attempts and reject history. It does not choose a profile, model or effort for you.",
         read_only: true,
-        params: &[p!("role", R, true), p!("task", S, false), REPO],
+        params: &[p!("role", R, true), p!("task", S, false), p!("tables", B, false), REPO],
         command: &["recommend"],
     },
     Tool {
@@ -176,7 +176,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "thoth_review_start",
-        description: "Start a review run and immediately return its run id. Give model and effort on the first review of an attempt; starting it again keeps the previous run's. effort can be left out only for a model without an effort setting (haiku) or an agy model whose name ends in its level (gemini-3.8-flash-high); any other agy model takes --effort low|medium|high|xhigh|max.",
+        description: "Start a review run and immediately return its run id. Give model and effort on the first review of an attempt; starting it again keeps the previous run's. effort can be left out only for a model without an effort setting (haiku) or an agy model whose name ends in its level (gemini-3.8-flash-high); any other agy model takes --effort low|medium|high|xhigh|max. With edit true (code tasks only) the reviewer may attach a small fix to its REJECT; thoth applies it within fixed bounds on thoth/TASK/aN-fix, and thoth_review_show reports pending_fix true until it is verified and confirmed with thoth_review_confirm.",
         read_only: false,
         params: &[
             p!("task", S, true),
@@ -185,15 +185,31 @@ pub static TOOLS: &[Tool] = &[
             p!("timeout", S, false),
             p!("effort", S, false),
             p!("reason", S, false),
+            p!("edit", B, false),
             REPO,
         ],
         command: &["review", "start"],
     },
     Tool {
+        name: "thoth_review_confirm",
+        description: "Start the confirmer of the task's pending fix (an edit review's applied fix, verified first with thoth_verify_start on the edit review's run) and immediately return its run id. The confirmer only confirms the fix: ok or revise for each edit, no new review. APPROVE with a green verify passes the task on the fix branch (thoth_review_show's merge_branch); anything else rejects it, to be redone from the original candidate. Give profile, model and effort every time; the edit review's own model at its own effort is refused. Block on it with thoth_wait (run).",
+        read_only: false,
+        params: &[
+            p!("task", S, true),
+            p!("profile", S, true),
+            p!("model", S, true),
+            p!("timeout", S, false),
+            p!("effort", S, false),
+            p!("reason", S, false),
+            REPO,
+        ],
+        command: &["review", "confirm"],
+    },
+    Tool {
         name: "thoth_review_show",
-        description: "Show the recorded review for a task.",
+        description: "Show the recorded review for a task; full adds the worker claims it judged.",
         read_only: true,
-        params: &[p!("task", S, true), REPO],
+        params: &[p!("task", S, true), p!("full", B, false), REPO],
         command: &["review", "show"],
     },
     Tool {
@@ -381,7 +397,7 @@ mod tests {
     use super::*;
     #[test]
     fn table_and_schema_agree_and_list_is_small() {
-        let (mut booleans, mut arrays) = (0, 0);
+        let (mut booleans, mut arrays) = (Vec::new(), Vec::new());
         for t in TOOLS {
             let d = definition(t);
             let props = d["inputSchema"]["properties"].as_object().unwrap();
@@ -389,14 +405,14 @@ mod tests {
                 match p.kind {
                     Kind::Bool => {
                         assert_eq!(props[p.name], json!({"type":"boolean"}));
-                        booleans += 1;
+                        booleans.push((t.name, p.name));
                     }
                     Kind::StrArray => {
                         assert_eq!(
                             props[p.name],
                             json!({"type":"array","items":{"type":"string"}})
                         );
-                        arrays += 1;
+                        arrays.push((t.name, p.name));
                     }
                     Kind::String => assert_eq!(props[p.name], json!({"type":"string"})),
                     Kind::Integer => assert_eq!(props[p.name], json!({"type":"integer"})),
@@ -425,9 +441,19 @@ mod tests {
                     .collect()
             );
         }
-        // thoth_verify_start has two booleans and thoth_spec_review_start one
-        // (SR-3 `edit`), thoth_checks_add one string array
-        assert_eq!((booleans, arrays), (3, 1));
+        // The known booleans and string arrays, found by tool and parameter
+        // name, are typed as such; a new one does not change the check.
+        for known in [
+            ("thoth_verify_start", "at_base"),
+            ("thoth_verify_start", "dry_run"),
+            ("thoth_spec_review_start", "edit"),
+            ("thoth_recommend", "tables"),
+            ("thoth_review_start", "edit"),
+            ("thoth_review_show", "full"),
+        ] {
+            assert!(booleans.contains(&known), "{known:?} is a boolean");
+        }
+        assert!(arrays.contains(&("thoth_checks_add", "inputs")));
         assert!(
             serde_json::to_vec(&json!({"tools":TOOLS.iter().map(definition).collect::<Vec<_>>() }))
                 .unwrap()

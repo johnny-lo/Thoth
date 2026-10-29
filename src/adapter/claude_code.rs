@@ -79,11 +79,17 @@ pub const CHECKS_NOTE: &str = "Run the tests the spec names before you finish. Y
 /// language's repo.
 pub const SUITE_NOTE: &str = "Evidence for the whole test suite comes from the control plane's verify of the checks above, not from you. Run the tests the spec names, each as its own foreground command, and do not start a whole-suite run that cannot finish within one command's time limit; when the spec asks for the whole suite, run it in parts that each finish, and keep each part's output.\n";
 
-/// P7-2: the worker prompt's last section. It says which changes ingest rule 6
-/// expects a `protected_change` claim for, and lists what the worker cannot
-/// work out by itself: the input files of every check (approved or not, the
-/// set rule 6 compares against), the check words, and the repo's extra
-/// patterns, all from `protected`.
+/// LEAN-1: right after the result.json shape. The summary is for what Thoth
+/// cannot record by itself; files, commands, exit codes and usage it already
+/// has.
+pub const SUMMARY_NOTE: &str = "In the summary, say what you intended, its limitations and the decisions you made. Do not reproduce file lists, command logs, exit codes or usage: Thoth already records them.\n";
+
+/// P7-2: the worker prompt's last section. LEAN-1: Thoth works the list of
+/// protected changes out from the diff itself, so the section only says what
+/// is recorded and that the commander approves it; the worker declares
+/// nothing. It lists what the worker cannot work out by itself: the input
+/// files of every check (approved or not), the check words, and the repo's
+/// extra patterns, all from `protected`.
 pub fn protected_section(protected: &crate::protected::Catalogue) -> String {
     let list = |items: &[String]| {
         if items.is_empty() {
@@ -93,7 +99,7 @@ pub fn protected_section(protected: &crate::protected::Catalogue) -> String {
         }
     };
     let mut s = String::from("\n## Protected files\n");
-    s.push_str("If you modify or delete an existing test file, or one of the check input files listed below, add one claim of kind protected_change per file to .agent/result.json. Its text starts with the file's path, then says why the change was needed, for example {\"kind\":\"protected_change\",\"text\":\"tests/x.rs: the old assertion contradicted AC2\",\"evidence\":[]}. A file you add needs no such claim, with one exception: a file you add, modify or delete whose name, up to its first dot, is one of the check words listed below must be declared the same way. The list is computed from the task's base commit, so changes that earlier runs of this attempt left in the worktree count too: declare them again in every delivery's result.json. An existing file is one that exists at the task's base commit: a test file this task itself added, in this or an earlier attempt, is not one, and changing it again needs no claim. Changes that arrive through a git merge of the main branch are not yours either: a file whose content at your final commit equals its content on the main branch is not counted. Changes an earlier attempt of this task made to an existing test file or check input, and check-word files it added, are still in the list: declare them again. A result.json that leaves one of these changes undeclared is not accepted.\n");
+    s.push_str("Thoth records protected changes automatically from the diff between the task's base commit and your final commit: every existing test file, and every check input file listed below, that you modify or delete; every existing Rust source file whose inline test region (from its first #[test], #[tokio::test] or #[cfg(test)] module attribute to the end of the file) you change or delete; and every file you add, modify or delete whose name, up to its first dot, is one of the check words listed below. You do not need to declare these files in .agent/result.json, and a delivery is not refused for leaving them out; a claim of kind protected_change is optional. The commander reads the recorded list and approves each test, inline test and check-word change before a review can pass, so change existing tests only when the spec requires it and say why in your summary. Test files this task added itself, and changes that arrive through a git merge of the main branch, are not listed.\n");
     s.push_str("Test files are recognised by path: anything under a tests/, test/ or __tests__/ directory, and names such as test_*, *_test.rs, *.test.ts, *.spec.ts or conftest.py.\n");
     s.push_str(&format!("Check input files: {}\n", list(&protected.inputs)));
     s.push_str(&format!("Check words: {}\n", list(&protected.stems)));
@@ -278,7 +284,9 @@ fn build_prompt_impl(
     }
     s.push_str("{\"task_id\":\"");
     s.push_str(task_id);
-    s.push_str("\",\"status\":\"completed\",\"summary\":\"<one paragraph>\",\"claims\":[{\"kind\":\"test_result\",\"text\":\"...\",\"evidence\":[]}],\"verification_requests\":[{\"cmd\":\"...\",\"cwd\":\".\"}]}\n");
+    s.push_str("\",\"status\":\"completed\",\"brief\":\"<short conclusion>\",\"summary\":\"<one paragraph>\",\"claims\":[{\"kind\":\"test_result\",\"text\":\"...\",\"evidence\":[]}]}\n");
+    s.push_str(BRIEF_NOTE);
+    s.push_str(SUMMARY_NOTE);
     s.push_str("Do not modify files outside this directory. Do not push.\n");
     if !worker_commits {
         s.push_str("Do not commit: leave your changes in the worktree. thoth will commit whatever is there once this run finishes cleanly.\n");
@@ -288,6 +296,10 @@ fn build_prompt_impl(
     s.push_str(&protected_section(protected));
     s
 }
+
+/// BRIEF-1: what the worker puts in result.json's `brief`, which the
+/// commander reads first.
+pub const BRIEF_NOTE: &str = "`brief` is your short conclusion, which the commander reads first: what you delivered (name the paths of any documents you wrote), the outcome of your checks in one sentence, and any decision you need from the commander. Keep it within 1,000 characters: a longer brief is cut at 1,000 characters and marked as cut, and without a brief the start of your summary is shown instead. Put the full explanation in `summary`. Do not list the files you changed or the commands you ran in either: they are already recorded as evidence.\n";
 
 /// The worker prompt's note that the run is one unattended turn. A worker that
 /// starts a command in the background and ends its turn is killed with it, and
@@ -373,7 +385,7 @@ pub fn build_review_prompt(
     // changed. Whether a change weakened a check is the reviewer's call, so
     // the list comes with the instruction to make it, file by file.
     if !protected_changes.is_empty() {
-        s.push_str("   Protected files this candidate changed (existing test files, check input files, and files named like a word of a check's command), as worked out by the control plane from the diff:\n");
+        s.push_str("   Protected files this candidate changed (existing test files, check input files, existing Rust source files whose inline test region changed, and files named like a word of a check's command), as worked out by the control plane from the diff:\n");
         for line in protected_changes {
             s.push_str(&format!("   - {line}\n"));
         }
@@ -1618,23 +1630,11 @@ mod tests {
             let at = p.find("\n## Protected files\n").expect("section");
             assert!(at > p.find("## Evidence").unwrap(), "after the Evidence section");
             let section = &p[at..];
-            assert!(section.contains("modify or delete an existing test file"));
-            assert!(section.contains("one claim of kind protected_change per file"));
-            assert!(section.contains("Its text starts with the file's path"));
-            assert!(section.contains("A file you add needs no such claim"));
             assert!(section.contains(
                 "Check input files: Cargo.lock, Cargo.toml, scripts/test_public_tree.py\n"
             ));
             assert!(section.contains("Check words: cargo, python, test, test_public_tree\n"));
-            assert!(section.contains(
-                "a file you add, modify or delete whose name, up to its first dot, is one of the \
-                 check words listed below must be declared the same way"
-            ));
             assert!(section.contains("add, modify or delete"));
-            assert!(section.contains("earlier runs of this attempt"));
-            assert!(section.contains("declare them again"));
-            assert!(section.contains("exists at the task's base commit"));
-            assert!(section.contains("equals its content on the main branch"));
             assert!(section.contains("Also treated as test files in this repo: *.snap\n"));
         }
 

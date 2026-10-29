@@ -624,6 +624,7 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
         );
     }
     plan_label::remember_or_warn(&gconn, &profile.profile_id, auth.subscription_type.as_deref());
+    crate::login_name::remember_or_warn(&gconn, &profile.profile_id, auth.email.as_deref());
     // MODELS-1: the list the login check just read is stored, then the model
     // is checked against it (agy) or against the models a run proved this
     // account cannot use (Claude), still before anything is written.

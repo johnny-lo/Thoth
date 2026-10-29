@@ -8,7 +8,9 @@ use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestOutcome {
-    Ok { summary: String, claim_count: usize },
+    /// `brief` is the delivery's short conclusion (BRIEF-1), masked and cut;
+    /// for a review it is the summary itself.
+    Ok { summary: String, claim_count: usize, brief: String },
     Invalid { reason: String },
     /// The run did not reach a state where ingest is even attempted.
     Skipped,
@@ -188,49 +190,12 @@ pub fn ingest_with_evidence(
         resolved.push(rows);
     }
 
-    // Rule 6 (P7-2). The control plane worked out, from the diff, which
-    // protected files this run modified or deleted (`protected_changes` on the
-    // run's newest diff evidence). Each one must be declared by a
-    // `protected_change` claim whose text starts with the path. The claim
-    // cites nothing - the diff evidence does not exist yet while the worker is
-    // writing result.json - and whether the change weakened a check is left to
-    // the reviewer. A run with no diff evidence has nothing to compare against;
-    // the list is read leniently (`changes_in_detail`), so one written before
-    // the key existed has nothing either.
-    let undeclared = match crate::protected::latest_diff(conn, run) {
-        Ok(latest) => latest
-            .map(|d| crate::protected::changes_in_detail(&d.detail))
-            .unwrap_or_default()
-            .into_iter()
-            .find(|ch| {
-                !parsed.claims.iter().any(|c| {
-                    c.kind == crate::protected::CLAIM_KIND
-                        && crate::protected::claim_declares(&c.text, &ch.path)
-                })
-            }),
-        Err(e) => {
-            return reject(
-                conn,
-                run,
-                format!("reading the run's diff evidence failed: {e}"),
-                serde_json::json!({ "rule": 6 }),
-            )
-        }
-    };
-    if let Some(ch) = undeclared {
-        return reject(
-            conn,
-            run,
-            format!(
-                "claim missing for protected file {} ({}): add a claim of kind protected_change \
-                 whose text starts with the path and explains the change",
-                ch.path, ch.status
-            ),
-            serde_json::json!({
-                "rule": 6, "path": ch.path, "status": ch.status, "kind": ch.kind,
-            }),
-        );
-    }
+    // Rule 6 (P7-2) is retired (LEAN-1): it refused a delivery that did not
+    // declare, claim by claim, each protected file the diff evidence lists.
+    // The list is the diff evidence's own (`protected_changes`), the review
+    // packet and the reviewer's prompt show it, and the commander approves it
+    // with `checks approve --run`; a `protected_change` claim is optional and
+    // stored as written. The number is not reused.
 
     // Rule 7 (RES-1a). A research task's completed delivery is its sourced
     // claims; without one the source audit would have nothing to check. The
@@ -387,18 +352,28 @@ pub fn ingest_with_evidence(
     // of here when the worktree's own copy is gone (Open question 15).
     let raw: serde_json::Value =
         serde_json::from_str(json_text).unwrap_or(serde_json::Value::Null);
+    // BRIEF-1: the short conclusion, masked before it is cut; `summary` and
+    // `result_json` keep the whole delivery.
+    let brief = crate::brief::for_delivery(&crate::redact::Masker::current(), &raw, &parsed.summary);
+    #[allow(unused_mut)]
+    let mut detail = serde_json::json!({
+        "summary": parsed.summary,
+        "claim_count": parsed.claims.len(),
+        "evidence_refs": evidence_refs,
+        "result_json": raw,
+        "brief": brief.text,
+        "brief_source": brief.source,
+        "brief_truncated": brief.truncated,
+    });
+    #[cfg(debug_assertions)]
+    test_pre_brief(&mut detail);
     if let Err(e) = state::append_event(
         &tx,
         &NewEvent {
             task_id: Some(run.task_id.clone()),
             run_id: Some(run.run_id.clone()),
             event_type: event_type::RESULT_INGESTED.to_string(),
-            detail: serde_json::json!({
-                "summary": parsed.summary,
-                "claim_count": parsed.claims.len(),
-                "evidence_refs": evidence_refs,
-                "result_json": raw,
-            }),
+            detail,
         },
     ) {
         let reason = format!("recording result_ingested event failed: {e}");
@@ -418,6 +393,24 @@ pub fn ingest_with_evidence(
     IngestOutcome::Ok {
         summary: parsed.summary,
         claim_count: parsed.claims.len(),
+        brief: brief.text,
+    }
+}
+
+/// Test seam, for tests/brief.rs only; debug builds only, so a release build
+/// has no such switch. When `THOTH_TEST_RESULT_PRE_BRIEF` is set, a
+/// `result_ingested` event leaves out the keys BRIEF-1 added, as a thoth from
+/// before BRIEF-1 wrote it, so a test can make one through the CLI and check
+/// how it is read.
+#[cfg(debug_assertions)]
+fn test_pre_brief(d: &mut serde_json::Value) {
+    if std::env::var_os("THOTH_TEST_RESULT_PRE_BRIEF").is_none() {
+        return;
+    }
+    if let Some(o) = d.as_object_mut() {
+        for k in ["brief", "brief_source", "brief_truncated"] {
+            o.remove(k);
+        }
     }
 }
 
@@ -613,7 +606,7 @@ mod tests {
                  "verification_requests":[{{"cmd":"cargo test","cwd":"."}}]}}"#
         );
         match ingest_with_evidence(&conn, &run, "normal", &json) {
-            IngestOutcome::Ok { summary, claim_count } => {
+            IngestOutcome::Ok { summary, claim_count, .. } => {
                 assert_eq!(summary, "did it");
                 assert_eq!(claim_count, 2);
             }
@@ -941,128 +934,6 @@ mod tests {
         ));
         let claims = state::list_claims_for_run(&conn, &run.run_id).unwrap();
         assert_eq!(claims[0].kind, "protected_change");
-    }
-
-    /// AC4, the negative cases: a text naming a longer path, a text naming
-    /// only the file name, no claim at all, and the right text under another
-    /// kind are all rule 6.
-    #[test]
-    fn rule6_an_undeclared_protected_change_is_unverified() {
-        const REASON: &str = "claim missing for protected file tests/x.rs (modified): add a claim \
-                              of kind protected_change whose text starts with the path and \
-                              explains the change";
-        for claims in [
-            r#"[{"kind":"protected_change","text":"tests/x.rs2: a different file"}]"#,
-            r#"[{"kind":"protected_change","text":"x.rs: the file name alone"}]"#,
-            r#"[]"#,
-            r#"[{"kind":"completion","text":"tests/x.rs: right text, wrong kind"}]"#,
-        ] {
-            let (conn, run) = setup();
-            seed_diff(&conn, &run.run_id, "E003", &[("tests/x.rs", "modified", "test")]);
-            let reason = invalid_reason(ingest_with_evidence(
-                &conn,
-                &run,
-                "normal",
-                &result_with_claims(claims),
-            ));
-            assert_eq!(reason, REASON, "claims were {claims}");
-            let detail = last_invalid_detail(&conn);
-            assert_eq!(detail["rule"], 6);
-            assert_eq!(detail["path"], "tests/x.rs");
-            assert_eq!(detail["status"], "modified");
-            assert_eq!(detail["kind"], "test");
-            assert_eq!(detail["reason"], REASON);
-            // rejected before any write
-            assert!(state::list_claims_for_run(&conn, &run.run_id).unwrap().is_empty());
-        }
-    }
-
-    /// AC4: every listed file needs its own claim, and the reason names the
-    /// one that is missing with its own status.
-    #[test]
-    fn rule6_every_protected_change_needs_its_own_claim() {
-        let (conn, run) = setup();
-        seed_diff(
-            &conn,
-            &run.run_id,
-            "E003",
-            &[("Cargo.lock", "deleted", "check_input"), ("tests/x.rs", "modified", "test")],
-        );
-        let one = result_with_claims(r#"[{"kind":"protected_change","text":"tests/x.rs: reason"}]"#);
-        let reason = invalid_reason(ingest_with_evidence(&conn, &run, "normal", &one));
-        assert!(reason.contains("Cargo.lock (deleted)"), "reason was: {reason}");
-        let detail = last_invalid_detail(&conn);
-        assert_eq!(detail["rule"], 6);
-        assert_eq!(detail["kind"], "check_input");
-
-        let both = result_with_claims(
-            r#"[{"kind":"protected_change","text":"tests/x.rs: reason"},
-                {"kind":"protected_change","text":"Cargo.lock no longer needed"}]"#,
-        );
-        assert!(matches!(
-            ingest_with_evidence(&conn, &run, "normal", &both),
-            IngestOutcome::Ok { claim_count: 2, .. }
-        ));
-    }
-
-    /// AC9: an added file named like a check word is handled by rule 6 exactly
-    /// like the other kinds, and the reason says `added`.
-    #[test]
-    fn rule6_treats_an_added_check_word_file_like_the_other_kinds() {
-        let (conn, run) = setup();
-        seed_diff(&conn, &run.run_id, "E003", &[("cargo.bat", "added", "check_word")]);
-        let reason = invalid_reason(ingest_with_evidence(
-            &conn,
-            &run,
-            "normal",
-            &result_with_claims("[]"),
-        ));
-        assert!(reason.contains("cargo.bat"), "reason was: {reason}");
-        assert!(reason.contains("added"), "reason was: {reason}");
-        let detail = last_invalid_detail(&conn);
-        assert_eq!(detail["rule"], 6);
-        assert_eq!(detail["status"], "added");
-        assert_eq!(detail["kind"], "check_word");
-
-        let declared = result_with_claims(
-            r#"[{"kind":"protected_change","text":"cargo.bat: a wrapper the task asked for"}]"#,
-        );
-        assert!(matches!(
-            ingest_with_evidence(&conn, &run, "normal", &declared),
-            IngestOutcome::Ok { .. }
-        ));
-    }
-
-    /// AC4: rule 6 reads the run's newest diff evidence - the largest code
-    /// number, not the largest string - and no other run's.
-    #[test]
-    fn rule6_reads_only_this_runs_newest_diff_evidence() {
-        let (conn, run) = setup();
-        let nothing = result_with_claims("[]");
-
-        // no diff evidence at all: rule 6 does not apply
-        assert!(matches!(
-            ingest_with_evidence(&conn, &run, "normal", &nothing),
-            IngestOutcome::Ok { .. }
-        ));
-
-        // another run's diff is not this run's
-        let other = demo_run_row("01HZRUNIDOTHEROTHEROTHER1");
-        state::insert_run(&conn, &other).unwrap();
-        seed_diff(&conn, &other.run_id, "E002", &[("tests/x.rs", "modified", "test")]);
-        assert!(matches!(
-            ingest_with_evidence(&conn, &run, "normal", &nothing),
-            IngestOutcome::Ok { .. }
-        ));
-
-        // E9 lists a change, the newer E10 lists none: E10 decides
-        seed_diff(&conn, &run.run_id, "E9", &[("tests/x.rs", "modified", "test")]);
-        assert_eq!(last_rule(&conn, &run, &nothing), Some(6));
-        seed_diff(&conn, &run.run_id, "E10", &[]);
-        assert!(matches!(
-            ingest_with_evidence(&conn, &run, "normal", &nothing),
-            IngestOutcome::Ok { .. }
-        ));
     }
 
     /// Ingests and returns the rule of the rejection, or `None` when accepted.

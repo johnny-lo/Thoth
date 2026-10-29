@@ -276,34 +276,26 @@ fn putting_back_mains_version_of_a_test_on_a_long_branch_is_a_protected_change()
         .args(["dispatch", &task, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium", "--json"]);
     let d = json_of(&lb.f.run_ok(c, "dispatch"));
     let run = s(&d["run_id"]);
+    // LEAN-1: listed on the diff evidence, without a rule 6 refusal
     let (_, status) = lb.f.wait_for(&task, "180s");
-    assert_eq!(status, "unverified", "{}", lb.f.explain_task(&task));
-
-    let mut c = lb.f.cmd();
-    c.args(["events", "--since", "0", "--task", &task, "--json"]);
-    let events = json_of(&lb.f.run_ok(c, "events"));
-    let invalid = events["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .rfind(|e| e["type"] == "result_invalid")
-        .expect("a result_invalid event")
-        .clone();
-    assert_eq!(invalid["detail"]["rule"], 6, "{invalid}");
-    assert_eq!(invalid["detail"]["path"], "tests/x_test.rs", "{invalid}");
+    assert_eq!(status, "in_review", "{}", lb.f.explain_task(&task));
 
     let mut c = lb.f.cmd();
     c.args(["evidence", "list", &task, "--json"]);
     let listed = json_of(&lb.f.run_ok(c, "evidence list"));
-    let code = listed["evidence"]
+    let diff = listed["evidence"]
         .as_array()
         .unwrap()
         .iter()
         .rfind(|e| e["kind"] == "diff" && e["run_id"] == run.as_str())
-        .expect("a diff evidence row")["code"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        .expect("a diff evidence row")
+        .clone();
+    assert_eq!(
+        diff["detail"]["protected_changes"],
+        serde_json::json!([{"path": "tests/x_test.rs", "status": "modified", "kind": "test"}]),
+        "{diff}"
+    );
+    let code = diff["code"].as_str().unwrap().to_string();
     let mut c = lb.f.cmd();
     c.args(["evidence", "show", &code, "--task", &task, "--json"]);
     let shown = json_of(&lb.f.run_ok(c, "evidence show"));

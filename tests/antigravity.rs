@@ -1483,6 +1483,17 @@ fn wait_run_human(f: &common::Fixture, run_id: &str, timeout: &str) -> (i32, Str
 
 const UNKNOWN_LINE: &str = "agy called tools Thoth does not know: ";
 
+/// The human `wait --run` lines of a run with a delivery, with the BRIEF-1
+/// `brief:` line (the second, equal to the `--json` output's `brief`) taken
+/// out, so the checks below see the lines they are about.
+fn lines_without_brief<'a>(human: &'a str, w: &Value) -> Vec<&'a str> {
+    let brief = w["brief"].as_str().unwrap_or_else(|| panic!("a delivered run has a brief: {w}"));
+    let mut lines: Vec<&str> = human.lines().collect();
+    assert!(lines.len() >= 2, "{human}");
+    assert_eq!(lines.remove(1), format!("brief: {brief}"), "{human}");
+    lines
+}
+
 /// The `status TASK --json` entry of one run.
 fn status_run(f: &common::Fixture, task_id: &str, run_id: &str) -> Value {
     let mut c = f.cmd();
@@ -1525,7 +1536,7 @@ fn an_unknown_agy_tool_name_is_denied_as_unknown_and_shown_by_wait() {
     assert_eq!(w["timed_out"], false, "{w}");
     let (code, human) = wait_run_human(&f, &run_id, "30s");
     assert_eq!(code, 0);
-    let lines: Vec<&str> = human.lines().collect();
+    let lines = lines_without_brief(&human, &w);
     assert_eq!(lines.len(), 2, "{human}");
     assert!(lines[0].starts_with(&format!("{run_id} completed")), "{human}");
     assert_eq!(lines[1], "agy called tools Thoth does not know: frobnicate_file; its tool names may have changed (AGY-1)");
@@ -1556,7 +1567,7 @@ fn a_known_but_denied_agy_tool_is_not_an_unknown_one() {
     let (_, w) = wait_run_json(&f, &run_id, "30s");
     assert_eq!(w["tools_unknown"], serde_json::json!([]), "{w}");
     let (_, human) = wait_run_human(&f, &run_id, "30s");
-    assert_eq!(human.lines().count(), 1, "{human}");
+    assert_eq!(lines_without_brief(&human, &w).len(), 1, "{human}");
     assert!(!human.contains(UNKNOWN_LINE), "{human}");
 }
 
@@ -1784,7 +1795,7 @@ fn wait_reads_only_a_string_array_from_the_newest_usage_else_nothing() {
     assert_eq!((code, w["status"].as_str()), (0, Some("completed")), "{w}");
     assert_eq!(w["tools_unknown"], serde_json::json!([]), "{w}");
     let (_, human) = wait_run_human(&f, &codex_run, "30s");
-    assert_eq!(human.lines().count(), 1, "{human}");
+    assert_eq!(lines_without_brief(&human, &w).len(), 1, "{human}");
     assert!(!human.contains(UNKNOWN_LINE), "{human}");
 
     // an agy run that saw an unknown name, then usages in the shapes an
@@ -1816,7 +1827,7 @@ fn wait_reads_only_a_string_array_from_the_newest_usage_else_nothing() {
         assert_eq!((code, w["status"].as_str()), (0, Some("completed")), "{what}: {w}");
         assert_eq!(w["tools_unknown"], serde_json::json!([]), "{what}: {w}");
         let (_, human) = wait_run_human(&f, &run_id, "30s");
-        assert_eq!(human.lines().count(), 1, "{what}: {human}");
+        assert_eq!(lines_without_brief(&human, &w).len(), 1, "{what}: {human}");
         assert!(!human.contains(UNKNOWN_LINE), "{what}: {human}");
     }
     // a newer string array is read again, and named in order on one line
@@ -1824,7 +1835,7 @@ fn wait_reads_only_a_string_array_from_the_newest_usage_else_nothing() {
     let (_, w) = wait_run_json(&f, &run_id, "30s");
     assert_eq!(w["tools_unknown"], serde_json::json!(["a_unknown", "z_unknown"]), "{w}");
     let (_, human) = wait_run_human(&f, &run_id, "30s");
-    let lines: Vec<&str> = human.lines().collect();
+    let lines = lines_without_brief(&human, &w);
     assert_eq!(lines.len(), 2, "{human}");
     assert_eq!(lines[1], "agy called tools Thoth does not know: a_unknown, z_unknown; its tool names may have changed (AGY-1)");
     // the codex run was never touched by any of this

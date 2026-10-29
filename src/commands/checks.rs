@@ -410,8 +410,8 @@ pub(crate) struct ApproveOutcome {
     pub source: &'static str,
     /// With `--run`: that run's id.
     pub protected_run: Option<String>,
-    /// With `--run`: the run's protected test and check-word changes approved
-    /// now (`protected::uncovered`).
+    /// With `--run`: the run's protected test, inline test and check-word
+    /// changes approved now (`protected::uncovered`).
     pub protected_approved: Vec<Change>,
     /// With `--run`: paths of those changes an earlier approval already covers.
     pub protected_unchanged: Vec<String>,
@@ -504,7 +504,8 @@ pub(crate) fn approve_checks(
         to_approve.push((c, fp));
     }
 
-    // With `run`: the run's protected test and check-word changes no earlier
+    // With `run`: the run's protected test, inline test and check-word
+    // changes no earlier
     // approval covers, read from its newest diff evidence. A list that cannot
     // be read is "not known", never "none": nothing is approved for it.
     let mut protected_approved: Vec<Change> = Vec::new();
@@ -513,10 +514,20 @@ pub(crate) fn approve_checks(
     let mut warnings: Vec<String> = Vec::new();
     if let Some(r) = &run_row {
         if let Some(latest) = crate::protected::latest_diff(&tx, r)? {
+            // GATE-1: an edit review run's diff is its fix's, which `review
+            // confirm` records again.
+            let again = if r.role == crate::model::role::REVIEWER
+                && crate::commands::review_fix::run_mode(&tx, &r.run_id)?
+                    == crate::spec_edits::ReviewMode::Edit
+            {
+                "review confirm"
+            } else {
+                "review start"
+            };
             match &latest.changes {
                 None => warnings.push(format!(
-                    "run {}'s diff evidence {} has no readable protected_changes; run review \
-                     start, then approve again",
+                    "run {}'s diff evidence {} has no readable protected_changes; run {again}, \
+                     then approve again",
                     r.run_id, latest.code
                 )),
                 Some(changes) => {

@@ -229,7 +229,7 @@ transcript 取得指令結束碼。diff 和候選
 commit 也會記下。輸出以 SHA-256 存放、只增不改，每次讀取都重新驗證雜湊。worker
 拿到的是 Thoth 產生的代碼索引，只能引用、不能修改。
 
-**6 個自動判成 `unverified` 的條件**，在寫入任何東西之前檢查：
+**5 個自動判成 `unverified` 的條件**，在寫入任何東西之前檢查：
 
 | 規則 | 符合時任務變成 `unverified` |
 |---|---|
@@ -238,7 +238,12 @@ commit 也會記下。輸出以 SHA-256 存放、只增不改，每次讀取都�
 | 3 | 主張引用的代碼不是這件任務的證據 |
 | 4 | 引用的證據不見了，或雜湊和當初記錄的不一致 |
 | 5 | 任務是 `risk: high`，而主張沒有引用任何由 Thoth 記錄的證據 |
-| 6 | diff 改到或刪掉既有的測試檔或檢查的輸入檔（或新增了和檢查指令裡的詞同名的檔），卻沒有 `protected_change` 主張申報它 |
+
+**受保護的變更由 Thoth 記下，再由指揮官核准。** Thoth 從候選 diff 自己列出 worker 改到或刪掉的
+既有測試檔與檢查輸入檔、inline 測試區（`#[cfg(test)]`、`#[test]`）被改動的既有 Rust 檔，以及和
+檢查指令裡的詞同名的檔。worker 不必逐檔申報（`protected_change` 主張可有可無），也不會因為漏寫
+被退件；審查者會看到這份清單，`review start` 與 `PASS` 要等指揮官用 `thoth checks approve --run`
+核准。
 
 **審查者在唯讀的 checkout 裡工作。** `thoth review start` 以 detached 方式 checkout
 候選 commit，審查者看不到沒 commit 的東西，也動不了任何分支。Claude Code 審查者

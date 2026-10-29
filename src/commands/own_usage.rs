@@ -67,18 +67,6 @@ impl Row {
         (five, seven, n, own)
     }
 
-    pub(crate) fn quota_points_avg(&self) -> Option<f64> {
-        self.quota().0
-    }
-
-    pub(crate) fn quota_points_weekly_avg(&self) -> Option<f64> {
-        self.quota().1
-    }
-
-    pub(crate) fn estimate_reliable(&self) -> bool {
-        self.quota().3
-    }
-
     pub(crate) fn json(&self) -> Value {
         let (five, seven, quota_runs, reliable) = self.quota();
         json!({
@@ -102,33 +90,6 @@ impl Row {
             "runs_left": self.runs_left,
             "runs_left_window": self.runs_left_window,
         })
-    }
-
-    pub(crate) fn human(&self) -> String {
-        let num = |v: Option<f64>| v.map_or("null".to_string(), |x| format!("{x:.2}"));
-        let left = match (self.runs_left, self.runs_left_window) {
-            (Some(n), Some(w)) => format!("runs left {n} ({w})"),
-            // An exhausted account whose runs give no average: the 0 is
-            // known, the window it would come from is not.
-            (Some(n), None) => format!("runs left {n} (window unknown)"),
-            _ => "runs left unknown".to_string(),
-        };
-        format!(
-            "usage: {} {} {} effort {} {}: runs {} (completed {}), tokens avg {}, quota avg {}/{} per run (5h/7d, {} run(s)), {}{}",
-            self.role,
-            plan_label::named(&self.profile, self.plan_label.as_deref(), crate::lang::Lang::En),
-            self.model,
-            self.effort.as_deref().unwrap_or("null"),
-            self.task_type.as_deref().unwrap_or("null"),
-            self.runs,
-            self.completed,
-            num(self.tokens_avg()),
-            num(self.quota_points_avg()),
-            num(self.quota_points_weekly_avg()),
-            self.quota().2,
-            left,
-            if self.estimate_reliable() { "" } else { " (estimate unreliable)" }
-        )
     }
 }
 

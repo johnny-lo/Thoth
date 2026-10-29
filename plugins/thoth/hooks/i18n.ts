@@ -77,6 +77,30 @@ const EN = {
   'toast.failed': '{name} failed',
   'toast.interrupted': '{name} was interrupted',
   'toast.quota_exceeded': '{profile} ran out of quota; its task was interrupted',
+  underReview: 'under review',
+  specUnderReview: 'spec under review',
+  cancel: 'Cancel',
+  closeTask: 'Close task',
+  again: 'Dispatch again',
+  yesCancel: 'Yes, cancel',
+  yesClose: 'Yes, close',
+  yesAgain: 'Yes, dispatch again',
+  back: 'Back',
+  confirmCancelRun:
+    'Stop the run of {title}? This is final: the task becomes cancelled and cannot be dispatched again; redoing it needs a new task.',
+  confirmCancelReview: 'Stop the review of {title} ({account}, {model})? The task stays in review; the commander can start the review again.',
+  confirmCancelSpecReview: 'Stop the spec review of {title}? The task stays where it was; the spec review can be started again.',
+  confirmClose: 'Close {title}? It becomes cancelled and drops out of the list; it cannot be dispatched again.',
+  confirmAgain:
+    'Dispatch {title} again on {account} with {model}, effort {effort}, the same as its last run? A new run starts and uses that account\'s quota.',
+  confirmAgainNoEffort:
+    'Dispatch {title} again on {account} with {model}, the same as its last run? A new run starts and uses that account\'s quota.',
+  noEarlierRun: '{title} has no earlier run to repeat; ask the commander',
+  'done.cancel': 'Cancelled: {title}',
+  'done.close': 'Closed: {title}',
+  'done.again': 'Dispatched again: {title}',
+  actionFailed: '{title}: {text}',
+  actionTimedOut: 'thoth did not answer in time; the panel will show what happened',
 }
 
 export type Key = keyof typeof EN
@@ -153,6 +177,27 @@ const ZH_TW: Record<Key, string> = {
   'toast.failed': '{name} 失敗',
   'toast.interrupted': '{name} 中斷',
   'toast.quota_exceeded': '{profile} 額度用完，任務中斷',
+  underReview: '審查中',
+  specUnderReview: '規格審查中',
+  cancel: '取消',
+  closeTask: '關閉任務',
+  again: '重派',
+  yesCancel: '確定取消',
+  yesClose: '確定關閉',
+  yesAgain: '確定重派',
+  back: '返回',
+  confirmCancelRun: '停止「{title}」的 run？這是最終的：任務會變成已取消、不能再派，要重做得另建任務。',
+  confirmCancelReview: '停止「{title}」的審查（{account}，{model}）？任務留在等審查，指揮官可以重新開審查。',
+  confirmCancelSpecReview: '停止「{title}」的規格審查？任務停在原狀態，可以重新開規格審查。',
+  confirmClose: '關閉「{title}」？任務會變成已取消、從清單消失，不能再派。',
+  confirmAgain: '用 {account}、{model}、effort {effort} 照上一次重派「{title}」？會開新的 run，用掉那個帳號的額度。',
+  confirmAgainNoEffort: '用 {account}、{model} 照上一次重派「{title}」？會開新的 run，用掉那個帳號的額度。',
+  noEarlierRun: '「{title}」沒有先前的 run 可以照做，請問指揮官',
+  'done.cancel': '已取消：{title}',
+  'done.close': '已關閉：{title}',
+  'done.again': '已重派：{title}',
+  actionFailed: '「{title}」：{text}',
+  actionTimedOut: 'thoth 沒有及時回應；面板會顯示結果',
 }
 
 const TABLES: Record<Lang, Record<Key, string>> = { en: EN, 'zh-TW': ZH_TW }

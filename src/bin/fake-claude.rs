@@ -105,12 +105,24 @@
 //! `auth status` or the interactive login) append one JSON line
 //! `{"names":[...]}`: the sorted names of its environment variables, never a
 //! value.
+//!
+//! BRIEF-1 switches, unset by default: in the scenarios that write a
+//! result.json with a task_id through `write_result_json` (`ok`, `slow`,
+//! `resume`), `FAKE_RESULT_SUMMARY` replaces the summary and
+//! `FAKE_RESULT_BRIEF` adds a `brief`; `FAKE_REVIEW_NOTE` replaces the note of
+//! `review_reject`'s unmet criterion.
 
 // Source-check scenarios: `source_check` checks the prompt's file:// pages;
 // `source_check_bad` writes {not json. FAKE_SOURCE_CHECK_VERDICT overrides
 // the computed verdict; FAKE_REVIEW_GATE holds output until its file exists.
 #[path = "support/source_check.rs"]
 mod source_check;
+// RFIX-1: `review_fix` hands in `FAKE_FIX_PLAN`'s document (and makes its
+// side effects); `fix_confirm_approve`, `fix_confirm_revise` (edit 0 revise)
+// and `fix_confirm_bad` (`{not json`) answer the edits in
+// `.agent/review-fix-input/edits.json`. All write `.agent/review.json`.
+#[path = "support/review_fix.rs"]
+mod review_fix;
 
 use std::io::Write;
 
@@ -373,13 +385,22 @@ fn write_result_json(task_id: &str, summary: &str, include_task_id: bool) {
     // refuses an uncited `test_result`. The `hooks` scenario is the one that
     // exercises a cited claim.
     let body = if include_task_id {
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "task_id": task_id,
             "status": "completed",
             "summary": summary,
             "claims": [{"kind": "completion", "text": "fake worker finished", "evidence": []}],
             "verification_requests": [{"cmd": "echo verify", "cwd": "."}]
-        })
+        });
+        // BRIEF-1 switches: `FAKE_RESULT_SUMMARY` replaces the summary and
+        // `FAKE_RESULT_BRIEF` adds a `brief` with that text.
+        if let Ok(text) = std::env::var("FAKE_RESULT_SUMMARY") {
+            body["summary"] = serde_json::json!(text);
+        }
+        if let Ok(text) = std::env::var("FAKE_RESULT_BRIEF") {
+            body["brief"] = serde_json::json!(text);
+        }
+        body
     } else {
         serde_json::json!({
             "status": "completed",
@@ -572,6 +593,48 @@ fn git_quiet(args: &[&str]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// `FAKE_EDIT_PLAN`'s JSON, applied in the current directory and staged:
+/// `write` is `[{"path", "text"}]` (or `"hex"` for bytes that are not UTF-8),
+/// `delete` is `[path]`, and `gitlink` is `[{"path", "sha"}]`: the path's
+/// index entry becomes a gitlink to `sha` and its file an empty directory. A plan
+/// that cannot be read changes nothing.
+fn apply_edit_plan(plan: &std::path::Path) {
+    let v: serde_json::Value = std::fs::read_to_string(plan)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let list = |key: &str| v[key].as_array().cloned().unwrap_or_default();
+    for w in list("write") {
+        let Some(path) = w["path"].as_str() else { continue };
+        let bytes: Vec<u8> = match (w["text"].as_str(), w["hex"].as_str()) {
+            (Some(text), _) => text.as_bytes().to_vec(),
+            (None, Some(hex)) => (0..hex.len() / 2)
+                .filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+                .collect(),
+            (None, None) => continue,
+        };
+        let p = std::path::Path::new(path);
+        if let Some(parent) = p.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(p, bytes);
+        git_quiet(&["add", "--", path]);
+    }
+    for d in list("delete") {
+        if let Some(path) = d.as_str() {
+            git_quiet(&["rm", "-q", "-f", "--", path]);
+        }
+    }
+    for g in list("gitlink") {
+        let (Some(path), Some(sha)) = (g["path"].as_str(), g["sha"].as_str()) else { continue };
+        git_quiet(&["rm", "-q", "-f", "--", path]);
+        git_quiet(&["update-index", "--add", "--cacheinfo", &format!("160000,{sha},{path}")]);
+        // an empty directory is a submodule that is not checked out: the
+        // work tree stays clean
+        let _ = std::fs::create_dir_all(path);
+    }
 }
 
 /// Polls the control-plane-generated index until it holds at least `min` rows,
@@ -894,6 +957,14 @@ fn main() {
                 status.as_object_mut().unwrap().remove("subscriptionType");
             }
             Ok(v) => status["subscriptionType"] = serde_json::json!(v),
+            Err(_) => {}
+        }
+        // PANEL-3 switch: `none` drops the email, any other value replaces it.
+        match std::env::var("FAKE_AUTH_EMAIL") {
+            Ok(v) if v == "none" => {
+                status.as_object_mut().unwrap().remove("email");
+            }
+            Ok(v) => status["email"] = serde_json::json!(v),
             Err(_) => {}
         }
         emit(&status);
@@ -1271,6 +1342,11 @@ fn main() {
                 let _ = std::fs::write(path, "written by the fake worker\n");
                 git_quiet(&["add", "--", &extra]);
             }
+            // Test switch: `FAKE_EDIT_PLAN=<file>` also applies that plan and
+            // commits it (LEAN-1's protected-change fixtures).
+            if let Ok(plan) = std::env::var("FAKE_EDIT_PLAN") {
+                apply_edit_plan(std::path::Path::new(&plan));
+            }
             git_quiet(&[
                 "-c", "user.email=fake@example.com",
                 "-c", "user.name=fake worker",
@@ -1353,9 +1429,10 @@ fn main() {
                         "evidence": cite,
                     });
                     if unmet {
-                        c["note"] = serde_json::json!(
-                            "no captured evidence shows this criterion being exercised"
-                        );
+                        // BRIEF-1 switch: `FAKE_REVIEW_NOTE` replaces the note.
+                        c["note"] = serde_json::json!(std::env::var("FAKE_REVIEW_NOTE").unwrap_or_else(|_| {
+                            "no captured evidence shows this criterion being exercised".to_string()
+                        }));
                         label_finding(&mut c, category.as_deref());
                     }
                     c
@@ -1394,6 +1471,36 @@ fn main() {
                 agent_dir.join("review.json"),
                 serde_json::to_string_pretty(&doc).unwrap(),
             );
+            emit(&result_event(&session_id, false, "DONE", serde_json::Value::Null));
+            std::process::exit(0);
+        }
+        "review_fix" => {
+            emit(&assistant_event(&session_id, "reviewing the candidate and attaching a fix"));
+            let plan = review_fix::plan();
+            review_fix::side_effects(&plan);
+            source_check::wait_gate();
+            let _ = std::fs::create_dir_all(".agent");
+            let _ = std::fs::write(".agent/review.json", review_fix::document(&plan).to_string());
+            emit(&result_event(&session_id, false, "DONE", serde_json::Value::Null));
+            std::process::exit(0);
+        }
+        "fix_confirm_approve" | "fix_confirm_revise" | "fix_confirm_bad" => {
+            emit(&assistant_event(&session_id, "checking the fix"));
+            let Some(edits) = review_fix::read_edits() else {
+                eprintln!("fake-claude: .agent/review-fix-input is missing or malformed");
+                std::process::exit(70);
+            };
+            review_fix::side_effects(&review_fix::plan());
+            source_check::wait_gate();
+            let text = if scenario == "fix_confirm_bad" {
+                "{not json".to_string()
+            } else {
+                review_fix::confirm_override()
+                    .unwrap_or_else(|| review_fix::confirm_document(&edits, scenario == "fix_confirm_revise"))
+                    .to_string()
+            };
+            let _ = std::fs::create_dir_all(".agent");
+            let _ = std::fs::write(".agent/review.json", text);
             emit(&result_event(&session_id, false, "DONE", serde_json::Value::Null));
             std::process::exit(0);
         }

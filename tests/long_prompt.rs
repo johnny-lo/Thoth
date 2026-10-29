@@ -26,6 +26,9 @@ impl AgyFixture for common::Fixture {
 
 /// `common::Fixture::SPEC`'s shape, with one 40,000-character constraint:
 /// past the 32,767-character command line, under spec lint's 40,960-byte limit.
+/// LEAN-1: important risk, where a spec over 20,480 bytes is only warned about
+/// (at low and normal it is refused); the dispatches skip the spec review that
+/// risk asks for, with `SKIP`.
 fn long_spec() -> String {
     serde_json::json!({
         "goal": "say hello",
@@ -33,10 +36,13 @@ fn long_spec() -> String {
         "constraints": ["x".repeat(40_000)],
         "non_goals": [],
         "excluded_alternatives": [],
-        "risk": "low",
+        "risk": "important",
     })
     .to_string()
 }
+
+/// The `--skip-spec-review` reason of the long-spec dispatches.
+const SKIP: &str = "long prompt fixture: the spec review gate is covered by tests/spec_review.rs";
 
 /// The argv of every launch a fake logged, oldest first.
 fn launches(log: &Path) -> Vec<Vec<String>> {
@@ -106,7 +112,8 @@ fn claude_prompt_goes_through_stdin() {
             .env("FAKE_TASK_ID", &task_id)
             .env("FAKE_CLAUDE_ARGS_LOG", &log)
             .env("FAKE_PROMPT_COPY", prompt_copy(&f))
-            .args(["dispatch", &task_id, "--profile", "claude-a", "--model", "sonnet", "--effort", "medium", "--json"]),
+            .args(["dispatch", &task_id, "--profile", "claude-a", "--model", "sonnet", "--effort", "medium", "--json"])
+            .args(["--skip-spec-review", SKIP]),
     );
     assert_eq!(
         f.wait_for_task_status(&task_id, &["in_review", "failed", "interrupted"], 60),
@@ -135,7 +142,8 @@ fn codex_prompt_goes_through_stdin() {
             .env("FAKE_TASK_ID", &task_id)
             .env("FAKE_CODEX_ARGS_LOG", &log)
             .env("FAKE_PROMPT_COPY", prompt_copy(&f))
-            .args(["dispatch", &task_id, "--profile", "codex-a", "--model", "gpt-5.6-luna", "--effort", "medium", "--json"]),
+            .args(["dispatch", &task_id, "--profile", "codex-a", "--model", "gpt-5.6-luna", "--effort", "medium", "--json"])
+            .args(["--skip-spec-review", SKIP]),
     );
     assert_eq!(
         f.wait_for_task_status(&task_id, &["in_review", "failed", "interrupted"], 120),
@@ -165,7 +173,8 @@ fn agy_long_prompt_fails_clearly() {
             .env("FAKE_AGY_DATA_DIR", &cfg)
             .env("FAKE_AGY_ARGS_LOG", &log)
             .env("FAKE_PROMPT_COPY", prompt_copy(&f))
-            .args(["dispatch", &task_id, "--profile", "agy-a", "--model", "gemini-3.8-flash-low", "--json"]),
+            .args(["dispatch", &task_id, "--profile", "agy-a", "--model", "gemini-3.8-flash-low", "--json"])
+            .args(["--skip-spec-review", SKIP]),
     );
     assert_too_long(&f, &task_id, d["run_id"].as_str().unwrap());
     // `agy models` (dispatch's login check) is logged too; no `-p` launch is

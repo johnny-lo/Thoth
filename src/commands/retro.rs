@@ -163,13 +163,28 @@ pub fn summarise(rows: &[ReviewRow], days: u32, now: OffsetDateTime) -> Retro {
     groups.sort_by(|a, b| {
         b.findings.len().cmp(&a.findings.len()).then_with(|| a.category.cmp(&b.category))
     });
-    Retro { days, since, reviews: in_window.len(), sizes, categories: groups }
+    // RFIX-1: an author check's record repeats the edit review it confirms,
+    // which is counted already; it is one review with it, not two.
+    let reviews = in_window.iter().filter(|(_, r)| author_check_copied(r).is_none()).count();
+    Retro { days, since, reviews, sizes, categories: groups }
+}
+
+/// RFIX-1: how many leading extra findings of an author check's record were
+/// copied from the edit review it confirms (`findings.author_check`), or
+/// `None` for any other review.
+fn author_check_copied(review: &ReviewRow) -> Option<usize> {
+    let stored: Value = serde_json::from_str(&review.findings).ok()?;
+    let marker = stored.get("author_check")?;
+    Some(marker.get("copied_extra_findings").and_then(Value::as_u64).unwrap_or(0) as usize)
 }
 
 /// A review's findings with the group each belongs to: every unmet criterion
 /// and every extra finding. Stored findings are already normalised by
-/// `review_json::parse_review`; anything else is unclassified or unsized.
+/// `review_json::parse_review`; anything else is unclassified or unsized. An
+/// author check's record gives only the extra findings it added: its
+/// criteria and its first extras are the edit review's, counted there.
 fn findings_of(review: &ReviewRow) -> Vec<(String, Item)> {
+    let copied = author_check_copied(review);
     let stored: Value = serde_json::from_str(&review.findings).unwrap_or(Value::Null);
     let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
     let category = |v: &Value| {
@@ -192,12 +207,14 @@ fn findings_of(review: &ReviewRow) -> Vec<(String, Item)> {
     let list = |key: &str| stored.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
 
     let mut out = Vec::new();
-    for c in list("criteria") {
-        if text(&c, "verdict").as_deref().map(str::trim) == Some("unmet") {
-            out.push((category(&c), item(&c, "criterion", text(&c, "id"), None)));
+    if copied.is_none() {
+        for c in list("criteria") {
+            if text(&c, "verdict").as_deref().map(str::trim) == Some("unmet") {
+                out.push((category(&c), item(&c, "criterion", text(&c, "id"), None)));
+            }
         }
     }
-    for e in list("extra_findings") {
+    for e in list("extra_findings").into_iter().skip(copied.unwrap_or(0)) {
         out.push((category(&e), item(&e, "extra", None, Some(text(&e, "severity").unwrap_or_default()))));
     }
     out

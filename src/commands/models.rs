@@ -615,19 +615,11 @@ fn load_with_refresh(paths: &Paths, refreshed: Refreshed, manual: bool) -> Resul
     for profile in profiles {
         let Discovered { source, note, seen_at, models: discovered } =
             discover(&profile, stored_lists.get(&profile.profile_id));
-        // MODELS-1: a claude-code profile's recorded unavailable models.
-        let unavailable_events = if profile.harness == crate::adapter::HARNESS_CLAUDE_CODE {
-            crate::db::global::list_quota_events(&global, &profile.profile_id)?
-        } else {
-            Vec::new()
-        };
         let plan = plans.get(&profile.profile_id).map(|p| p.plan.clone());
         let mut models = Vec::new();
-        for (model, display_name) in discovered {
-            let unavailable = crate::model_list::unavailable_now(&unavailable_events, plan.as_deref(), &model);
-            // RJ-2: one name for both sources, from what the harness itself
-            // reported; no hard-coded alias table any more.
-            let score_name = comparison_name(paths, &repos, &profile, &model)?;
+        for Listed { model, display_name, score_name, unavailable } in
+            listed(paths, &repos, &global, &profile, discovered, plan.as_deref())?
+        {
             let score = score_name
                 .as_deref()
                 .and_then(|name| find_score(cache_value.as_ref(), name));
@@ -698,6 +690,43 @@ fn load_with_refresh(paths: &Paths, refreshed: Refreshed, manual: bool) -> Resul
         },
         decision_table,
     })
+}
+
+/// One model of a profile's list with the name the external tables know it
+/// by and whether a run proved it unavailable; `thoth models` and
+/// `recommend` (CROSS-1) both read it from `listed`.
+pub(crate) struct Listed {
+    pub(crate) model: String,
+    pub(crate) display_name: String,
+    pub(crate) score_name: Option<String>,
+    pub(crate) unavailable: Option<crate::model_list::Unavailable>,
+}
+
+/// `discovered` (from `discover`) with each model's `score_name` and
+/// `unavailable`, in the list's order.
+pub(crate) fn listed(
+    paths: &Paths,
+    repos: &[String],
+    global: &rusqlite::Connection,
+    profile: &Profile,
+    discovered: Vec<(String, String)>,
+    plan: Option<&str>,
+) -> Result<Vec<Listed>> {
+    // MODELS-1: a claude-code profile's recorded unavailable models.
+    let unavailable_events = if profile.harness == crate::adapter::HARNESS_CLAUDE_CODE {
+        crate::db::global::list_quota_events(global, &profile.profile_id)?
+    } else {
+        Vec::new()
+    };
+    let mut out = Vec::new();
+    for (model, display_name) in discovered {
+        let unavailable = crate::model_list::unavailable_now(&unavailable_events, plan, &model);
+        // RJ-2: one name for both sources, from what the harness itself
+        // reported; no hard-coded alias table any more.
+        let score_name = comparison_name(paths, repos, profile, &model)?;
+        out.push(Listed { model, display_name, score_name, unavailable });
+    }
+    Ok(out)
 }
 
 /// What `discover` found for one profile.

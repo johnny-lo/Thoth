@@ -204,6 +204,19 @@ pub fn find_review(conn: &Connection, task_id: &str, spec_review_id: &str) -> Re
         .find(|n| n.spec_review_id == spec_review_id))
 }
 
+/// BRIEF-1: the newest spec review spec reviewer run `run_id` wrote.
+pub fn review_for_run(conn: &Connection, task_id: &str, run_id: &str) -> Result<Option<Newest>> {
+    Ok(reviews_of(conn, task_id)?
+        .into_iter()
+        .rev()
+        .find(|n| n.reviewer_run_id.as_deref() == Some(run_id)))
+}
+
+/// BRIEF-1: the short conclusion of one spec review.
+pub fn brief_of(n: &Newest) -> Option<crate::brief::Brief> {
+    crate::brief::for_spec_review(&Masker::current(), &n.verdict, &n.mode, &n.document, n.edit_count)
+}
+
 pub fn state(conn: &Connection, task: &state::Task) -> Result<State> {
     let events: Vec<state::EventRow> = state::events_since(conn, 0, Some(&task.task_id))?
         .into_iter()
@@ -636,6 +649,7 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, proposed_out: Option<&Path>
         std::fs::write(file, bytes).with_context(|| format!("writing {}", file.display()))?;
         masked_eprintln!("wrote {} ({} bytes)", file.display(), bytes.len());
     }
+    let brief = st.newest.as_ref().and_then(brief_of);
     let newest = match &st.newest {
         None => serde_json::Value::Null,
         Some(n) => serde_json::json!({
@@ -665,6 +679,7 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, proposed_out: Option<&Path>
         "stalled": st.stalled,
         "pending_edits": st.pending_edits,
         "newest": newest,
+        "brief": brief.as_ref().map(|b| b.text.clone()),
     });
 
     let Some(n) = &st.newest else {
@@ -701,6 +716,10 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, proposed_out: Option<&Path>
         st.review_count,
         short(&n.spec_sha256),
     )];
+    // BRIEF-1: the findings and answers below are the full text.
+    if let Some(b) = &brief {
+        lines.push(crate::brief::human_lines(b, "the findings below"));
+    }
     // One line per criterion. A reviewer's document carries the findings
     // themselves; an author's check (SR-3) carries no criteria, so its lines
     // come from the summary Thoth wrote into the event (every criterion ok on
@@ -1135,6 +1154,7 @@ fn launch(paths: &Paths, cwd: &Path, args: LaunchArgs<'_>) -> Result<i32> {
         );
     }
     plan_label::remember_or_warn(&gconn, &profile.profile_id, auth.subscription_type.as_deref());
+    crate::login_name::remember_or_warn(&gconn, &profile.profile_id, auth.email.as_deref());
     // MODELS-1: store the list just read, then check the model against it
     // (agy) or against the account's recorded unavailable models (Claude),
     // before the worktree and the run row.
@@ -1633,10 +1653,13 @@ pub fn ingest_run(
     } else {
         String::new()
     };
+    // A review writes no `result_ingested`, so its run note keeps this text.
+    let note = format!("{} over {} criteria{edited}", verdict.as_str(), doc.criteria.len());
     SpecReviewIngest {
         outcome: IngestOutcome::Ok {
-            summary: format!("{} over {} criteria{edited}", verdict.as_str(), doc.criteria.len()),
+            summary: note.clone(),
             claim_count: 0,
+            brief: note,
         },
         verdict: Some(verdict),
     }
@@ -1868,18 +1891,18 @@ fn ingest_confirm(
     match written {
         Err(e) => invalid("write", format!("recording the author check failed: {e:#}")),
         Ok(Err((stage, reason))) => invalid(stage, reason),
-        Ok(Ok(())) => SpecReviewIngest {
-            outcome: IngestOutcome::Ok {
-                summary: format!(
-                    "author {} over {} edit(s){}",
-                    verdict.as_str(),
-                    edit_review.edit_count,
-                    if verdict == SpecVerdict::Approve { ", spec replaced" } else { "" }
-                ),
-                claim_count: 0,
-            },
-            verdict: Some(verdict),
-        },
+        Ok(Ok(())) => {
+            let note = format!(
+                "author {} over {} edit(s){}",
+                verdict.as_str(),
+                edit_review.edit_count,
+                if verdict == SpecVerdict::Approve { ", spec replaced" } else { "" }
+            );
+            SpecReviewIngest {
+                outcome: IngestOutcome::Ok { summary: note.clone(), claim_count: 0, brief: note },
+                verdict: Some(verdict),
+            }
+        }
     }
 }
 

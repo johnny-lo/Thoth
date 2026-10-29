@@ -254,7 +254,7 @@ its transcript. The diff and the candidate commit are
 recorded too. Output is stored by SHA-256, append-only, and re-hashed every time it
 is read. The worker gets a generated index of codes to cite and never edits it.
 
-**Six automatic reasons for `unverified`**, checked before anything is written:
+**Five automatic reasons for `unverified`**, checked before anything is written:
 
 | rule | the task goes `unverified` when |
 |---|---|
@@ -263,7 +263,14 @@ is read. The worker gets a generated index of codes to cite and never edits it.
 | 3 | a claim cites a code that is not evidence of this task |
 | 4 | cited evidence is missing, or no longer matches its recorded hash |
 | 5 | the task is `risk: high` and a claim cites no evidence recorded by Thoth |
-| 6 | the diff modified or deleted an existing test file or a check's input file (or added a file named like a word of a check's command) and no `protected_change` claim declares it |
+
+**Protected changes are recorded, then approved.** From the candidate's diff Thoth itself
+lists every existing test file or check input the worker modified or deleted, every existing
+Rust file whose inline test region (`#[cfg(test)]`, `#[test]`) changed, and every file named
+like a word of a check's command. The worker does not declare them (a `protected_change`
+claim is optional) and is never refused for leaving one out; the reviewer is shown the list,
+and `review start` and a `PASS` wait until the commander approves it with
+`thoth checks approve --run`.
 
 **The reviewer works in a read-only checkout.** `thoth review start` checks out the
 candidate commit detached, so the reviewer cannot see uncommitted work or move a

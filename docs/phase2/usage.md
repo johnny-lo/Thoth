@@ -93,6 +93,28 @@ changed (AGY-1)`. A task id and
 `--run` are mutually exclusive, and exactly one is required. `review start
 --json` returns the reviewer `run_id` precisely so the two can be chained.
 
+Both forms lead with a short conclusion (BRIEF-1). `wait <task> --json` adds
+`run_id` (the task's last implementer run, by run id), `result_status`,
+`claim_count`, `brief`, `brief_source` and `brief_truncated` from that run's
+own newest delivery, all null when it has none (an earlier run's result never
+stands in) and on a timeout. `wait --run <run_id> --json` adds `brief`,
+`brief_source`, `brief_truncated`, `result_status` and `claim_count` on both
+paths: an implementer run's delivery (`brief_source` `worker` or `summary`);
+a reviewer run's own verdict (`review`, for example `REJECT: 1/2 criteria
+met; AC2 unmet (fix S, spec_mismatch): the retry never fires; 1 extra
+finding(s); major (fix S, test_interface): the new test asserts a constant`);
+a spec reviewer run's own spec review (`spec_review`, for example `REVISE: 1/2
+criteria need revision; AC1 (exists, src/lib.rs:1): ...; 3 edit(s) proposed`,
+or `REVISE: 1 of 3 edits revise` for an author's check). A reviewer's
+`result_status` and `claim_count` are null, and a run that reached no delivery
+or judgement (or a research source check) has a null brief. A brief is at most
+1,000 characters and each note or location in it at most 200, counted in
+characters; everything is masked before it is cut. The human output prints
+`brief: ...` under the first line and, when it was cut, where the full text
+is (`thoth task result <task> [--run <run>]`, `thoth review show <task>` or
+`thoth spec review show <task>`). The full rules are under "Briefs" in
+`docs/adapter-usage.md`.
+
 `thoth events --since <seq>` (watch for the `verdict` event) and
 `thoth review show <task> --json` remain the polling alternatives.
 
@@ -124,8 +146,8 @@ Kinds Phase 2 produces, all `collected_by = control_plane`:
 `commit` evidence's `detail` carries exactly three keys — `sha`, `subject`,
 `author_date` — the `git show --stat` text lives in the blob, not in `detail`.
 `diff` evidence's `detail` carries `from_commit`, `to_commit`, `files_changed`,
-`touches_tests`, `protected_changes`, `stat`, `protected_base` and
-`integration_tip`; `touches_tests` is a filename
+`touches_tests`, `protected_changes`, `inline_test_errors` (LEAN-1), `stat`,
+`protected_base` and `integration_tip`; `touches_tests` is a filename
 heuristic (paths under a `tests/`, `test/`, `__tests__/` or `*.Tests/`
 directory, `conftest.py`, `test_*`, `*_test.{rs,py,go,ts}`,
 `*.test.{ts,tsx,js}`, `*.spec.{ts,tsx,js}`, `*Tests.cs`, `*Test.cs`; case is
@@ -147,8 +169,10 @@ when it was not used), sorted by path, `[]` when there is none:
   file is a `deleted` old path (plus an added new one).
 - `kind` is `check_input` (the path is an input of any check in the catalogue,
   approved or not), `test` (the heuristic above, or one of the repo's extra
-  patterns — see "Protected files"), or `check_word`. When a path is more than
-  one, `check_input` wins, then `test`.
+  patterns — see "Protected files"), `check_word`, or `inline_test` (below).
+  When a path is more than one, `check_input` wins, then `test`, then
+  `check_word`; `inline_test` is only looked for in a `.rs` file that is none
+  of the three.
 - `check_word`: the file's name, up to its first `.`, equals a word of a
   check's command taken the same way (`cargo test` gives `cargo` and `test`;
   `python scripts/check_tests_no_db.py` gives `python` and `check_tests_no_db`;
@@ -158,6 +182,27 @@ when it was not used), sorted by path, `[]` when there is none:
   named like a check word (`cargo.bat`, `tools/Cargo.cmd`, `docs/python.md`)
   is listed with status `added` and kind `check_word`, so a file that could be
   picked up in place of a check's program is put in front of the reviewer.
+- `inline_test` (LEAN-1): an existing `.rs` file (modified, deleted or
+  type-changed) whose inline test region changed. The region starts at the
+  first line that, trimmed, starts with `#[` and whose attribute — the text up
+  to its first `]` — is named `test` or ends in `::test` (`#[test]`,
+  `#[tokio::test]`), or is a `cfg` attribute with the whole word `test`
+  (`#[cfg(test)]`, `#[cfg(all(test, windows))]`) whose next text that is not
+  blank, an attribute or a comment declares a `mod`; it runs to the end of the
+  file. `#[latest]`, `#[attest]`, a trailing `// test` comment and
+  `#[cfg(test)]` on a function do not start one. The file is read at the
+  task's base and at the candidate (CRLF read as LF, bytes that are not UTF-8
+  as replacement characters), and the region counts as changed when its base
+  lines do not all appear, whole and in order, among the candidate's lines —
+  a changed or deleted test line, tests put in another order, the region or
+  the file deleted. Inserted lines alone do not count: an edit of the
+  production code above the region, tests added to an existing region, a first
+  region added to a file that had none, and a new source file are not listed.
+  Only Rust, and only this syntax.
+- `inline_test_errors` (LEAN-1) is `[{"path", "error"}]`, normally `[]`: a
+  `.rs` file that could not be read at the base or at the candidate (for
+  example it became a gitlink) is listed as `inline_test` anyway, never left
+  out, and the reason is here.
 - What counts as the task's own: a file the task itself added in an earlier
   attempt is `added`, not `modified`, since the list counts from the task's
   base, not the run's. A change that arrived through `git merge` of the main
@@ -172,10 +217,11 @@ when it was not used), sorted by path, `[]` when there is none:
   `touches_tests`, `stat` and the patch still run from the run's own base to
   the candidate.
 - A rework compares against the task's base, so changes an earlier attempt
-  made to an existing test or check input are listed again and must be
-  declared again.
+  made to an existing test or check input are listed again.
 
-Ingest rule 6 and the review packet read this key.
+The worker does not have to declare any of it (LEAN-1; ingest rule 6, which
+refused a delivery that did not, is retired). The review packet, the
+reviewer's prompt, `checks approve --run` and the review gate read this key.
 
 `--task` is optional when the code is unique across the repository's tasks, and
 also when `THOTH_RUN_ID` is set — which it is inside a worker or reviewer, so
@@ -187,8 +233,8 @@ the reviewer actually read what it cited.
 
 ### Why a task goes to `unverified`
 
-Seven conditions, checked before anything is written, so a rejected document
-leaves the previous claims untouched:
+Six conditions (rule 6 is retired), checked before anything is written, so a
+rejected document leaves the previous claims untouched:
 
 | | condition | event detail |
 |---|---|---|
@@ -197,7 +243,7 @@ leaves the previous claims untouched:
 | rule 3 | a cited code is not evidence of this task | `rule: 3` with the claim's index and the code |
 | rule 4 | a cited evidence's blob is missing, or no longer hashes to its recorded sha256 | `rule: 4` with the claim's index, the code, the blob path and the sha256 |
 | rule 5 | the task is `risk: high` and a claim cites no `control_plane` evidence | `rule: 5` with the claim's index, kind, cited codes and the risk |
-| rule 6 | the run's newest `diff` evidence lists a protected change (`detail.protected_changes`) that no `protected_change` claim declares | `rule: 6` with the file's `path`, `status` and `kind` |
+| rule 6 | retired (LEAN-1): it refused a protected change (`detail.protected_changes`) that no `protected_change` claim declared. No new event has it; an older one keeps its `path`, `status` and `kind` | — |
 | rule 7 | the task's `task_type` is `research`, `status` is `completed`, and no claim is of kind `research` | `rule: 7` |
 | rule 0 | not a rule at all: the document was fine and the *database write* failed (a busy transaction, a failed insert, a failed commit) | `rule: 0`, with `claim_kind`/`claim_id`/`code` when the failure happened on a particular row |
 
@@ -239,33 +285,34 @@ a research claim is checked by opening its sources again, not by a command's
 evidence. The worker of a research task is told all this in a `## Research
 claims` section of its prompt, before the result.json shape.
 
-**Rule 6** makes the worker say, file by file, that it changed something a
-check depends on. For each entry of `protected_changes` there must be a claim
-of kind `protected_change` whose `text` — trimmed, `\` read as `/` — starts
-with the entry's path, followed by `:`, whitespace or nothing:
+**Protected changes need no declaration (LEAN-1).** Rule 6 used to make the
+worker say, file by file, that it changed something a check depends on, and
+refused the delivery when one file was missing. It is retired: the list is
+the diff evidence's `protected_changes`, worked out by Thoth, and a delivery
+is never refused or rerouted for leaving a file out. A claim of kind
+`protected_change` is optional and kept as written, even when it names only
+some of the files:
 
 ```json
 {"kind": "protected_change", "text": "tests/x.rs: the old assertion contradicted AC2"}
 ```
 
-`tests/x.rs2: …` and `x.rs: …` do not declare `tests/x.rs`. A missing one gives
-`claim missing for protected file tests/x.rs (modified): add a claim of kind
-protected_change whose text starts with the path and explains the change`.
-A `protected_change` claim is exempt from rule 2 (the diff evidence does not
-exist yet while the worker writes result.json, so there is nothing to cite);
-rule 5 applies to it as to any claim. Rule 6 does not apply to a run with no
-diff evidence. It does not judge whether the change weakened a check — that
-stays with the reviewer, who is shown the same list — and it does not stop a
-worker from changing a test. The worker is told all this in the
-`## Protected files` section at the end of its prompt. That section lists the
-inputs of every check in the catalogue, approved or not and whether or not the
-spec's `checks` field names it — the same set rule 6 compares against — and
-says the list counts from the task's base commit, so changes that earlier runs
-of the same attempt left in the worktree must be declared again. It also says
-that an existing file is one that exists at the task's base commit (a test
-file the task itself added, in this or an earlier attempt, needs no claim),
-and that a file whose content at the final commit equals the main branch's
-came in through a merge and is not counted. Separately,
+It is exempt from rule 2 (there is nothing to cite); rule 5 applies to it as
+to any claim. Recording a change does not judge it: the reviewer is shown the
+same list, and the commander approves each `test`, `check_word` and
+`inline_test` change with `checks approve --run` before a review can start or
+a PASS be recorded (see "Approval before review"). The worker is told this in
+the `## Protected files` section at the end of its prompt: what Thoth records
+automatically (existing test files and check inputs modified or deleted,
+existing Rust files whose inline test region changed, files named like a
+check word), that it does not have to declare them, and that the commander
+approves them. That section lists the inputs of every check in the catalogue,
+approved or not and whether or not the spec's `checks` field names it, the
+check words, and the repo's extra patterns. The result.json shape it is shown
+no longer has `verification_requests` (a delivery that still carries the key
+is accepted; it is kept for reference only), and the prompt asks the summary
+for intent, limitations and decisions, not for file lists, command logs, exit
+codes or usage, which Thoth records itself. Separately,
 before `## Evidence`, the worker prompt says the run is a single unattended
 turn: no background commands, and checks, commit and `.agent/result.json` all
 done before the turn ends.
@@ -343,7 +390,7 @@ research uses the source-check prompt and document above.
 
 ```
 thoth review start <task> --profile <id> --model <m> --effort <level> [--timeout 30m] [--json]
-thoth review show <task> [--json]
+thoth review show <task> [--full] [--json]
 thoth review record <task> -f review.json [--json]
 ```
 
@@ -407,7 +454,8 @@ first `:` when it looks like an id (`"AC1: retries three times"` → `AC1`),
 otherwise the 1-based position (`"prints hello"` → `AC1`).
 
 Every unmet criterion and every extra finding may carry two labels, which
-`thoth retro` counts (nothing else decides on them yet):
+`thoth retro` counts; `fix_size` also decides whether an edit review's fix
+may be bound to the finding (see "Reviewer fixes, author confirms" below):
 
 - `fix_size`: the smallest fix that would resolve it. `S` (at most 10 changed
   lines in one file), `M` (at most about 50 changed lines, or more than one
@@ -486,6 +534,102 @@ difference. That is a warning, not a failure — the reviewer may have read the
 same bytes out of the diff it was handed — but a review that cites five codes and
 opened none is worth a second look.
 
+It leads with `brief` (BRIEF-1): the newest review's short conclusion, by the
+same rule as `wait --run` on a reviewer (null without a review, and for a
+research source check). `findings` stay whole. Breaking change: the worker's
+`claims` are left out (`null`) unless you pass `--full`, which brings back the
+claim table (`[]` without a review); `thoth task result <task>` has the same
+claims. The human output prints `brief: ...` under its first line and the
+`claim` lines only with `--full`. The MCP tool `thoth_review_show` takes the
+same switch as the boolean `full`.
+
+### Reviewer fixes, author confirms
+
+A REJECT whose findings are small does not have to cost a whole new attempt.
+With `--edit` the reviewer may attach the fix itself; Thoth applies it where
+nothing else lives, the commander re-runs the checks on it, and a model the
+commander picks confirms only that fix:
+
+```
+thoth review start TASK --edit --profile P --model M --effort E --reason "why this reviewer"
+thoth wait --run EDIT_RUN                # REJECT, pending_fix true
+thoth verify EDIT_RUN                    # the approved checks, in the fix worktree
+thoth checks approve --run EDIT_RUN --reason "why"   # only if the fix changed a protected file
+thoth review confirm TASK --profile P2 --model M2 --effort E2 --reason "why this confirmer"
+thoth wait --run CONFIRM_RUN             # PASS or REJECT
+```
+
+`--edit` is for code tasks; a `docs`, `research` or `review` task is refused.
+The reviewer stays read-only. It answers with the usual review document plus
+`edits`, each `{"path","old","new","criterion","reason"}`: `old` is text that
+occurs exactly once in the file as the earlier edits left it (`""` creates a
+new file), `criterion` names an unmet criterion or `extra_findings[i]`. Thoth
+applies the edits in order in `worktrees/TASK-aN-fix`, a detached checkout of
+the candidate that a new `review start --edit` resets, and holds the result to
+fixed bounds, measured with git against the candidate:
+
+- every edit is bound to a finding whose `fix_size` is S or M, and every unmet
+  criterion has an edit (an L finding, or one without a size, is redone);
+- every extra finding whose `severity` is not `minor` (trimmed, any case; an
+  empty or unknown severity counts) has an edit too: a fix that leaves a
+  blocking finding open is refused at stage `size`, and the task is redone. A
+  `minor` finding may stay, and a confirmed PASS keeps it;
+- at most 40 changed lines (added plus deleted, a replaced line counts 2) in at
+  most 3 files, plain text only;
+- no file that parses as a Thoth spec, before or after;
+- an existing test file only gains lines, and no line holding `assert`,
+  `#[test]` or `#[cfg(test)]` is deleted, no `#[ignore]` added;
+- no check input and no check-word file;
+- nothing under `.agent/`, `.agents/` or `.git/`, no path that leaves the
+  worktree, and the reviewer itself changed no file and left HEAD alone.
+
+These keep a fix to what a second model can judge in one sitting and away from
+what the checks themselves read; anything larger is a normal rework. A fix
+that fits is committed on `thoth/TASK/aN-fix` (the implementer's branch and
+candidate are not touched), its REJECT is recorded without a `verdict`, and the
+task stays `in_review` with `review show`'s `pending_fix` true. A fix that does
+not fit is refused (`review_fix_refused` names the stage), the worktree and the
+branch go back to where they were, and the REJECT settles the task as usual.
+
+`thoth verify EDIT_RUN` runs the approved checks in the fix worktree and
+records the commit they ran on (`head_commit`, `head_commit_after`) and whether
+they left it clean. `review confirm` needs that verify: refused before it,
+after a `--at-base` or dry run only, or when the checks moved HEAD or changed a
+file. It also needs the fix's own protected changes approved on the edit run:
+a fix that adds lines to an existing test file or changes an inline test region
+lists them on its diff evidence (`review fix: git diff ...`, on EDIT_RUN; the
+`protected_changes` entries of EDIT_RUN in `thoth review packet TASK --json`),
+and `review confirm` refuses, writing nothing but that evidence, until `thoth
+checks approve --run EDIT_RUN --reason "WHY"` approved them. An approval of the
+implementer run does not cover the fix. The write of a confirmed PASS checks
+the same again; when it fails no review is written (`review_invalid` stage
+`protected`) and the fix stays pending. Then the commander picks the confirmer
+by quota: another provider when
+there is quota, otherwise another model or another effort. Thoth records
+whether the confirmer is of the implementer's provider and refuses only the
+edit review's own model at the same effort; it picks nobody and waits for no
+reset. Say why in `--reason` (the quota you saw, why this provider or model).
+The confirmer reads `.agent/review-fix-input/` (the spec, the findings, the
+completed edits, the patch) and answers ok or revise for each edit; it does
+not review again and adds no finding.
+
+APPROVE with a green verify is PASS: `review show` then gives `merge_branch`
+and `merge_commit`, the fix branch and its commit. PASS means the fix may be
+merged, not that it was; the commander reads the difference and merges it
+themselves. A REVISE or a red verify (or one whose output was not collected in
+full) is not adopted: REJECT, with the original findings plus one line per
+revise, one for the red verify and one saying to redo the work from the
+original candidate; `dispatch` then starts the next attempt from the
+implementer's candidate, without the fix. One edit-then-confirm chain writes
+one `verdict`. A confirm that fails, is invalid or is cancelled writes no
+review and can be run again. That includes a confirmer that changed a file or
+moved HEAD: its answer is not read, `review_invalid` names stage `worktree`,
+the task stays `in_review` with the fix still pending, and Thoth puts the fix
+worktree back at the fix commit (while the fix branch still points there), so
+the next `review confirm` runs on the verified fix without a new `verify`.
+Not adopting a fix at all is a plain `review start` of the original
+candidate, or a reroute.
+
 ### Recording an external review
 
 ```
@@ -510,8 +654,8 @@ fixed order:
    live run); there must be a completed implementer run to judge (`review
    record` targets the same run `review start` would), and that run must
    have a `candidate_commit` (the same thing `review start` refuses to
-   review without one); for a `PASS`, every protected `test` and
-   `check_word` change of that run must be approved (see "Approval before
+   review without one); for a `PASS`, every protected `test`,
+   `check_word` and `inline_test` change of that run must be approved (see "Approval before
    review" under "Protected files"). The run's diff evidence is recorded
    before the transaction when it is missing or unreadable, with `warning: `
    lines on stderr when that fails.
@@ -581,8 +725,9 @@ Sections, in order:
 3. the evidence index: code, kind, exit code, run id, label, and for `command`
    rows the last 15 lines of the stored output;
    then `## Protected files changed`: for every `diff` row, each entry of its
-   `protected_changes` as `path (status, kind)` with the diff's code and run,
-   followed by the text of each `protected_change` claim of the newest
+   `protected_changes` as `path (status, kind)` with the diff's code and run
+   (`kind` may be `inline_test`, LEAN-1; no claim is needed for an entry),
+   followed by the text of each optional `protected_change` claim of the newest
    `result_ingested` event; either list says `(none)` when it is empty. A
    Claude reviewer's prompt carries the same list after its rule 1, with the
    instruction to decide, file by file, whether the change weakened a check
@@ -635,7 +780,12 @@ and exits 0.
 
 Every review created in the window counts, whatever its verdict (a
 `created_at` that cannot be read is skipped). Each unmet criterion and each
-extra finding is one finding; a met criterion is not. Findings are grouped by
+extra finding is one finding; a met criterion is not. A confirmer's record
+(`source` `author_check`) repeats the criteria and extra findings of the edit
+review it confirms, which are counted with that review already, so retro
+counts only the extra findings the confirm added, and not as a review of its
+own: one "reviewer fixes, author confirms" chain counts once in `reviews` and
+in each category. Findings are grouped by
 their `category` (see "The reviewer"); a finding with no category, or one
 outside the list, goes to `unclassified`, which is what every review recorded
 before the labels existed looks like. Each group shows how many findings it
@@ -672,7 +822,8 @@ Only `goal`, `acceptance_criteria` and `constraints` are read; `non_goals` and
 
 | rule | example |
 |---|---|
-| `too_large` | the file is over 40960 bytes: split the task |
+| `too_large` | the file is over 40960 bytes, at every risk: split the task |
+| `large` (LEAN-1) | the file is over 20480 bytes (and at most 40960) and the spec's `risk` is `low` or `normal` (or absent, which is `normal`; a file that does not parse has no readable risk, so it is `normal` too and `invalid_spec` is added) |
 | `invalid_spec` | the spec does not parse (the message is the parse error) |
 | `ac_blank` | `"  "` as an acceptance criterion |
 | `ac_duplicate` | `"AC1:  x"` after `"AC1: x"` (ends trimmed, spaces collapsed) |
@@ -691,12 +842,26 @@ Warnings:
 
 | rule | example |
 |---|---|
-| `large` | the file is over 20480 bytes |
+| `large` | the file is over 20480 bytes (and at most 40960) at `important` or `high` risk |
 | `missing_path` | `src/gone.rs` is not in the main work tree (`新檔 src/new_one.rs`, `johnny-lo/x`, `$THOTH_HOME/x`, URLs are left alone) |
 | `missing_name` | ``src/present.rs 的 `absent_fn` `` or `src/present.rs:absent_fn`, when the file has no `absent_fn` |
 | `line_number` | `src/a.rs:12`, `` `name`:12 ``, `第 12 行` (not `10:30`, `host:8888` or `第 3 節`) |
 | `two_dot_diff` | `git diff master..HEAD`: compares the two tips, so use `master...HEAD` |
 | `powershell_in_bash` | `` `$env:FOO = 1` `` or `` `Get-ChildItem` `` in a field that never says PowerShell or pwsh |
+
+**Why `large` depends on the risk (LEAN-1).** `low` and `normal` tasks already
+skip the mandatory spec review before their first dispatch (only `important`
+and `high` are gated); that is unchanged. What LEAN-1 adds is the size rule
+that goes with it: a spec nobody is required to review must stay at or under
+20480 bytes, so `large` is an error there, and its message asks you to shrink
+the spec or split the task. At `important` and `high` the spec review reads
+the spec, so `large` stays a warning. The 40960-byte ceiling (`too_large`)
+holds at every risk. The lint runs where it ran before — `task create`, `task
+update-spec`, `spec review start` (on the stored spec, with or without
+`--edit`), `spec review confirm` (on the proposed spec), a reviewer's edits
+when they are recorded, and confirm's APPROVE — and nowhere new: `dispatch`, a
+rework and `review start` do not lint, so a larger spec stored before LEAN-1
+still dispatches, but a spec review of it is refused until it is shrunk.
 
 A path counts as new, and is never reported, when `new`, `create` or `新`
 stands in the 12 characters before it anywhere in the spec. "Main work tree"
@@ -932,6 +1097,14 @@ not Thoth's: the event records `edit_count`, `bytes_before` and
 `bytes_after`, and the commander decides from them to run `confirm`, or to
 start a full review again when the edits amount to a rewrite.
 
+**Briefs** (BRIEF-1). `spec review show --json` and `wait --run` on either
+run carry the review's short conclusion as `brief`: an edit review's ends in
+`; N edit(s) proposed` (`REVISE: 0/2 criteria need revision; 3 edit(s)
+proposed`), and an author's check counts its answers (`REVISE: 1 of 3 edits
+revise`). The human `spec review show` prints `brief: ...` under its first
+line and keeps every criterion, finding, edit line and author answer below it
+whole.
+
 ## Rework after a REJECT
 
 ```
@@ -1068,6 +1241,14 @@ status, after the task is closed too. With no ingested result.json (a
 `queued` task, or one whose only result was refused) it exits 1 and points to
 `thoth events --task TASK --json`, where a refused one is a `result_invalid`
 event.
+
+It also leads with the delivery's brief (BRIEF-1): `--json` adds `brief`,
+`brief_source` (`worker` when the worker's result.json has a non-blank string
+`brief`, otherwise `summary`) and `brief_truncated`; the human output prints
+`brief: ...` above `summary:`, and when the brief was cut at 1,000 characters,
+a line naming this command for the full text. Ask a document task's worker
+for a brief that names the documents it wrote; the summary and claims are
+still shown whole, before and after `task accept`.
 
 `task accept` takes the delivery: `in_review` → `accepted`, with one
 `task_accepted` event recording the reason and the run whose result.json was
@@ -1609,7 +1790,7 @@ thoth checks remove py
   so `list` shows the check `stale` only when the main tree matches none of its
   approvals (for example when it was never approved from the main tree and the
   run's change is not merged yet). It also approves that run's protected
-  `test` and `check_word` changes (see "Protected files"): those not covered by
+  `test`, `check_word` and `inline_test` changes (see "Protected files"): those not covered by
   an earlier approval of the same run are listed under `protected_approved`
   (`approved protected change of run RUN: PATH (STATUS, KIND)` on the human
   output) and recorded in one `protected_change_approved` event; those already
@@ -1741,14 +1922,18 @@ input files.
 
 Thoth works out from each candidate diff which existing test files and check
 input files were modified or deleted, records them on the diff evidence
-(`protected_changes`, see "Evidence"), requires the worker to declare each one
-(rule 6, see "Why a task goes to `unverified`") and shows them to the reviewer
-(the packet's `## Protected files changed`). What counts:
+(`protected_changes`, see "Evidence") and shows them to the reviewer (the
+packet's `## Protected files changed` and the reviewer's prompt). Since LEAN-1
+the worker does not declare them: a delivery is not refused for leaving one
+out (rule 6 is retired), and a `protected_change` claim is optional. What
+counts:
 
 - test files, by path (the `touches_tests` heuristic);
 - the input files of every check in the catalogue, approved or not;
 - files named like a word of a check's command (`check_word`), which also
   covers a file that is *added*;
+- (LEAN-1) existing Rust source files whose inline test region was changed or
+  deleted (`inline_test`; the rule is under "Evidence");
 - the repo's own extra patterns:
 
 ```
@@ -1775,7 +1960,8 @@ list exits `1`. With `THOTH_RUN_ID` set both commands refuse.
 
 **Approval before review.** `review start` and a PASS `review record` refuse
 while the run under review (the newest completed implementer run) changed a
-`test` or `check_word` file that nobody has approved for that run: `refusing to
+`test`, `check_word` or `inline_test` file that nobody has approved for that
+run: `refusing to
 start a review of task TASK: run RUN changed protected files that nobody has
 approved yet: PATH (STATUS, KIND), ...; read the change (thoth review packet
 TASK), then approve it with: thoth checks approve --run RUN --reason "WHY" (MCP:
@@ -1789,13 +1975,23 @@ RUN has no diff evidence for its candidate, so its protected file changes
 cannot be checked`, or `... has no readable protected_changes, and recording it
 again failed`). An approval belongs to its run: a rework run with the same
 change needs its own. REJECT and UNVERIFIED records need no approval.
+A diff evidence row with a `protected_changes` list but no
+`inline_test_errors` list was written by a thoth before inline tests were
+looked for, so it is not readable either: these gates record that run's diff
+again and judge the new row, and `checks approve --run RUN` approves nothing
+from it (with the same warning). `review confirm` gates a reviewer fix the same
+way on the edit review run (see "Reviewer fixes, author confirms"): the fix's
+protected changes are approved with `checks approve --run EDIT_RUN`, and an
+approval of one of the two runs does not cover the other.
 `check_input` changes are not gated here: `verify`'s fingerprint comparison
 already refuses a changed check input, and package-info auto-accept lets a
 version-only change through.
 
-Limits: only paths are looked at, so a test that lives in an inline
-`#[cfg(test)]` module inside a source file under `src/` is not detected; and
-nothing here judges whether a test became weaker — that is the reviewer's job.
+Limits: inline tests are detected only in Rust files and only with the
+attributes described under "Evidence" (no other language's inline tests, no
+configurable syntax); and nothing here judges whether a test became weaker,
+or approves anything by itself — that is the reviewer's and the commander's
+job. A list Thoth cannot read is never taken for an empty one.
 
 ## New event types
 
@@ -2014,7 +2210,8 @@ Eight smaller ones worth knowing:
   cumulative.** It is a diff against the previous attempt's candidate, not
   against the task's original base — see "Rework after a REJECT" above.
 - **A test file that exists on the main branch but not at the task's base,
-  and that the task then edits, counts as added** (not listed by rule 6).
+  and that the task then edits, counts as added** (not in
+  `protected_changes`).
   `protected_changes` counts from the task's base commit, where that file does
   not exist yet, and its content differs from the main branch's, so it is
   neither dropped nor listed as `modified`.
@@ -2758,16 +2955,31 @@ Breaking change (RJ-1): `thoth recommend` lists each profile's quota facts
 reviewer ranking puts a profile of another provider than the implementer's
 first) and is resolved to the full id in `task_id`. Choosing the profile, model
 and effort is the commander's; the decision table is still in `thoth models`.
-It does not dispatch a run.
+It does not dispatch a run. CROSS-1 brings back a `models` key on each
+candidate, but it is not the list RJ-1 removed: it is the models this account
+can run and the score facts that match them (below), and it picks nothing.
 
-Breaking change (RJ-2): `recommend` now also sends what the commander needs
-to choose, filtered by fact only and never judged by Thoth:
+Breaking change (RJ-2, reshaped by CROSS-1): `recommend` now also sends what
+the commander needs to choose, filtered by fact only and never judged by
+Thoth. CROSS-1 (the user, 2026-10-21: every account shows the models its
+subscription can run now, crossed with the table scores, instead of a table
+each time) sends it as one cross table by default:
 
-- each candidate's `available_models` (`[{model, display_name}]`: what
-  `thoth models` lists for the account: the fixed aliases for claude-code,
-  the `models_cache.json` slugs for codex, and for an antigravity account the
-  list its last login check stored (MODELS-1), `[]` before any check);
-- `tables`: the three external tables, each cut down to the organizations
+- each candidate's `models` (CROSS-1; RJ-2's `available_models` is gone):
+  what `thoth models` lists for the account (the fixed aliases for
+  claude-code, the `models_cache.json` slugs for codex, and for an
+  antigravity account the list its last login check stored, MODELS-1, `[]`
+  before any check), minus the models a run proved unavailable (those are in
+  `models_excluded`). Each row has the model's `names` (claude-code: the name
+  its newest run reported, none before it has run; codex and agy: the slug
+  and display name), the `agent_arena`, `artificial_analysis` and
+  `ai_stupid_level` rows whose name matches one of them (same base after
+  normalization, same effort when the own name has one; null when nothing
+  matches, never a guess), and its `usage`. The candidate also carries
+  `shared`, its `windows` (as `thoth profile usage`), `models_source`,
+  `models_seen_at`, `models_note` and `usage_other_models`;
+- `unmatched`: every model a present table did not match, and which tables;
+- `tables` (only with `--tables` since CROSS-1, else null): the three external tables, each cut down to the organizations
   with an account registered here (every profile's provider, plus for an agy
   account the organizations its model names start with: `claude-`
   anthropic, `gpt-` openai, `gemini-` google) and to the usable columns. Agent
@@ -2780,9 +2992,13 @@ to choose, filtered by fact only and never judged by Thoth:
   and AI Stupid Level (only `name`, whether the model may have `degraded`
   lately, and `observed_at`). Every table carries its source, license, a
   `filtered` sentence, `present`, `fetched_at`, `age_hours`, `stale` and
-  `rows` (`[]` without a cache); no row is mapped to an account and no
-  `profile_id` appears. Thoth does not rank the rows or pick from them;
-- `usage`: Thoth's own usage, one row per role, account, model, effort and
+  `rows` (`[]` without a cache); no `profile_id` appears in them (CROSS-1
+  overturns RJ-2's "no row is mapped to an account" only through the
+  candidates' `models` above). Thoth does not rank the rows or pick from them;
+- each model row's `usage` (CROSS-1: RJ-2's top-level `usage` moved there,
+  and to `usage_other_models` for a model no longer listed, each row exactly
+  once, without the account and model it sits under and without `plan`,
+  `plan_label` and `shared`): Thoth's own usage, one row per role, account, model, effort and
   task type (this computer's runs plus the shared records folder's, each run
   once; `--role reviewer` counts reviewer and spec reviewer runs, each in rows
   of its own role, `reviewer` or `spec_reviewer`): `runs`, `completed`,
@@ -2791,7 +3007,7 @@ to choose, filtered by fact only and never judged by Thoth:
   same name elsewhere may be another subscription; reliable runs when there
   are any, else the unreliable ones with `estimate_reliable: false`, so a
   shared account still gets a number marked as not its own), `quota_runs`,
-  `quota_runs_unreliable`, `shared`, `plan`, `plan_label`, and `runs_left`
+  `quota_runs_unreliable`, `estimate_reliable`, and `runs_left`
   with `runs_left_window`: for the account's current `five_hour` and
   `seven_day` windows (a reset one counts as 0%), max(0, 95 − used) divided
   by that window's average, floored, the smaller of the two; null when
@@ -2816,11 +3032,17 @@ time(s); last implementer run …` line (`task T: no runs yet` without any
 run; `… last implementer run: none` when only spec reviews ran) and for
 `--role reviewer` a `last reviewer run …` line before the accounts; after
 them one line per table (`NAME: N row(s) (filtered), fetched AT` or `NAME:
-not cached`), one `usage:` line per usage row ending in `runs left N
-(WINDOW)` (`runs left 0 (window unknown)` for an exhausted account without
-an average) or `runs left unknown` (plus `(estimate unreliable)` when the
-estimate is not the account's own), and a last line saying the table rows
-are in `--json`. The exact keys are in `docs/adapter-usage.md`.
+not cached`) and a last line `full filtered tables: add --tables --json;
+nothing above picks for you`. CROSS-1: each account is one block, the same
+with or without `--tables`: a first line with the eligibility, quota state
+and every window (`five_hour 42% used, resets AT`), a `reasons:` line when
+the account is not eligible, then a table with one line per model (`model`,
+`AA I/C/A`, `Arena #rank score`, `ASL`, `tokens avg`, `quota/run 5h/7d`,
+`runs left`; a cell without a fact reads `no data`, `無資料` with
+`THOTH_LANG=zh-TW`), and the `unavailable:`, `no match:`, `other:`, `models
+read at` and `note:` lines. RJ-2's `usage:` lines and its `rows are in
+--json` last line are gone. The exact keys and layout are in
+`docs/adapter-usage.md`.
 
 `thoth profile set-shared ID on|off [--json]` marks a profile as one a human
 also works in (their own terminal on the same account), so the quota points
@@ -2879,6 +3101,26 @@ label it saved automatically (for example `claude-a (max)`), because
 `profile login` stores the raw subscription type as `account_label`; the next
 `profile check`, `dispatch` or other check that stores the tier turns it into
 `claude-a (Max)`.
+
+Login name (new, PANEL-3). Schema 5 adds `login_name` and
+`login_name_seen_at` to `profiles` the same way, so a person can tell
+claude-a, b and c apart. The same five login checks store, when they report
+logged in with an email, the part of the email before the first `@` (trimmed,
+control characters removed, at most 32 characters) and the time; never the
+whole email. No `@`, nothing before it, no email (codex and agy report none
+today), a failed check or a logged-out one keeps the stored name; the next
+check with a name overwrites it, so an account that changed login changes
+name. A failed write is one line `warning: could not store the login name of
+ID: ...` on stderr; nothing else changes. The read-only commands above still
+never migrate; on a schema 4 database they work as before, with no names. The
+name is written before the bracket text only in three places: doctor's and
+setup's profile headings (`Profile claude-a (alice, Max)`, `帳號
+claude-a（alice，Max）`; doctor uses the email its own check just saw, else the
+stored name), the report page's account block (`claude-a（alice，Max）`; the
+decision table there, which may hold other computers' rows for the same id,
+does not), and the Thoth panel. `profile list --json` gains `login_name` and
+`login_name_seen_at`; every other output, every `--json` id, `thoth models`
+and the shared records folder stay without it.
 
 Three read-only commands, added after Phase 2. None of them reads
 credentials or calls a network service itself. `profile usage` without
@@ -3085,7 +3327,7 @@ the automatic refresh asks only agy and codex; Thoth stores the readings). A win
   "skipped": null | "off" | "worker", "results": [{"profile_id", "status",
   "error"}]}`, where `status` is `refreshed`, `failed` or `skipped_live_run`
   and only due profiles are listed.
-- `thoth recommend --role implementer|reviewer [--task TASK] [--model MODEL] [--json]`:
+- `thoth recommend --role implementer|reviewer [--task TASK] [--model MODEL] [--tables] [--json]`:
   ranks profiles and says why. With `live-quota` on it first runs the
   automatic refresh above, so it may then start agy or codex and write
   readings; `--json` reports it as `live_quota_refresh` and each failure is a

@@ -644,6 +644,8 @@ fn show_with_no_review_has_the_same_keys() {
         sorted_keys(&s),
         [
             "approved",
+            // BRIEF-1: the newest spec review's short conclusion, null here
+            "brief",
             "newest",
             "pending_edits",
             "required_before_dispatch",
@@ -658,6 +660,7 @@ fn show_with_no_review_has_the_same_keys() {
     );
     assert_eq!(s["pending_edits"], false);
     assert!(s["newest"].is_null());
+    assert!(s["brief"].is_null());
     assert_eq!(s["review_count"], 0);
     assert_eq!(s["approved"], false);
     assert_eq!(s["required_before_dispatch"], true);
@@ -744,10 +747,12 @@ fn mcp_records_shows_and_skips() {
 
     let list = s.send(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 35);
+    // thoth_review_confirm sits after thoth_review_start, one place before
+    // these.
+    assert_eq!(tools.len(), 36);
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names[17], "thoth_spec_review_record");
-    assert_eq!(names[18], "thoth_spec_review_show");
+    assert_eq!(names[18], "thoth_spec_review_record");
+    assert_eq!(names[19], "thoth_spec_review_show");
     let tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap().clone();
     assert_eq!(tool("thoth_spec_review_show")["annotations"]["readOnlyHint"], true);
     assert_eq!(tool("thoth_spec_review_record")["annotations"]["readOnlyHint"], false);

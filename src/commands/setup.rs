@@ -254,9 +254,15 @@ fn step_accounts(s: &mut Session, paths: &Paths, cli_ok: &[&str]) {
 
     // Registered profiles: offer a login for an active one that is logged out.
     let labels = plan_label::read_only_labels(paths);
+    let logins = crate::login_name::read_only_names(paths);
     let label_of = |labels: &std::collections::HashMap<String, String>, id: &str| labels.get(id).cloned();
     for p in &list {
-        let item = profile_item(&s.c, p, label_of(&labels, &p.profile_id).as_deref());
+        let item = profile_item(
+            &s.c,
+            p,
+            label_of(&labels, &p.profile_id).as_deref(),
+            label_of(&logins, &p.profile_id).as_deref(),
+        );
         s.show(&item);
         if item.status != Status::Fail || !cli_ok.contains(&p.harness.as_str()) || p.status != "active" {
             continue;
@@ -268,7 +274,13 @@ fn step_accounts(s: &mut Session, paths: &Paths, cli_ok: &[&str]) {
         login_loop(s, paths, Some(&p.profile_id), None);
         // Re-read after the login, which may have stored the tier.
         let fresh = plan_label::read_only_labels(paths);
-        let again = profile_item(&s.c, p, label_of(&fresh, &p.profile_id).as_deref());
+        let fresh_logins = crate::login_name::read_only_names(paths);
+        let again = profile_item(
+            &s.c,
+            p,
+            label_of(&fresh, &p.profile_id).as_deref(),
+            label_of(&fresh_logins, &p.profile_id).as_deref(),
+        );
         s.result(&again);
     }
 
@@ -284,12 +296,18 @@ fn step_accounts(s: &mut Session, paths: &Paths, cli_ok: &[&str]) {
         if login_loop(s, paths, None, Some(harness)) {
             if let Profiles::Listed(now) = read_profiles(paths) {
                 let fresh = plan_label::read_only_labels(paths);
+                let fresh_logins = crate::login_name::read_only_names(paths);
                 let new: Vec<&Profile> = now
                     .iter()
                     .filter(|p| p.harness == harness && !list.iter().any(|o| o.profile_id == p.profile_id))
                     .collect();
                 for p in new {
-                    let item = profile_item(&s.c, p, label_of(&fresh, &p.profile_id).as_deref());
+                    let item = profile_item(
+                        &s.c,
+                        p,
+                        label_of(&fresh, &p.profile_id).as_deref(),
+                        label_of(&fresh_logins, &p.profile_id).as_deref(),
+                    );
                     s.result(&item);
                 }
             }

@@ -189,7 +189,8 @@ fn codex_source_check_pass_records_sources_claims_events_and_read_only_web_args(
     );
     assert!(!args.iter().any(|a| a.contains("network_access")));
     assert!(args.contains(&"--output-schema".to_string()));
-    let show = json_ok(&f, &["review", "show", &task, "--json"]);
+    // BRIEF-1: the claims and their sources are shown only with --full.
+    let show = json_ok(&f, &["review", "show", &task, "--full", "--json"]);
     assert_eq!(show["verdict"], "PASS");
     assert_eq!(show["findings"]["sources"].as_array().unwrap().len(), 2);
     for s in show["findings"]["sources"].as_array().unwrap() {

@@ -210,9 +210,10 @@ fn review_pass_settles_the_task_pass_and_review_show_reports_the_findings() {
     assert!(!kinds.contains(&"review_invalid".to_string()), "{kinds:?}");
 
     // --- review show -----------------------------------------------------
+    // BRIEF-1: the implementer's claims are shown only with --full.
     let out = f
         .cmd()
-        .args(["review", "show", &task_id, "--json"])
+        .args(["review", "show", &task_id, "--full", "--json"])
         .assert()
         .success()
         .get_output()

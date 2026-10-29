@@ -103,6 +103,12 @@ thoth profile check claude-a
 - A name that differs from a registered profile only in letter case is refused
   (a Windows directory name is not case-sensitive, so they would share one
   directory).
+- New (PANEL-3): a new name that starts with `claude-`, `codex-` or `agy-`
+  (lower case, with something after it) needs no `--harness`:
+  `thoth profile login claude-x` is `--harness claude-code`, `codex-x` is
+  `codex`, `agy-x` is `antigravity` (agy's one-account rule still applies).
+  A given `--harness` wins over the name; any other new name still needs
+  `--harness`.
 - It needs a real terminal. Claude Code's `!` and pipes are not one, and thoth
   refuses there. In the mintty Git Bash window thoth may not notice, but
   claude's and agy's screens do not work properly there; use Windows Terminal,
@@ -325,6 +331,15 @@ status (`completed` / `failed` / `cancelled` / `interrupted`) instead of the
 task's, and reports a reviewer run's verdict. A task id and `--run` are mutually
 exclusive. See `docs/phase2/usage.md`.
 
+When the wait ends, `--json` also names the task's last implementer run
+(`run_id`, by run id) and what that run's own newest delivery says:
+`result_status`, `claim_count` and its brief (`brief`, `brief_source`,
+`brief_truncated`; BRIEF-1). They are null when that run delivered nothing,
+even if an earlier run did, and all six are null on a timeout. The human
+output prints `brief: ...` under the status line, continuation lines indented
+two spaces, and when the brief was cut,
+`(cut at 1000 chars; full text: thoth task result <task>)`.
+
 ## Reading the outcome
 
 | task status | what it means | what to do |
@@ -334,6 +349,16 @@ exclusive. See `docs/phase2/usage.md`.
 | `interrupted` | the run stopped early; the worktree and `harness_session_id` are intact. `runs.interrupted_reason` says why: `quota` (the account's quota is used up), `crash` (the worker ended without a result), `auth` (the profile is logged out; see Login failures below), `transient` (a network problem or a busy service; the runner already retried it twice in the same run (see Temporary problems below)) | `quota` (Breaking change, RJ-3): `thoth dispatch <task> --profile <other> --reason <why>` now with a profile that still has quota (`thoth status <task>` lists them; the re-dispatch keeps the run's model and effort when `<other>` has the same harness); do not wait for the used-up profile or resume the run on it. A reviewer or spec reviewer run is started again with `review start` / `spec review start` on the next reviewer that has quota. Only when no profile has quota anywhere does the commander wait for quota to come back. `auth`: `thoth profile login <profile>`, then `thoth resume <run>`. `transient`: `thoth resume <run>` to try again. `crash`: `thoth resume <run>` (same profile) or `thoth dispatch <task> --profile <other>` |
 | `failed` | the harness reported a real failure, the wall-clock timeout fired, a cancel could not kill every process, or the runner gave up after repeated database errors | read `runs.error_text` and `runs\<run_id>\stderr.log` (and `stderr.retry1.log` / `stderr.retry2.log` when the runner relaunched the harness). `failed` is still re-dispatchable — `thoth dispatch <task> --profile <id>` starts a new run on the same attempt, reusing the worktree, exactly like the `interrupted`/`unverified` re-entry paths |
 | `cancelled` | you cancelled it and every process died | nothing |
+
+Start from the brief (BRIEF-1): the worker's own short conclusion when its
+result.json has a non-blank string `brief`, otherwise its summary. It is at
+most 1,000 characters (characters, not bytes, so Chinese text and emoji get the
+same room; no ellipsis is added, trailing whitespace after a cut is trimmed,
+newlines inside stay), masked before it is cut, and `brief_truncated` says
+whether it was cut. `thoth wait`, `thoth wait --run`, `thoth task result` and
+the run's settling `status_change` note show it; the whole summary and claims
+are in `thoth task result <task> [--run <run>]`. A delivery ingested before
+BRIEF-1 has its brief taken from its stored result.json the same way.
 
 `thoth status <task> --json` gives each run a `next_step`: the command to run
 next for an interrupted or failed run, naming its profile, run and task (null
@@ -592,6 +617,15 @@ earlier ingest — so it works after a `completed` run, after an `interrupted` o
 without a full reroute), and it can be re-run to replace an earlier submission
 (claims are replaced, not doubled).
 
+The output's `note` is `ingested N claim(s): ` followed by the delivery's
+brief (BRIEF-1), not its whole summary: result.json may carry an optional
+string `brief`, the worker's short conclusion; when it is missing, blank or
+not a string the summary stands in. Either is trimmed, masked and cut to 1,000
+characters (see "Reading the outcome"). A missing or long `brief` is never a
+reason to reject the document, and the `result_ingested` event keeps the
+whole `summary` and `result_json`, plus `brief`, `brief_source` (`worker` or
+`summary`) and `brief_truncated`.
+
 ## Common errors
 
 | message | cause |
@@ -664,7 +698,7 @@ What it checks, in order:
 
 - **Thoth state directory** (`state_dir`): where `THOTH_HOME` (or `~/.thoth`) points, and whether it exists. A missing directory is only a warning; the first command that needs it creates it. If only the old `~/.agentctl` exists, or only `AGENTCTL_HOME` is set, doctor reports it as a failure and prints the `setx` / `export` line, instead of refusing to run as every other command does; the other ways to settle it are under "Coming from agentctl" above.
 - **The three CLIs** (`cli_claude`, `cli_codex`, `cli_agy`): each one's `--version`, through the same Windows npm-shim resolution as `profile check`. A CLI that does not run fails when a registered profile uses it, and only warns otherwise. The fix is the install command (or the agy install page); doctor never installs anything.
-- **Profiles** (`profiles`, then one `profile:<id>` per profile): that `global.db` has at least one profile, and that each profile is logged in. A logged-out profile gets `thoth profile login <id>`; with no profile at all, the fix is `thoth profile login --harness claude-code|codex|antigravity`. Each profile's heading shows its stored tier (`Profile claude-a (Max)`, in Traditional Chinese `帳號 claude-a（Max）`); the detail is still what this check just saw.
+- **Profiles** (`profiles`, then one `profile:<id>` per profile): that `global.db` has at least one profile, and that each profile is logged in. A logged-out profile gets `thoth profile login <id>`; with no profile at all, the fix is `thoth profile login --harness claude-code|codex|antigravity`. Each profile's heading shows its stored tier (`Profile claude-a (Max)`, in Traditional Chinese `帳號 claude-a（Max）`); the detail is still what this check just saw. New (PANEL-3): the heading also names the login, the part of the login email before `@`: `Profile claude-a (alice, Max)`, `帳號 claude-a（alice，Max）`, from this check's email, else the stored one; without a name it is as before. `--json` does not change.
 - **This repository** (`repo`): that the current directory is in a git repository and that `thoth init` has been run for it.
 - **Checks** (`checks`): the approved checks of this repository. A check whose program is not on `PATH` right now fails, even when `thoth checks list` shows it as `approved` (an approval made while the program was missing still matches): `verify` could not run it. The fix names the program and shows how to put its folder on `PATH`; when the missing program is in `~/.cargo/bin` or `~/.local/bin`, the fix names that folder instead of a placeholder. A check whose pin changed since approval (`thoth checks list` calls it `stale`) is a warning, listed with what changed; approve it again in a terminal with `thoth checks approve` after looking at the change. Pending checks and an empty catalogue are warnings too. A check added with `--exe-pin path` is listed as `program pinned by path only`; that is information, not a warning.
 - **Config file** (`config`): that `config.json`, when present, is a JSON object with only the known keys. A broken file is a warning: every setting stored in it is ignored (environment variables and defaults still apply). An unknown key is a warning and blocks nothing. `secrets.json` (the two API keys) is checked the same way, and on Linux it must be readable by you only.

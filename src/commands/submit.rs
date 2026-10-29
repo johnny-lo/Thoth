@@ -75,10 +75,10 @@ pub fn run(paths: &Paths, cwd: &Path, file: &Path, needle: &str, json: bool) -> 
     let outcome = ingest::ingest_path(&conn, &run, &task.risk, file);
     let now = ids::now_rfc3339();
     let (task_status, ok, note) = match &outcome {
-        IngestOutcome::Ok { summary, claim_count } => (
+        IngestOutcome::Ok { claim_count, brief, .. } => (
             TaskStatus::InReview,
             true,
-            format!("ingested {claim_count} claim(s): {summary}"),
+            format!("ingested {claim_count} claim(s): {brief}"),
         ),
         IngestOutcome::Invalid { reason } => (
             TaskStatus::Unverified,

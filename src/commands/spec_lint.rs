@@ -13,10 +13,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-/// Over this many bytes a spec is refused: the task should be split.
+/// Over this many bytes a spec is refused at every risk: the task should be
+/// split.
 pub const TOO_LARGE_BYTES: usize = 40960;
-/// Over this many bytes (up to `TOO_LARGE_BYTES`) a spec is only warned about.
+/// Over this many bytes (up to `TOO_LARGE_BYTES`) a spec is `large`: an error
+/// at low and normal risk, a warning at important and high (LEAN-1).
 pub const LARGE_BYTES: usize = 20480;
+
+/// LEAN-1: the risks at which `large` is an error. They skip the mandatory
+/// first-dispatch spec review, so their specs are kept small instead; the
+/// gated risks (`spec_review::gated_risk`) are reviewed, and only warned.
+const SMALL_SPEC_RISKS: [&str; 2] = ["low", "normal"];
+
+/// The risk `large` is judged at: the spec's own `risk`, `normal` when it has
+/// none, and `normal` too when the spec cannot be read (no risk is readable,
+/// so the default applies).
+fn size_risk(raw: &str) -> String {
+    crate::spec::parse_spec(raw).map(|s| s.risk).unwrap_or_else(|_| "normal".to_string())
+}
 
 const WRITE_WORDS_ZH: &[&str] = &["改", "加", "寫入", "寫進", "新增", "建立", "刪", "移除", "搬", "覆蓋", "編輯"];
 const WRITE_WORDS_EN: &[&str] = &[
@@ -136,11 +150,24 @@ pub fn lint(raw: &str, root: &Path, check_ids: &[String]) -> Report {
             format!("the spec is {bytes} bytes, over the {TOO_LARGE_BYTES}-byte limit; split the task into smaller tasks"),
         ));
     } else if bytes > LARGE_BYTES {
-        warnings.push(Finding::new(
-            "large",
-            None,
-            format!("the spec is {bytes} bytes, over {LARGE_BYTES}; consider splitting the task"),
-        ));
+        let risk = size_risk(raw);
+        if SMALL_SPEC_RISKS.contains(&risk.as_str()) {
+            errors.push(Finding::new(
+                "large",
+                None,
+                format!(
+                    "the spec is {bytes} bytes, over the {LARGE_BYTES}-byte limit for risk {risk}: \
+                     low and normal risk tasks skip the mandatory spec review, so their specs must \
+                     stay at or under {LARGE_BYTES} bytes; shrink the spec or split the task"
+                ),
+            ));
+        } else {
+            warnings.push(Finding::new(
+                "large",
+                None,
+                format!("the spec is {bytes} bytes, over {LARGE_BYTES}; consider splitting the task"),
+            ));
+        }
     }
     let spec = match crate::spec::parse_spec(raw) {
         Ok(s) => s,
@@ -925,12 +952,12 @@ mod tests {
         let r = lint(&sized(20480), d.path(), &[]);
         assert!(r.errors.is_empty() && r.warnings.is_empty());
         let r = lint(&sized(20481), d.path(), &[]);
-        assert!(r.errors.is_empty());
-        assert_eq!(rules(&r.warnings), vec!["large"]);
-        assert_eq!(r.warnings[0].location, None);
+        assert!(r.warnings.is_empty());
+        assert_eq!(rules(&r.errors), vec!["large"]);
+        assert_eq!(r.errors[0].location, None);
         let r = lint(&sized(40960), d.path(), &[]);
-        assert!(r.errors.is_empty());
-        assert_eq!(rules(&r.warnings), vec!["large"]);
+        assert!(r.warnings.is_empty());
+        assert_eq!(rules(&r.errors), vec!["large"]);
         let r = lint(&sized(40961), d.path(), &[]);
         assert_eq!(rules(&r.errors), vec!["too_large"]);
         assert_eq!(r.errors[0].location, None);

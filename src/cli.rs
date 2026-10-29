@@ -72,13 +72,14 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
-    /// List every profile's quota facts (eligible or not, and why) and the
-    /// models it can run, the three external tables filtered to the
-    /// organizations with an account here (Artificial Analysis, Agent Arena,
-    /// AI Stupid Level's recent degradation), Thoth's own usage per account,
-    /// model, effort and task type (average tokens and quota points, runs
-    /// left), and with --task the task's reject history; it does not choose a
-    /// profile, model or effort for you.
+    /// For every account, its quota facts and windows (eligible or not, and
+    /// why), the models it can run now with each model's matching scores in
+    /// the three external tables (Artificial Analysis indexes, Agent Arena
+    /// ranks, AI Stupid Level's recent degradation), Thoth's own usage of that
+    /// account and model (average tokens and quota points, how many runs are
+    /// left), and the model names no table matched; with --tables the three
+    /// full filtered tables too; with --task the task's reject history. It
+    /// does not choose a profile, model or effort for you.
     Recommend {
         #[arg(long)]
         role: String,
@@ -86,6 +87,9 @@ pub enum Command {
         task: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        /// Also send the three full filtered tables in --json.
+        #[arg(long)]
+        tables: bool,
         #[arg(long)]
         json: bool,
     },
@@ -510,12 +514,45 @@ pub enum ReviewAction {
         /// launch_choice event; required when require-reason is on.
         #[arg(long)]
         reason: Option<String>,
+        /// Edit mode: the reviewer may attach a small fix to its REJECT,
+        /// which thoth applies in the fix worktree, checks against fixed
+        /// bounds and commits on thoth/TASK/aN-fix for `verify` and
+        /// `review confirm`. Code tasks only.
+        #[arg(long)]
+        edit: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Launch the confirmer of the pending fix (an edit review's applied fix, after `thoth verify RUN` on it): it judges only the fix's edits, ok or revise each. APPROVE with a green verify passes the task on the fix branch; anything else rejects it, to be redone from the original candidate.
+    Confirm {
+        task: String,
+        /// A profile id.
+        #[arg(long)]
+        profile: String,
+        /// The model. Required every time; it may not be the edit review's
+        /// model at the edit review's effort.
+        #[arg(long)]
+        model: String,
+        #[arg(long, value_parser = parse_duration_secs, default_value = "30m")]
+        timeout: u64,
+        /// Reasoning effort, as for review start; required unless the model
+        /// has no effort setting.
+        #[arg(long)]
+        effort: Option<String>,
+        /// Why this profile, model and effort were chosen; recorded in the
+        /// launch_choice event; required when require-reason is on.
+        #[arg(long)]
+        reason: Option<String>,
         #[arg(long)]
         json: bool,
     },
     /// Show the newest review's verdict, findings and opened evidence.
     Show {
         task: String,
+        /// Also show the worker claims the review judged (`claims` is null
+        /// without it; `thoth task result` has them too).
+        #[arg(long)]
+        full: bool,
         #[arg(long)]
         json: bool,
     },

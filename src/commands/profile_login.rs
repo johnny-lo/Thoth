@@ -56,6 +56,20 @@ fn id_prefix(harness: &str) -> &'static str {
     }
 }
 
+/// The harness a new id names by its prefix: `claude-` is claude-code,
+/// `codex-` codex, `agy-` antigravity, with at least one character after the
+/// prefix. The prefixes are lower case and matched as written.
+fn infer_harness(id: &str) -> Option<&'static str> {
+    [
+        ("claude-", crate::adapter::HARNESS_CLAUDE_CODE),
+        ("codex-", HARNESS_CODEX),
+        ("agy-", antigravity::HARNESS_NAME),
+    ]
+    .into_iter()
+    .find(|(prefix, _)| id.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty()))
+    .map(|(_, harness)| harness)
+}
+
 fn default_provider(harness: &str) -> &'static str {
     match harness {
         HARNESS_CODEX => "openai",
@@ -218,6 +232,8 @@ pub fn run(paths: &Paths, args: LoginArgs<'_>) -> Result<i32> {
     }
     // TIER-1: the tier the CLI just reported; a failed write only warns.
     plan_label::remember_or_warn(&conn, &profile.profile_id, status.subscription_type.as_deref());
+    // PANEL-3: the login name of the email it reported, the same way.
+    crate::login_name::remember_or_warn(&conn, &profile.profile_id, status.email.as_deref());
     // MODELS-1: the model list the CLI just reported, the same way.
     crate::model_list::remember_or_warn(&conn, &profile.profile_id, &status);
     // FC-1: the runner marked this profile `logged_out`; the CLI now says it
@@ -296,7 +312,8 @@ fn decide_target(conn: &rusqlite::Connection, args: &LoginArgs<'_>) -> Result<st
             if !valid_login_id(id) {
                 return refuse(json, "login.refuse.bad_id", &[id]).map(Err);
             }
-            let Some(harness) = args.harness else {
+            // PANEL-3: a new `claude-x`, `codex-x` or `agy-x` names its CLI.
+            let Some(harness) = args.harness.or_else(|| infer_harness(id)) else {
                 return refuse(json, "login.refuse.need_harness", &[id]).map(Err);
             };
             if harness == antigravity::HARNESS_NAME {

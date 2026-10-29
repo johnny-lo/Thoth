@@ -533,9 +533,12 @@ fn verify_reports_the_same_json_shape_when_there_are_no_approved_checks() {
         "dry_run", "failures", "ok", "reason", "results", "run_id", "source", "task_id",
         "warnings", "worker_declared", "approved_checks", "previous_verify",
         "missing_since_last_verify",
+        // RFIX-1: where the checks ran, null when nothing ran
+        "head_commit", "head_commit_after", "worktree_clean",
     ];
     expected.sort();
     assert_eq!(keys(&v), expected);
+    assert_eq!(v["head_commit"], serde_json::Value::Null);
     assert_eq!(v["ok"], false);
     assert_eq!(v["failures"], 0);
     assert_eq!(v["reason"], "no_approved_checks");

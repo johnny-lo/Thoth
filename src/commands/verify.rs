@@ -419,6 +419,7 @@ pub fn run(
             "worker_declared": worker_declared, "reason": "no_approved_checks",
             "approved_checks": approved_checks, "previous_verify": previous_verify,
             "missing_since_last_verify": missing_since_last_verify,
+            "head_commit": null, "head_commit_after": null, "worktree_clean": null,
         });
         if let Some(c) = &at_commit {
             doc["at_commit"] = serde_json::json!(c);
@@ -467,6 +468,22 @@ pub fn run(
         run_worktree.clone()
     };
 
+    // RFIX-1: the commit the checks ran on, and whether they left it alone:
+    // HEAD before and after, and no project file changed (`.agent/` and
+    // `.agents/` are Thoth's; ignored files such as build output do not
+    // count, a generated file that is not ignored does). Nothing for a dry run.
+    let tree_state = |dir: &Path| -> (Option<String>, bool) {
+        let head = worktree::rev_parse_head(dir).ok();
+        let clean = crate::review_fix_edits::project_changes(dir, false).map(|c| c.is_empty()).unwrap_or(false);
+        (head, clean)
+    };
+    let (head_before, clean_before) = if dry_run {
+        (None, false)
+    } else if at_base {
+        (at_commit.clone(), tree_state(&worktree).1)
+    } else {
+        tree_state(&worktree)
+    };
     let ctx = evidence::EvidenceContext {
         paths,
         repo_id: &repo_id,
@@ -708,6 +725,13 @@ pub fn run(
         }));
     }
 
+    let (head_after, clean_after) = if dry_run { (None, false) } else { tree_state(&worktree) };
+    let ran = !dry_run;
+    let head_keys = serde_json::json!({
+        "head_commit": head_before,
+        "head_commit_after": head_after,
+        "worktree_clean": ran.then(|| clean_before && clean_after && head_before.is_some() && head_before == head_after),
+    });
     if !dry_run {
         // The new rows belong in the index the worker and reviewer read.
         if let Err(e) = evidence::refresh_index(&conn, &run.task_id, &run_worktree) {
@@ -730,6 +754,9 @@ pub fn run(
         });
         if let Some(c) = &at_commit {
             detail["at_commit"] = serde_json::json!(c);
+        }
+        for (k, v) in head_keys.as_object().into_iter().flatten() {
+            detail[k] = v.clone();
         }
         state::append_event(
             &conn,
@@ -835,6 +862,9 @@ pub fn run(
     });
     if let Some(c) = &at_commit {
         doc["at_commit"] = serde_json::json!(c);
+    }
+    for (k, v) in head_keys.as_object().into_iter().flatten() {
+        doc[k] = v.clone();
     }
     output::emit(json, &doc, &human);
     // Non-zero when a check failed (or was refused/timed out), so a script

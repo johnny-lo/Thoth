@@ -50,6 +50,7 @@ pub const STATE_CHANGING: &[&str] = &[
     "thoth_task_accept",
     "thoth_dispatch",
     "thoth_review_start",
+    "thoth_review_confirm",
     "thoth_review_record",
     "thoth_spec_review_record",
     "thoth_spec_review_start",
@@ -454,7 +455,11 @@ fn execute(
         "thoth_profile_usage" => pos!("id"),
         "thoth_recommend" => {
             argv.push(format!("--role={}", a["role"].as_str().unwrap()));
-            flag(&mut argv, a, "task", "task")
+            flag(&mut argv, a, "task", "task");
+            // CROSS-1: `tables` is a boolean switch, like SR-3's `edit`.
+            if a.get("tables") == Some(&Value::Bool(true)) {
+                argv.push("--tables".into())
+            }
         }
         "thoth_task_create" => {
             flag(&mut argv, a, "title", "title");
@@ -581,7 +586,7 @@ fn execute(
             };
             argv.extend(["-f".into(), temp.as_ref().unwrap().display().to_string()])
         }
-        "thoth_review_start" => {
+        "thoth_review_start" | "thoth_review_confirm" => {
             pos!("task");
             for (n, f) in [
                 ("profile", "profile"),
@@ -592,8 +597,18 @@ fn execute(
             ] {
                 flag(&mut argv, a, n, f)
             }
+            // RFIX-1: `edit` is a boolean switch, not a valued flag.
+            if a.get("edit") == Some(&Value::Bool(true)) {
+                argv.push("--edit".into())
+            }
         }
-        "thoth_review_show" => pos!("task"),
+        "thoth_review_show" => {
+            pos!("task");
+            // BRIEF-1: `full` is a boolean switch, like `edit` below.
+            if a.get("full") == Some(&Value::Bool(true)) {
+                argv.push("--full".into())
+            }
+        }
         "thoth_spec_review_record" => {
             pos!("task");
             temp = match json_file(&paths, "spec-review", &a["review"]) {
@@ -888,11 +903,11 @@ mod tests {
                 t.name
             );
         }
-        assert_eq!(STATE_CHANGING.len(), 17);
+        assert_eq!(STATE_CHANGING.len(), 18);
         let mut names = STATE_CHANGING.to_vec();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 17);
+        assert_eq!(names.len(), 18);
     }
     #[test]
     fn forbidden_sequences_are_enforced() {

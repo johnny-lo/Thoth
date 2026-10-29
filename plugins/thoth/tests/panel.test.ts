@@ -1539,3 +1539,486 @@ test('band_keeps_what_the_mods_after_it_draw', async ($, on) => {
     await ui.unmount()
   }
 })
+
+// PANEL-3: login names, review in progress, and Cancel / Close task / Dispatch again with a second press.
+
+const RUN_REV = '01M5RUNREVIEWAAAAAAAAAAAAA'
+const RUN_IMPL = '01M5RUNIMPLAAAAAAAAAAAAAAA'
+const RUN_SPEC = '01M5RUNSPECAAAAAAAAAAAAAAA'
+const RUN_OTHER = '01M5RUNOTHERAAAAAAAAAAAAAA'
+const liveRun = (run_id: string, role: string, profile: string, model: string, status = 'running') => ({
+  run_id,
+  role,
+  profile,
+  model,
+  status,
+})
+
+const LIVE_STATUS = {
+  tasks: [
+    task('T1', 'S3-9 handoff', 'in_review', { live_run: liveRun(RUN_REV, 'reviewer', 'claude-a', 'opus') }),
+    task('T2', 'S3-11 codex quota', 'running', { live_run: liveRun(RUN_IMPL, 'implementer', 'codex-a', 'gpt-5.6-luna') }),
+    task('T3', 'P7-x check', 'unverified', { live_run: null }),
+    task('T4', 'MOD-2 stream', 'failed', { runs: 3, live_run: null }),
+    task('T6', 'Spec draft', 'draft', { live_run: liveRun(RUN_SPEC, 'spec_reviewer', 'codex-a', 'gpt-5.6-luna') }),
+  ],
+}
+const PROFILE_LIST = {
+  profiles: [
+    { profile_id: 'claude-a', login_name: 'alice', login_name_seen_at: '2026-10-27T00:00:00Z' },
+    { profile_id: 'codex-a', login_name: 'carol', login_name_seen_at: '2026-10-27T00:00:00Z' },
+    { profile_id: 'agy-a', login_name: null, login_name_seen_at: null },
+  ],
+}
+const LIVE_REPLIES = (): Record<string, Reply> => ({
+  ...SAMPLE_REPLIES(),
+  'status --json': json(LIVE_STATUS),
+  'profile usage --json': json(SAMPLE_USAGE_PLANS),
+  'profile list --json': json(PROFILE_LIST),
+})
+const WRITES = ['cancel', 'task', 'dispatch']
+/** Every thoth command the panel ran that writes, as its arguments joined with spaces. */
+const writes = (w: World) =>
+  w.calls.filter(call => call.argv[0] !== 'git' && WRITES.includes(call.argv[1] ?? '')).map(call => call.argv.slice(1).join(' '))
+const profileListRuns = (w: World) => w.calls.filter(call => call.argv.slice(1).join(' ') === 'profile list --json').length
+
+test('panel3_named_puts_the_login_before_the_label', () => {
+  expect(named('claude-a', 'Max', 'en', 'alice')).toBe('claude-a (alice, Max)')
+  expect(named('claude-a', 'Max', 'zh-TW', 'alice')).toBe('claude-a（alice，Max）')
+  expect(named('claude-a', null, 'en', 'alice')).toBe('claude-a (alice)')
+  expect(named('claude-a', null, 'zh-TW', 'alice')).toBe('claude-a（alice）')
+  expect(named('claude-a', 'Max', 'en', null)).toBe('claude-a (Max)')
+  expect(named('agy-a', null, 'zh-TW', undefined)).toBe('agy-a')
+})
+
+test('panel3_a_running_review_is_in_progress_with_its_account_and_model', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  for (const surface of SURFACES) {
+    const ui = await pane($, surface)
+    expect(await between(ui, 1, 2)).toEqual(['● P7-x check unverified', '● MOD-2 stream failed'])
+    expect(await between(ui, 2, 3)).toEqual([
+      '● S3-9 handoff under review · claude-a (alice, Max) · opus',
+      '● S3-11 codex quota running',
+      '● Spec draft spec under review · codex-a (carol, Plus) · gpt-5.6-luna',
+    ])
+    await ui.unmount()
+  }
+
+  // The review ends: the task waits on the commander again.
+  w.replies['status --json'] = json({
+    tasks: LIVE_STATUS.tasks.map(t => (t.task_id === 'T1' ? { ...t, live_run: null } : t)),
+  })
+  await w.clock.advance(10_000)
+  const ui = await pane($, 'terminal')
+  expect(await between(ui, 1, 2)).toEqual(['● S3-9 handoff in review', '● P7-x check unverified', '● MOD-2 stream failed'])
+  expect(await between(ui, 2, 3)).not.toContain('● S3-9 handoff in review')
+  await ui.unmount()
+})
+
+test('panel3_a_running_review_is_in_progress_in_zh_tw', { options: { language: 'zh-TW' } }, async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  for (const surface of SURFACES) {
+    const ui = await pane($, surface)
+    const all = (await ui.findAll({ type: 'Text' })).map(node => node.text ?? '')
+    const at = (label: string) => all.findIndex(text => text.startsWith(`── ${label} `))
+    expect(all.slice(at('指揮官處理中') + 1, at('進行中'))).toEqual(['● P7-x check 未驗證', '● MOD-2 stream 失敗'])
+    expect(all.slice(at('進行中') + 1, at('帳號額度'))).toEqual([
+      '● S3-9 handoff 審查中 · claude-a（alice，Max） · opus',
+      '● S3-11 codex quota 執行中',
+      '● Spec draft 規格審查中 · codex-a（carol，Plus） · gpt-5.6-luna',
+    ])
+    await ui.unmount()
+  }
+})
+
+test('panel3_a_stuck_review_outside_a_repository_keeps_its_marks', async ($, on) => {
+  const status = {
+    tasks: [task('T1', 'S3-9 handoff', 'in_review', { any_heartbeat_stale: true, repo: '/work/alpha', live_run: liveRun(RUN_REV, 'reviewer', 'claude-b', 'opus') })],
+    outside_repo: true,
+  }
+  const w = world(on, { ...SAMPLE_REPLIES(), 'status --json': json(status) })
+  await start($, w)
+  const ui = await pane($, 'terminal')
+  expect(await between(ui, 2, 3)).toEqual(['● S3-9 handoff under review · claude-b · opus may be stuck · alpha'])
+  await ui.unmount()
+})
+
+test('panel3_without_live_run_the_grouping_is_as_before', async ($, on) => {
+  const w = world(on, { ...SAMPLE_REPLIES(), 'profile list --json': json(PROFILE_LIST) })
+  await start($, w)
+  const ui = await pane($, 'terminal')
+  expect(await between(ui, 1, 2)).toEqual(['● S3-9 handoff in review', '● P7-x check unverified may be stuck', '● MOD-2 stream failed'])
+  expect(await between(ui, 2, 3)).toEqual(['● S3-11 codex quota running', '● Small fixes queued'])
+  expect(await ui.find({ type: 'Button', key: 'cancel:T2' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('panel3_the_band_counts_a_review_as_running', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  for (const surface of SURFACES) {
+    const line = await band($, surface)
+    const text = (await line.find({ type: 'Text', text: /Thoth · / }))?.text ?? ''
+    expect(text).toContain('3 running')
+    expect(text).toContain('2 with the commander')
+    await line.unmount()
+  }
+})
+
+test('panel3_a_running_review_alone_refreshes_every_ten_seconds', async ($, on) => {
+  const reviewing = { tasks: [task('T1', 'S3-9 handoff', 'in_review', { live_run: liveRun(RUN_REV, 'reviewer', 'claude-b', 'opus') })] }
+  const w = world(on, { ...SAMPLE_REPLIES(), 'status --json': json(reviewing) })
+  await start($, w)
+  await w.clock.advance(10_000)
+  expect(w.statusRuns()).toBe(2)
+
+  // Without a live run the same task waits on the commander: the next refresh is a minute away.
+  w.replies['status --json'] = json({ tasks: [task('T1', 'S3-9 handoff', 'in_review', { live_run: null })] })
+  await w.clock.advance(10_000)
+  expect(w.statusRuns()).toBe(3)
+  await w.clock.advance(10_000)
+  expect(w.statusRuns()).toBe(3)
+  await w.clock.advance(50_000)
+  expect(w.statusRuns()).toBe(4)
+})
+
+test('panel3_login_names_in_quota_band_toast_and_run_pane', async ($, on) => {
+  const w = world(on, { ...WATCH_REPLIES(), 'profile usage --json': json(SAMPLE_USAGE_PLANS), 'profile list --json': json(PROFILE_LIST) })
+  await watchT2($, w)
+  const ui = await pane($, 'terminal')
+  expect((await ui.find({ type: 'Text', text: /^claude-a \(alice, Max\) {2}/ }))?.text).toContain('78% left')
+  expect((await ui.find({ type: 'Text', text: /^codex-a \(carol, Plus\) {2}/ }))?.text).toContain('quota exhausted')
+  expect(await ui.find({ type: 'Text', text: /^agy-a {2}/ })).toBeDefined()
+  await ui.press({ key: 'ask:T1' })
+  expect(w.submitted).toEqual(['Thoth task "S3-9 handoff" is now in review. Please take a look and tell me the next step.'])
+  await ui.unmount()
+  const top = await band($, 'terminal')
+  expect((await top.find({ type: 'Text', text: /Thoth · / }))?.text).toContain('codex-a (carol, Plus) 5h 14% left')
+  await top.unmount()
+  const run = await runPane($, 'terminal')
+  expect((await textsOf(run))[0]).toBe('S3-11 codex quota · implementer · codex-a (carol, Plus) · gpt-5.6-luna · running')
+  await run.unmount()
+  await w.clock.advance(10_000)
+  expect(w.toasts).toContain('codex-a (carol, Plus) ran out of quota; its task was interrupted')
+})
+
+test('panel3_login_names_in_zh_tw', { options: { language: 'zh-TW' } }, async ($, on) => {
+  const w = world(on, { ...WATCH_REPLIES(), 'profile usage --json': json(SAMPLE_USAGE_PLANS), 'profile list --json': json(PROFILE_LIST) })
+  await watchT2($, w)
+  const ui = await pane($, 'terminal')
+  expect((await ui.find({ type: 'Text', text: /^claude-a（alice，Max） {2}/ }))?.text).toContain('剩 78%')
+  await ui.unmount()
+  const run = await runPane($, 'terminal')
+  expect((await textsOf(run))[0]).toBe('S3-11 codex quota · 實作者 · codex-a（carol，Plus） · gpt-5.6-luna · 執行中')
+  await run.unmount()
+  await w.clock.advance(10_000)
+  expect(w.toasts).toContain('codex-a（carol，Plus） 額度用完，任務中斷')
+})
+
+test('panel3_profile_list_runs_at_most_once_a_minute_and_a_failure_means_no_names', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  expect(profileListRuns(w)).toBe(1)
+  await w.clock.advance(10_000)
+  await w.clock.advance(10_000)
+  expect(profileListRuns(w)).toBe(1)
+  for (let i = 0; i < 4; i++) await w.clock.advance(10_000)
+  expect(profileListRuns(w)).toBe(2)
+
+  w.replies['profile list --json'] = { exitCode: 1, stderr: 'boom' }
+  await $.command.run({
+    command: 'thoth',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 160 },
+  })
+  expect(profileListRuns(w)).toBe(3)
+  const ui = await pane($, 'terminal')
+  expect(await ui.find({ type: 'Text', text: /^claude-a \(Max\) {2}/ })).toBeDefined()
+  expect(await between(ui, 2, 3)).toContain('● S3-9 handoff under review · claude-a (Max) · opus')
+  for (const text of await texts(ui)) {
+    expect(text).not.toContain('alice')
+    expect(text).not.toContain('boom')
+  }
+  await ui.unmount()
+})
+
+/** Presses `key` on a fresh terminal pane, lets the panel settle, and gives back the pane drawn after it. */
+async function pressAndRedraw($: Engine, w: World, key: string) {
+  const ui = await pane($, 'terminal')
+  await ui.press({ key })
+  await ui.unmount()
+  await w.clock.settle()
+  return pane($, 'terminal')
+}
+
+const CANCEL_EN = {
+  implementer:
+    'Stop the run of S3-11 codex quota? This is final: the task becomes cancelled and cannot be dispatched again; redoing it needs a new task.',
+  reviewer: 'Stop the review of S3-9 handoff (claude-a (alice, Max), opus)? The task stays in review; the commander can start the review again.',
+  spec_reviewer: 'Stop the spec review of Spec draft? The task stays where it was; the spec review can be started again.',
+}
+const CANCEL_ZH = {
+  implementer: '停止「S3-11 codex quota」的 run？這是最終的：任務會變成已取消、不能再派，要重做得另建任務。',
+  reviewer: '停止「S3-9 handoff」的審查（claude-a（alice，Max），opus）？任務留在等審查，指揮官可以重新開審查。',
+  spec_reviewer: '停止「Spec draft」的規格審查？任務停在原狀態，可以重新開規格審查。',
+}
+
+test('panel3_cancel_asks_first_and_runs_once_on_yes', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  w.calls.length = 0
+  let ui = await pressAndRedraw($, w, 'cancel:T2')
+  expect(writes(w)).toEqual([])
+  expect(await ui.find({ type: 'Text', text: CANCEL_EN.implementer })).toBeDefined()
+  expect((await ui.find({ type: 'Button', key: 'confirm:T2' }))?.text).toBe('Yes, cancel')
+  expect((await ui.find({ type: 'Button', key: 'back:T2' }))?.text).toBe('Back')
+  // A second press while thoth answers runs nothing more.
+  await Promise.all([ui.press({ key: 'confirm:T2' }), ui.press({ key: 'confirm:T2' })])
+  await ui.unmount()
+  await w.clock.settle()
+  expect(writes(w)).toEqual([`cancel ${RUN_IMPL} --json`])
+  expect(w.toasts).toContain('Cancelled: S3-11 codex quota')
+  expect(w.statusRuns()).toBeGreaterThanOrEqual(1)
+  ui = await pane($, 'terminal')
+  expect(await ui.find({ type: 'Text', text: CANCEL_EN.implementer })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('panel3_back_runs_nothing', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  w.calls.length = 0
+  let ui = await pressAndRedraw($, w, 'cancel:T1')
+  expect(await ui.find({ type: 'Text', text: CANCEL_EN.reviewer })).toBeDefined()
+  await ui.press({ key: 'back:T1' })
+  await ui.unmount()
+  await w.clock.settle()
+  ui = await pane($, 'terminal')
+  expect(await ui.find({ type: 'Text', text: CANCEL_EN.reviewer })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'confirm:T1' })).toBeUndefined()
+  await ui.unmount()
+  expect(writes(w)).toEqual([])
+})
+
+test('panel3_the_three_cancel_sentences', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  for (const [key, text] of [['cancel:T2', CANCEL_EN.implementer], ['cancel:T1', CANCEL_EN.reviewer], ['cancel:T6', CANCEL_EN.spec_reviewer]]) {
+    const ui = await pressAndRedraw($, w, key!)
+    expect(await ui.find({ type: 'Text', text: text! })).toBeDefined()
+    await ui.unmount()
+  }
+  expect(writes(w)).toEqual([])
+})
+
+test('panel3_the_three_cancel_sentences_in_zh_tw', { options: { language: 'zh-TW' } }, async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  for (const [key, text] of [['cancel:T2', CANCEL_ZH.implementer], ['cancel:T1', CANCEL_ZH.reviewer], ['cancel:T6', CANCEL_ZH.spec_reviewer]]) {
+    const ui = await pressAndRedraw($, w, key!)
+    expect(await ui.find({ type: 'Text', text: text! })).toBeDefined()
+    expect((await ui.find({ type: 'Button', text: '確定取消' }))).toBeDefined()
+    expect((await ui.find({ type: 'Button', text: '返回' }))).toBeDefined()
+    await ui.unmount()
+  }
+  const ui = await pane($, 'terminal')
+  expect((await ui.find({ type: 'Button', key: 'cancel:T2' }))?.text).toBe('取消')
+  await ui.unmount()
+  expect(writes(w)).toEqual([])
+})
+
+test('panel3_a_changed_run_id_drops_the_confirm', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  w.calls.length = 0
+  let ui = await pressAndRedraw($, w, 'cancel:T2')
+  expect(await ui.find({ type: 'Text', text: CANCEL_EN.implementer })).toBeDefined()
+  await ui.unmount()
+  w.replies['status --json'] = json({
+    tasks: LIVE_STATUS.tasks.map(t => (t.task_id === 'T2' ? { ...t, live_run: liveRun(RUN_OTHER, 'implementer', 'codex-a', 'gpt-5.6-luna') } : t)),
+  })
+  await w.clock.advance(10_000)
+  ui = await pane($, 'terminal')
+  expect(await ui.find({ type: 'Text', text: CANCEL_EN.implementer })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'confirm:T2' })).toBeUndefined()
+  await ui.unmount()
+  expect(writes(w)).toEqual([])
+})
+
+test('panel3_a_reload_drops_the_confirm', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  let ui = await pressAndRedraw($, w, 'close:T4')
+  expect(await ui.find({ type: 'Button', key: 'confirm:T4' })).toBeDefined()
+  await ui.unmount()
+  await $.session.start({ cwd: '/repo' })
+  await w.clock.settle()
+  ui = await pane($, 'terminal')
+  expect(await ui.find({ type: 'Button', key: 'confirm:T4' })).toBeUndefined()
+  await ui.unmount()
+  expect(writes(w)).toEqual([])
+})
+
+const CLOSE_ARGS = 'task close T4 --reason closed from the Thoth panel --json'
+
+test('panel3_close_task_asks_first_and_runs_once', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  await start($, w)
+  let ui = await pane($, 'terminal')
+  expect((await ui.find({ type: 'Button', key: 'close:T4' }))?.text).toBe('Close task')
+  expect(await ui.find({ type: 'Button', key: 'close:T3' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'cancel:T4' })).toBeUndefined()
+  await ui.unmount()
+  w.calls.length = 0
+  ui = await pressAndRedraw($, w, 'close:T4')
+  expect(writes(w)).toEqual([])
+  expect(
+    await ui.find({ type: 'Text', text: 'Close MOD-2 stream? It becomes cancelled and drops out of the list; it cannot be dispatched again.' }),
+  ).toBeDefined()
+  await ui.press({ key: 'confirm:T4' })
+  await ui.unmount()
+  await w.clock.settle()
+  expect(writes(w)).toEqual([CLOSE_ARGS])
+  expect(w.toasts).toContain('Closed: MOD-2 stream')
+})
+
+test('panel3_close_task_in_zh_tw_and_never_on_in_review', { options: { language: 'zh-TW' } }, async ($, on) => {
+  const w = world(on, { ...SAMPLE_REPLIES(), 'profile list --json': json(PROFILE_LIST) })
+  await start($, w)
+  let ui = await pane($, 'terminal')
+  expect(await ui.find({ type: 'Button', key: 'close:T1' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'again:T1' })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'close:T4' }))?.text).toBe('關閉任務')
+  expect((await ui.find({ type: 'Button', key: 'again:T4' }))?.text).toBe('重派')
+  await ui.unmount()
+  ui = await pressAndRedraw($, w, 'close:T4')
+  expect(await ui.find({ type: 'Text', text: '關閉「MOD-2 stream」？任務會變成已取消、從清單消失，不能再派。' })).toBeDefined()
+  expect((await ui.find({ type: 'Button', key: 'confirm:T4' }))?.text).toBe('確定關閉')
+  await ui.press({ key: 'confirm:T4' })
+  await ui.unmount()
+  await w.clock.settle()
+  expect(w.toasts).toContain('已關閉：MOD-2 stream')
+})
+
+test('panel3_an_error_is_told_and_the_panel_refreshes', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  w.replies[CLOSE_ARGS] = { exitCode: 1, stderr: 'warning: something\n{"ok":false,"error":"the task changed meanwhile"}\n' }
+  await start($, w)
+  const ui = await pressAndRedraw($, w, 'close:T4')
+  const runs = w.statusRuns()
+  await ui.press({ key: 'confirm:T4' })
+  await ui.unmount()
+  await w.clock.settle()
+  expect(w.toasts).toContain('MOD-2 stream: the task changed meanwhile')
+  expect(w.toasts.filter(text => text.startsWith('Closed'))).toEqual([])
+  expect(w.statusRuns()).toBeGreaterThan(runs)
+})
+
+test('panel3_no_answer_in_time_is_told', async ($, on) => {
+  const w = world(on, LIVE_REPLIES())
+  w.replies[`cancel ${RUN_IMPL} --json`] = 'throw'
+  await start($, w)
+  const ui = await pressAndRedraw($, w, 'cancel:T2')
+  const runs = w.statusRuns()
+  await ui.press({ key: 'confirm:T2' })
+  await ui.unmount()
+  await w.clock.settle()
+  expect(w.toasts).toContain('thoth did not answer in time; the panel will show what happened')
+  expect(w.statusRuns()).toBeGreaterThan(runs)
+})
+
+const T4_RUNS = (implementer: Record<string, unknown>) => ({
+  task_id: 'T4',
+  title: 'MOD-2 stream',
+  status: 'failed',
+  runs: [
+    { ...runRow(RUN_A, 'implementer', 'interrupted', 'codex-a', 'gpt-5.6-luna'), effort_requested: 'low', interrupted_reason: 'crash', next_step: 'x' },
+    { ...runRow(RUN_B, 'implementer', 'failed', 'claude-b', 'sonnet'), effort_requested: 'high', interrupted_reason: null, next_step: null, ...implementer },
+    { ...runRow(RUN_C, 'reviewer', 'completed', 'codex-a', 'gpt-5.6-luna'), effort_requested: 'xhigh' },
+  ],
+})
+const AGAIN_REASON = `dispatched again from the Thoth panel: same profile, model and effort as run ${RUN_B}`
+
+test('panel3_dispatch_again_repeats_the_last_implementer_run', async ($, on) => {
+  const w = world(on, { ...LIVE_REPLIES(), 'status T4 --json': json(T4_RUNS({})) })
+  await start($, w)
+  w.calls.length = 0
+  const ui = await pressAndRedraw($, w, 'again:T4')
+  expect(writes(w)).toEqual([])
+  expect(w.calls.map(call => call.argv.slice(1).join(' '))).toContain('status T4 --json')
+  expect(
+    await ui.find({
+      type: 'Text',
+      text: "Dispatch MOD-2 stream again on claude-b with sonnet, effort high, the same as its last run? A new run starts and uses that account's quota.",
+    }),
+  ).toBeDefined()
+  expect((await ui.find({ type: 'Button', key: 'confirm:T4' }))?.text).toBe('Yes, dispatch again')
+  await Promise.all([ui.press({ key: 'confirm:T4' }), ui.press({ key: 'confirm:T4' })])
+  await ui.unmount()
+  await w.clock.settle()
+  expect(writes(w)).toEqual([`dispatch T4 --profile claude-b --model sonnet --effort high --reason ${AGAIN_REASON} --json`])
+  expect(w.toasts).toContain('Dispatched again: MOD-2 stream')
+})
+
+test('panel3_dispatch_again_without_effort_in_zh_tw', { options: { language: 'zh-TW' } }, async ($, on) => {
+  const w = world(on, { ...LIVE_REPLIES(), 'status T4 --json': json(T4_RUNS({ effort_requested: null })) })
+  await start($, w)
+  w.calls.length = 0
+  const ui = await pressAndRedraw($, w, 'again:T4')
+  expect(await ui.find({ type: 'Text', text: '用 claude-b、sonnet 照上一次重派「MOD-2 stream」？會開新的 run，用掉那個帳號的額度。' })).toBeDefined()
+  expect((await ui.find({ type: 'Button', key: 'confirm:T4' }))?.text).toBe('確定重派')
+  await ui.press({ key: 'confirm:T4' })
+  await ui.unmount()
+  await w.clock.settle()
+  expect(writes(w)).toEqual([`dispatch T4 --profile claude-b --model sonnet --reason ${AGAIN_REASON} --json`])
+  expect(w.toasts).toContain('已重派：MOD-2 stream')
+})
+
+test('panel3_dispatch_again_on_quota_only_shows_the_next_step', async ($, on) => {
+  const next = 'quota used up on claude-b; dispatch again with a profile that still has quota: thoth dispatch T4 --profile OTHER'
+  const w = world(on, {
+    ...LIVE_REPLIES(),
+    'status T4 --json': json(T4_RUNS({ status: 'interrupted', interrupted_reason: 'quota', next_step: next })),
+  })
+  await start($, w)
+  w.calls.length = 0
+  const ui = await pressAndRedraw($, w, 'again:T4')
+  expect(await ui.find({ type: 'Text', text: next })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'confirm:T4' })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'back:T4' }))?.text).toBe('Back')
+  for (const text of await texts(ui)) expect(text).not.toContain('Dispatch MOD-2 stream again')
+  await ui.unmount()
+  expect(writes(w)).toEqual([])
+})
+
+test('panel3_dispatch_again_without_an_implementer_run_asks_for_the_commander', async ($, on) => {
+  const w = world(on, {
+    ...LIVE_REPLIES(),
+    'status T4 --json': json({ task_id: 'T4', runs: [runRow(RUN_C, 'reviewer', 'completed', 'codex-a', 'gpt-5.6-luna')] }),
+  })
+  await start($, w)
+  w.calls.length = 0
+  const ui = await pressAndRedraw($, w, 'again:T4')
+  expect(await ui.find({ type: 'Button', key: 'confirm:T4' })).toBeUndefined()
+  await ui.unmount()
+  expect(w.toasts).toContain('MOD-2 stream has no earlier run to repeat; ask the commander')
+  expect(writes(w)).toEqual([])
+})
+
+test('panel3_a_refused_dispatch_is_told', async ($, on) => {
+  const w = world(on, { ...LIVE_REPLIES(), 'status T4 --json': json(T4_RUNS({})) })
+  w.replies[`dispatch T4 --profile claude-b --model sonnet --effort high --reason ${AGAIN_REASON} --json`] = {
+    exitCode: 1,
+    stderr: '{"ok":false,"error":"profile claude-b failed its auth check"}\n',
+  }
+  await start($, w)
+  const ui = await pressAndRedraw($, w, 'again:T4')
+  await ui.press({ key: 'confirm:T4' })
+  await ui.unmount()
+  await w.clock.settle()
+  expect(w.toasts).toContain('MOD-2 stream: profile claude-b failed its auth check')
+  expect(w.toasts.filter(text => text.startsWith('Dispatched again'))).toEqual([])
+})

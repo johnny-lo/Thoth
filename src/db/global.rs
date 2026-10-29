@@ -204,6 +204,47 @@ pub fn profile_models(conn: &Connection) -> Result<BTreeMap<String, StoredModels
     Ok(out)
 }
 
+/// PANEL-3: the login name (the part of the login email before `@`, already
+/// cleaned by `login_name::from_email`) a login check last reported for a
+/// profile, and when. A profile that does not exist is left alone.
+pub fn set_profile_login_name(conn: &Connection, id: &str, name: &str, seen_at: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE profiles SET login_name = ?2, login_name_seen_at = ?3 WHERE profile_id = ?1",
+        params![id, name, seen_at],
+    )?;
+    Ok(())
+}
+
+/// A stored login name and when it was seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLoginName {
+    pub name: String,
+    pub seen_at: Option<String>,
+}
+
+/// Every profile with a stored login name, keyed by profile id. A global.db
+/// still at schema 4 (opened read-only, so never migrated) has no
+/// `login_name` column and reads as no names at all.
+pub fn profile_login_names(conn: &Connection) -> Result<BTreeMap<String, StoredLoginName>> {
+    let mut out = BTreeMap::new();
+    if !crate::db::migrations::column_exists(conn, "profiles", "login_name")? {
+        return Ok(out);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT profile_id, login_name, login_name_seen_at FROM profiles WHERE login_name IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                StoredLoginName { name: r.get(1)?, seen_at: r.get(2)? },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    out.extend(rows);
+    Ok(out)
+}
+
 pub fn upsert_repo(conn: &Connection, repo_id: &str, root_path: &str, now: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO repos (repo_id, root_path, created_at) VALUES (?1, ?2, ?3)

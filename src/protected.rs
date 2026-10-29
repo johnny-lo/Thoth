@@ -4,15 +4,19 @@
 //! an existing test file, or a file an approved check reads, has changed what
 //! the check proves. Thoth does not judge whether the change weakened anything
 //! (that is the reviewer's job); it only works out *which* such files a diff
-//! touched, records them on the diff evidence, shows them to the reviewer, and
-//! requires the worker to declare each one (ingest rule 6).
+//! touched, records them on the diff evidence, and shows them to the reviewer
+//! and the commander, who approves them with `checks approve --run`. LEAN-1:
+//! the worker no longer declares each one; a `protected_change` claim is
+//! optional and kept as written.
 //!
-//! Everything here is a pure function of a path and the repo's catalogue. The
+//! The path rules are pure functions of a path and the repo's catalogue. The
 //! catalogue lives in `state.db` (the `checks` table and one `meta` row), where
 //! a worker cannot reach it.
 //!
-//! Limit: only paths are looked at. An inline `#[cfg(test)]` module inside a
-//! source file is not detected.
+//! LEAN-1: an existing `.rs` file the path rules do not classify is also read,
+//! at the task's base and at the candidate, and its inline test region (see
+//! `inline_region_start`) compared; a changed or deleted region is kind
+//! `inline_test`. Only Rust, and only that syntax.
 //!
 //! SMALL-4: "existing" means existing at the task's base commit, not at the
 //! run's (a rework starts from the previous candidate), and a file whose
@@ -29,7 +33,8 @@ use serde_json::{json, Value};
 /// unique and sorted.
 pub const META_KEY: &str = "protected_patterns";
 
-/// The claim kind a worker declares a protected change with.
+/// The claim kind a worker may declare a protected change with. Optional
+/// since LEAN-1: the list is the diff evidence's, not the claims'.
 pub const CLAIM_KIND: &str = "protected_change";
 
 /// Why a path is protected.
@@ -41,6 +46,9 @@ pub enum Kind {
     CheckInput,
     /// A file named like a word of a check's command (AC9).
     CheckWord,
+    /// LEAN-1: an existing Rust source file whose inline test region was
+    /// changed or deleted (or could not be compared).
+    InlineTest,
 }
 
 impl Kind {
@@ -49,9 +57,13 @@ impl Kind {
             Kind::Test => "test",
             Kind::CheckInput => "check_input",
             Kind::CheckWord => "check_word",
+            Kind::InlineTest => "inline_test",
         }
     }
 }
+
+/// Every kind this module writes.
+const KINDS: [Kind; 4] = [Kind::Test, Kind::CheckInput, Kind::CheckWord, Kind::InlineTest];
 
 /// Backslashes folded to `/`, everything lower-cased. Every comparison in this
 /// module is made on this form.
@@ -286,6 +298,177 @@ pub fn changes(catalogue: &Catalogue, name_status: &[(char, String)]) -> Vec<Cha
     out
 }
 
+/// LEAN-1: one `.rs` file whose inline test region could not be compared,
+/// as `detail.inline_test_errors` lists it. The path is listed as an
+/// `inline_test` change anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineError {
+    pub path: String,
+    pub error: String,
+}
+
+impl InlineError {
+    pub fn to_json(&self) -> Value {
+        json!({"path": self.path, "error": self.error})
+    }
+}
+
+/// LEAN-1: whether a diff entry is read for an inline test region: an
+/// existing (`M`, `D`, `T`) `.rs` path the path rules do not classify.
+pub fn may_hold_inline_tests(catalogue: &Catalogue, letter: char, path: &str) -> bool {
+    matches!(letter, 'M' | 'D' | 'T')
+        && normalize(path).ends_with(".rs")
+        && catalogue.classify(path).is_none()
+}
+
+/// LEAN-1: the `inline_test` changes among a diff's entries, and the files
+/// that could not be compared. `read(path, at_candidate)` returns the file's
+/// bytes at the task's base (`false`) or at the candidate (`true`); a deleted
+/// file is not read at the candidate. Any read failure lists the path.
+pub fn inline_changes(
+    catalogue: &Catalogue,
+    name_status: &[(char, String)],
+    read: impl Fn(&str, bool) -> std::result::Result<Vec<u8>, String>,
+) -> (Vec<Change>, Vec<InlineError>) {
+    let mut changes: Vec<Change> = Vec::new();
+    let mut errors: Vec<InlineError> = Vec::new();
+    for (letter, path) in name_status {
+        if !may_hold_inline_tests(catalogue, *letter, path) {
+            continue;
+        }
+        let base = read(path, false);
+        let candidate = if *letter == 'D' { None } else { Some(read(path, true)) };
+        let changed = match (base, candidate) {
+            (Err(e), _) => Err(format!("reading it at the task's base failed: {e}")),
+            (_, Some(Err(e))) => Err(format!("reading it at the candidate failed: {e}")),
+            (Ok(b), c) => Ok(inline_tests_changed(
+                &String::from_utf8_lossy(&b),
+                c.map(|c| String::from_utf8_lossy(&c.unwrap_or_default()).into_owned()).as_deref(),
+            )),
+        };
+        let listed = match changed {
+            Ok(changed) => changed,
+            Err(error) => {
+                errors.push(InlineError { path: path.clone(), error });
+                true
+            }
+        };
+        if listed {
+            let status = match letter {
+                'M' => "modified",
+                'D' => "deleted",
+                _ => "type_changed",
+            };
+            changes.push(Change {
+                path: path.clone(),
+                status: status.to_string(),
+                kind: Kind::InlineTest.as_str().to_string(),
+            });
+        }
+    }
+    (changes, errors)
+}
+
+/// LEAN-1: whether the inline test region of `base` (a file's text at the
+/// task's base) did not survive into `candidate` (`None`: the file was
+/// deleted). The region's lines must appear, whole and in order, among the
+/// candidate's lines; lines inserted anywhere do not matter. A base without
+/// a region has nothing to change. CRLF and LF are the same line end.
+pub fn inline_tests_changed(base: &str, candidate: Option<&str>) -> bool {
+    let base_lines: Vec<&str> = base.lines().collect();
+    let Some(start) = inline_region_start(&base_lines) else {
+        return false;
+    };
+    let Some(candidate) = candidate else {
+        return true;
+    };
+    let mut wanted = base_lines[start..].iter().peekable();
+    for line in candidate.lines() {
+        if wanted.peek().is_some_and(|w| **w == line) {
+            wanted.next();
+        }
+    }
+    wanted.peek().is_some()
+}
+
+/// LEAN-1: the line the inline test region starts at; it runs to the end of
+/// the file. The first line that, trimmed, starts with `#[` and whose
+/// attribute (the text up to its first `]`) either is named `test` or ends in
+/// `::test` (`#[test]`, `#[tokio::test]`), or is a `cfg` attribute with the
+/// whole word `test` (`#[cfg(test)]`, `#[cfg(all(test, windows))]`) that
+/// applies to a module: the next text that is not blank, an attribute or a
+/// comment declares a `mod`.
+pub fn inline_region_start(lines: &[&str]) -> Option<usize> {
+    for (i, line) in lines.iter().enumerate() {
+        let Some(inner) = line.trim().strip_prefix("#[") else {
+            continue;
+        };
+        let Some(end) = inner.find(']') else {
+            continue;
+        };
+        let attr = inner[..end].trim();
+        let name = attr
+            .split(|c: char| c == '(' || c == '=' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if name == "test" || name.ends_with("::test") {
+            return Some(i);
+        }
+        if name == "cfg" && has_word(attr, "test") {
+            let item = std::iter::once(&inner[end + 1..])
+                .chain(lines[i + 1..].iter().copied())
+                .map(strip_attributes)
+                .find(|t| !t.is_empty() && !t.starts_with("//") && !t.starts_with("/*") && !t.starts_with('*'));
+            if item.is_some_and(declares_module) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// `text` trimmed, without the attributes it starts with.
+fn strip_attributes(text: &str) -> &str {
+    let mut t = text.trim();
+    while let Some(inner) = t.strip_prefix("#[") {
+        match inner.find(']') {
+            Some(end) => t = inner[end + 1..].trim(),
+            None => return "#[",
+        }
+    }
+    t
+}
+
+/// Whether `word` appears in `text` with no identifier character on either
+/// side (`test` in `all(test, windows)`, not in `latest` or `attest`).
+fn has_word(text: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(word).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(ident)
+            && !text[at + word.len()..].chars().next().is_some_and(ident)
+    })
+}
+
+/// Whether a line declares a module: `mod NAME`, after an optional `pub` or
+/// `pub(...)`.
+fn declares_module(text: &str) -> bool {
+    let mut t = text.trim_start();
+    if let Some(rest) = t.strip_prefix("pub") {
+        let after = rest.trim_start();
+        if let Some(scoped) = after.strip_prefix('(') {
+            match scoped.find(')') {
+                Some(close) => t = scoped[close + 1..].trim_start(),
+                None => return false,
+            }
+        } else if rest.starts_with(char::is_whitespace) {
+            t = after;
+        } else {
+            return false;
+        }
+    }
+    t.strip_prefix("mod").is_some_and(|r| r.starts_with(char::is_whitespace))
+}
+
 /// SMALL-4: the entries of `own` (a diff against the task's base) that are
 /// this task's own. `differs_from_tip` is the paths whose content at the
 /// candidate differs from the integration tip; `None` keeps everything. Paths
@@ -319,17 +502,19 @@ pub fn changes_in_detail(detail: &Value) -> Vec<Change> {
 /// `protected_changes` read strictly: `None` ("not known") unless the key is
 /// an array whose every entry has string `path`, `status` and `kind`, the kind
 /// being one this module writes. A diff evidence recorded before the key
-/// existed, or a damaged one, is `None`, never an empty list.
+/// existed, or a damaged one, is `None`, never an empty list. GATE-1: so is
+/// one without an `inline_test_errors` array: a thoth before LEAN-1 wrote it
+/// and never looked for `inline_test` changes.
 pub fn strict_changes(detail: &Value) -> Option<Vec<Change>> {
+    if !detail["inline_test_errors"].is_array() {
+        return None;
+    }
     detail["protected_changes"]
         .as_array()?
         .iter()
         .map(|c| {
             let kind = c["kind"].as_str()?;
-            if ![Kind::Test, Kind::CheckInput, Kind::CheckWord]
-                .iter()
-                .any(|k| k.as_str() == kind)
-            {
+            if !KINDS.iter().any(|k| k.as_str() == kind) {
                 return None;
             }
             Some(Change {
@@ -345,14 +530,14 @@ pub fn strict_changes(detail: &Value) -> Option<Vec<Change>> {
 /// `diff` whose code has the largest number.
 pub struct LatestDiff {
     pub code: String,
-    /// `Null` when the stored detail is not valid JSON.
-    pub detail: Value,
-    /// `strict_changes` of `detail`.
+    /// `strict_changes` of the row's `detail` (`None` too when the stored
+    /// detail is not valid JSON).
     pub changes: Option<Vec<Change>>,
 }
 
-/// The one way the newest diff evidence of a run is picked (ingest rule 6,
-/// `checks approve --run`, and the gate in `review start` / `review record`).
+/// The one way the newest diff evidence of a run is picked (`checks approve
+/// --run`, and the gate in `review start` / `review record` / `review
+/// confirm`; an edit review run's diff evidence is its fix's).
 /// `None` when the run has no diff evidence.
 pub fn latest_diff(conn: &Connection, run: &crate::db::state::Run) -> Result<Option<LatestDiff>> {
     let code_number = |code: &str| -> u64 {
@@ -366,8 +551,7 @@ pub fn latest_diff(conn: &Connection, run: &crate::db::state::Run) -> Result<Opt
         .max_by_key(|e| code_number(&e.code));
     Ok(newest.map(|e| {
         let detail: Value = serde_json::from_str(&e.detail).unwrap_or(Value::Null);
-        let changes = strict_changes(&detail);
-        LatestDiff { code: e.code, detail, changes }
+        LatestDiff { code: e.code, changes: strict_changes(&detail) }
     }))
 }
 
@@ -394,28 +578,18 @@ pub fn approved_pairs(conn: &Connection, run_id: &str) -> Result<Vec<(String, St
     Ok(out)
 }
 
-/// The `test` and `check_word` changes no approval covers yet, in input
-/// order. `check_input` changes are never listed: verify's fingerprint check
-/// already refuses a changed check input (and lets a version-only change
-/// through), so approving them here as well would add nothing.
+/// The `test`, `check_word` and `inline_test` changes no approval covers yet,
+/// in input order. `check_input` changes are never listed: verify's
+/// fingerprint check already refuses a changed check input (and lets a
+/// version-only change through), so approving them here as well would add
+/// nothing.
 pub fn uncovered(changes: &[Change], approved: &[(String, String)]) -> Vec<Change> {
     changes
         .iter()
-        .filter(|c| c.kind == Kind::Test.as_str() || c.kind == Kind::CheckWord.as_str())
+        .filter(|c| c.kind != Kind::CheckInput.as_str())
         .filter(|c| !approved.iter().any(|(p, s)| *p == c.path && *s == c.status))
         .cloned()
         .collect()
-}
-
-/// Rule 6: whether a `protected_change` claim's text declares `path`. The
-/// text, trimmed and with `\` folded to `/`, must start with the path, and the
-/// path must be followed by `:`, whitespace, or nothing.
-pub fn claim_declares(text: &str, path: &str) -> bool {
-    let t = text.trim().replace('\\', "/");
-    match t.strip_prefix(path) {
-        Some(rest) => rest.chars().next().is_none_or(|c| c == ':' || c.is_whitespace()),
-        None => false,
-    }
 }
 
 #[cfg(test)]
@@ -653,18 +827,6 @@ mod tests {
         );
     }
 
-    /// AC4: what counts as declaring a path.
-    #[test]
-    fn a_claim_declares_a_path_only_when_its_text_starts_with_exactly_that_path() {
-        assert!(claim_declares("tests/x.rs: the old assertion contradicted AC2", "tests/x.rs"));
-        assert!(claim_declares("  tests/x.rs because of AC2", "tests/x.rs"));
-        assert!(claim_declares("tests/x.rs", "tests/x.rs"));
-        assert!(claim_declares(r"tests\x.rs: windows separators", "tests/x.rs"));
-        assert!(!claim_declares("tests/x.rs2: another file", "tests/x.rs"));
-        assert!(!claim_declares("x.rs: not the whole path", "tests/x.rs"));
-        assert!(!claim_declares("changed tests/x.rs: path not first", "tests/x.rs"));
-    }
-
     #[test]
     fn patterns_round_trip_through_meta_unique_and_sorted() {
         let conn = Connection::open_in_memory().unwrap();
@@ -718,7 +880,7 @@ mod tests {
         let good = json!({"protected_changes": [
             {"path": "tests/a.rs", "status": "modified", "kind": "test"},
             {"path": "Cargo.toml", "status": "modified", "kind": "check_input"},
-        ]});
+        ], "inline_test_errors": []});
         assert_eq!(
             strict_changes(&good),
             Some(vec![
@@ -726,23 +888,54 @@ mod tests {
                 change("Cargo.toml", "modified", "check_input"),
             ])
         );
-        assert_eq!(strict_changes(&json!({"protected_changes": []})), Some(vec![]));
-        assert_eq!(strict_changes(&json!({"files_changed": []})), None);
-        assert_eq!(strict_changes(&json!({"protected_changes": "tests/a.rs"})), None);
+        assert_eq!(
+            strict_changes(&json!({"protected_changes": [], "inline_test_errors": []})),
+            Some(vec![])
+        );
+        assert_eq!(strict_changes(&json!({"files_changed": [], "inline_test_errors": []})), None);
+        assert_eq!(
+            strict_changes(&json!({"protected_changes": "tests/a.rs", "inline_test_errors": []})),
+            None
+        );
         assert_eq!(
             strict_changes(&json!({"protected_changes": [
                 {"path": "tests/a.rs", "status": "modified", "kind": "test"},
                 {"path": "tests/b.rs", "kind": "test"},
-            ]})),
+            ], "inline_test_errors": []})),
             None
         );
         assert_eq!(
             strict_changes(&json!({"protected_changes": [
                 {"path": "tests/a.rs", "status": "modified", "kind": "golden"},
-            ]})),
+            ], "inline_test_errors": []})),
             None
         );
         assert_eq!(strict_changes(&Value::Null), None);
+    }
+
+    /// GATE-1 AC2: a row without an `inline_test_errors` array was written
+    /// before LEAN-1 and is not known, whatever its `protected_changes` says.
+    #[test]
+    fn strict_changes_needs_the_inline_test_errors_array_written_since_lean_1() {
+        let listed = json!([{"path": "tests/a.rs", "status": "modified", "kind": "test"}]);
+        for marker in [None, Some(Value::Null), Some(json!("none")), Some(json!({})), Some(json!(0))] {
+            for changes in [json!([]), listed.clone()] {
+                let mut d = json!({"protected_changes": changes});
+                if let Some(m) = &marker {
+                    d["inline_test_errors"] = m.clone();
+                }
+                assert_eq!(strict_changes(&d), None, "{d}");
+            }
+        }
+        let errors = json!([{"path": "src/x.rs", "error": "e"}]);
+        assert_eq!(
+            strict_changes(&json!({"protected_changes": listed, "inline_test_errors": errors})),
+            Some(vec![change("tests/a.rs", "modified", "test")])
+        );
+        // the marker alone does not make a missing or malformed list readable
+        assert_eq!(strict_changes(&json!({"inline_test_errors": []})), None);
+        assert_eq!(strict_changes(&json!({"protected_changes": null, "inline_test_errors": []})), None);
+        assert_eq!(strict_changes(&json!({"protected_changes": {}, "inline_test_errors": []})), None);
     }
 
     /// SMALL-4 AC1 (u1).

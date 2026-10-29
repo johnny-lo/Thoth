@@ -47,7 +47,8 @@ pub struct VerificationRequest {
 }
 
 /// v6 section 10.5 comments the claims.kind vocabulary. `protected_change`
-/// (P7-2) declares one modified or deleted protected file; see ingest rule 6.
+/// (P7-2) declares one modified or deleted protected file; optional since
+/// LEAN-1 (the diff evidence lists them; ingest rule 6 is retired).
 /// `research` (RES-1a) is a sourced factual claim; see `RESEARCH_CLAIM_KIND`.
 pub const CLAIM_KINDS: [&str; 6] = [
     "test_result",

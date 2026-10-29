@@ -207,7 +207,7 @@ pub fn remove_worktree_force(repo_root: &Path, path: &Path) -> Result<()> {
 /// Whether `git config` resolves both `user.name` and `user.email` for `dir`
 /// (repo-local, or the user's own global/system config) - if either is
 /// missing, `git commit` would refuse rather than guess.
-fn has_configured_identity(dir: &Path) -> bool {
+pub fn has_configured_identity(dir: &Path) -> bool {
     let configured = |key: &str| {
         crate::process::quiet(Command::new("git").args(["config", key]).current_dir(dir))
             .output()
@@ -558,6 +558,13 @@ pub fn diff_name_status(dir: &Path, from: &str, to: &str) -> Result<Vec<(char, S
         dir,
         &["diff", "--name-status", "--no-renames", "-z", &range],
     )?))
+}
+
+/// LEAN-1: the bytes of `path` at `commit` (`git cat-file blob`), as git
+/// stores them. An error when the path is not a blob there (missing, a
+/// gitlink, an object that cannot be read).
+pub fn blob_at(dir: &Path, commit: &str, path: &str) -> Result<Vec<u8>> {
+    git_capture_bytes(dir, &["cat-file", "blob", &format!("{commit}:{path}")])
 }
 
 /// Parses `git diff --name-status --no-renames -z`: status, NUL, path, NUL,

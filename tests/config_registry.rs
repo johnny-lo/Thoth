@@ -481,7 +481,7 @@ fn mcp_lists_settings_read_only_without_secret_values_and_has_no_set_tool() {
     s.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}));
     let list = s.send(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 35);
+    assert_eq!(tools.len(), 36);
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     let at = names.iter().position(|n| *n == "thoth_config_list").unwrap();
     assert_eq!(names[at + 1], "thoth_doctor");

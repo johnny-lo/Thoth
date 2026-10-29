@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const REPO_PLUGIN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugins/thoth");
 const SPEC: &str = r#"{"goal":"say hello","acceptance_criteria":["AC1: prints hello"],"constraints":[],"non_goals":[],"excluded_alternatives":[],"risk":"low"}"#;
-const STATE_CHANGING: [&str; 17] = [
+const STATE_CHANGING: [&str; 18] = [
     "thoth_init",
     "thoth_task_create",
     "thoth_task_update_spec",
@@ -15,6 +15,7 @@ const STATE_CHANGING: [&str; 17] = [
     "thoth_task_accept",
     "thoth_dispatch",
     "thoth_review_start",
+    "thoth_review_confirm",
     "thoth_review_record",
     "thoth_spec_review_record",
     "thoth_spec_review_start",

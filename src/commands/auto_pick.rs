@@ -65,6 +65,9 @@ pub(crate) enum Retry {
     /// `spec review start`: there is no attempt to continue, so every launch
     /// gives its own.
     EveryTime,
+    /// `review confirm` (RFIX-1): the commander names the confirmer every
+    /// time; nothing is kept from the edit review.
+    Confirm,
 }
 
 /// What the commander gave, and the run a left-out value is kept from.
@@ -186,6 +189,7 @@ pub(crate) fn choose(
                  run's"
             }
             Retry::EveryTime => "spec review start needs them every time",
+            Retry::Confirm => "review confirm needs them every time",
         };
         bail!(
             "task {}: {} {} missing: Thoth no longer picks the model or effort for you. {when}; \
@@ -243,6 +247,8 @@ pub(crate) const SOURCE_REVIEW_START: &str = "review_start";
 pub(crate) const SOURCE_SPEC_REVIEW_START: &str = "spec_review_start";
 /// SR-3: the author's check of a reviewer's edits.
 pub(crate) const SOURCE_SPEC_REVIEW_CONFIRM: &str = "spec_review_confirm";
+/// RFIX-1: the confirmer of a code reviewer's fix.
+pub(crate) const SOURCE_REVIEW_CONFIRM: &str = "review_confirm";
 
 /// RJ-1 (AC3): one launch as it was chosen, for the `launch_choice` event.
 pub(crate) struct LaunchChoice<'a> {

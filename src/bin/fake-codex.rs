@@ -120,6 +120,11 @@
 // FAKE_REVIEW_GATE holds output until its file exists.
 #[path = "support/source_check.rs"]
 mod source_check;
+// RFIX-1: the same scenarios as fake-claude's (`review_fix`,
+// `fix_confirm_approve`, `fix_confirm_revise`, `fix_confirm_bad`), answered
+// as the final message to `-o` under a strict `--output-schema`.
+#[path = "support/review_fix.rs"]
+mod review_fix;
 
 use std::io::Write;
 
@@ -550,6 +555,54 @@ fn criterion_ids(packet: &str) -> Vec<String> {
         .filter_map(|l| l[2..].split(':').next().map(|s| s.trim().to_string()))
         .filter(|s| !s.is_empty() && s != "(none)")
         .collect()
+}
+
+/// RFIX-1: the edit reviewer and the confirmer, under a strict schema.
+fn fix_review(scenario: &str, args: &[String], thread_id: &str) -> ! {
+    let (Some(schema_path), Some(out_path)) = (arg_value(args, "--output-schema"), arg_value(args, "-o")) else {
+        emit(&turn_started());
+        fail_turn(&serde_json::json!({"type": "error", "status": 400, "error": {
+            "type": "invalid_request_error",
+            "message": "fake-codex: a reviewer run needs --output-schema and -o"}}));
+    };
+    let schema = std::fs::read_to_string(&schema_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let Some(schema) = schema else {
+        eprintln!("Error: failed to read output schema file {schema_path}");
+        std::process::exit(1);
+    };
+    emit(&turn_started());
+    if let Some(bad) = review_fix::strict_violation(&schema, "schema") {
+        fail_turn(&serde_json::json!({"type": "error", "status": 400, "error": {
+            "type": "invalid_request_error",
+            "message": format!("Invalid schema for response_format 'codex_output_schema': {bad}")}}));
+    }
+    let plan = review_fix::plan();
+    let last = if scenario == "review_fix" {
+        review_fix::side_effects(&plan);
+        review_fix::document(&plan).to_string()
+    } else {
+        let Some(edits) = review_fix::read_edits() else {
+            fail_turn(&serde_json::json!({"type": "error", "status": 500, "error": {
+                "type": "fake_codex", "message": "fake-codex: .agent/review-fix-input is missing or malformed"}}));
+        };
+        review_fix::side_effects(&plan);
+        if scenario == "fix_confirm_bad" {
+            "{not json".to_string()
+        } else {
+            review_fix::confirm_override()
+                .unwrap_or_else(|| review_fix::confirm_document(&edits, scenario == "fix_confirm_revise"))
+                .to_string()
+        }
+    };
+    source_check::wait_gate();
+    emit(&agent_message(8, &last));
+    if let Err(e) = std::fs::write(&out_path, &last) {
+        eprintln!("fake-codex: writing {out_path} failed: {e}");
+        std::process::exit(1);
+    }
+    write_rollout(thread_id);
+    emit(&turn_completed(120));
+    std::process::exit(0);
 }
 
 /// The reviewer half: `--output-schema` + `-o`, read the input files, answer
@@ -1202,6 +1255,9 @@ fn main() {
         }
         "review_pass" | "review_reject" | "review_bad" | "review_uncited" | "source_check" | "source_check_bad" => {
             review(&scenario, &args, &prompt, &thread_id)
+        }
+        "review_fix" | "fix_confirm_approve" | "fix_confirm_revise" | "fix_confirm_bad" => {
+            fix_review(&scenario, &args, &thread_id)
         }
         "spec_review_approve" | "spec_review_revise" | "spec_review_bad" | "spec_review_edit"
         | "spec_confirm_approve" => spec_review(&scenario, &args, &prompt, &thread_id),

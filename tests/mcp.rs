@@ -118,7 +118,7 @@ fn old_and_new_protocols_and_bad_input() {
     assert_eq!(discover["result"]["resultType"], "complete");
     let list = s.send(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 35);
+    assert_eq!(tools.len(), 36);
     // Only the tool names are checked: thoth_checks_approve is the one that
     // approves, and none offers protect or unprotect.
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -132,10 +132,11 @@ fn old_and_new_protocols_and_bad_input() {
             assert!(!key.contains("protect"), "{key}");
         }
     }
-    // SR-3 added thoth_spec_review_confirm after thoth_spec_review_start, so
-    // everything from thoth_resume on sits one place later.
+    // Each confirm tool sits right after its start tool:
+    // thoth_review_confirm after thoth_review_start, thoth_spec_review_confirm
+    // after thoth_spec_review_start.
     assert_eq!(
-        names[23..],
+        names[24..],
         [
             "thoth_verify_start",
             "thoth_job_status",
@@ -151,11 +152,13 @@ fn old_and_new_protocols_and_bad_input() {
             "thoth_guide"
         ]
     );
-    assert_eq!(names[22], "thoth_cancel");
-    assert_eq!(names[17], "thoth_spec_review_record");
-    assert_eq!(names[18], "thoth_spec_review_show");
-    assert_eq!(names[19], "thoth_spec_review_start");
-    assert_eq!(names[20], "thoth_spec_review_confirm");
+    assert_eq!(names[23], "thoth_cancel");
+    assert_eq!(names[15], "thoth_review_start");
+    assert_eq!(names[16], "thoth_review_confirm");
+    assert_eq!(names[18], "thoth_spec_review_record");
+    assert_eq!(names[19], "thoth_spec_review_show");
+    assert_eq!(names[20], "thoth_spec_review_start");
+    assert_eq!(names[21], "thoth_spec_review_confirm");
     let read_only = |name: &str| {
         tools.iter().find(|t| t["name"] == name).unwrap()["annotations"]["readOnlyHint"].clone()
     };

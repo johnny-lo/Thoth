@@ -880,20 +880,14 @@ pub(crate) fn ranked_candidates(
     Ok(candidates)
 }
 
-/// The models a profile can run, for the commander to look up in the tables
-/// (RJ-2): what `thoth models` lists (`models::discover`): the fixed aliases
-/// for claude-code, the `models_cache.json` slugs for codex and, for
-/// antigravity, the list its last login check read (MODELS-1; none stored
-/// is `[]`).
-fn available_models(profile: &Profile, stored: Option<&crate::db::global::StoredModels>) -> Vec<Value> {
-    super::models::discover(profile, stored)
-        .models
-        .into_iter()
-        .map(|(model, display_name)| json!({"model": model, "display_name": display_name}))
-        .collect()
-}
-
-pub fn recommend(paths: &Paths, role: &str, task: Option<&str>, model: Option<&str>, json_output: bool) -> Result<i32> {
+pub fn recommend(
+    paths: &Paths,
+    role: &str,
+    task: Option<&str>,
+    model: Option<&str>,
+    with_tables: bool,
+    json_output: bool,
+) -> Result<i32> {
     if role != "implementer" && role != "reviewer" {
         bail!("--role must be implementer or reviewer");
     }
@@ -917,61 +911,78 @@ pub fn recommend(paths: &Paths, role: &str, task: Option<&str>, model: Option<&s
     // TIER-1: the stored tiers, read-only; no tier when they cannot be read.
     // MODELS-1: the stored agy model lists, from the same read-only open (a
     // global.db older than the column reads as none).
-    let (plans, stored_lists) = match global_read_only(paths) {
-        Ok(g) => (
-            crate::db::global::profile_plans(&g).unwrap_or_default(),
-            crate::db::global::profile_models(&g).unwrap_or_default(),
-        ),
-        Err(_) => (BTreeMap::new(), BTreeMap::new()),
-    };
-    let fields: BTreeMap<&str, (Option<String>, Option<String>)> = candidates
-        .iter()
-        .map(|c| (c.profile.profile_id.as_str(), plan_fields(&plans, &c.profile)))
-        .collect();
-    let field = |id: &str| fields.get(id).cloned().unwrap_or_default();
+    let global = global_read_only(paths)?;
+    let plans = crate::db::global::profile_plans(&global).unwrap_or_default();
+    let stored_lists = crate::db::global::profile_models(&global).unwrap_or_default();
     let profiles: Vec<Profile> = candidates.iter().map(|c| c.profile.clone()).collect();
+    // CROSS-1: always built, since the cells are taken from its rows; sent
+    // whole only with --tables.
     let tables = super::tables::build(paths, &profiles, &stored_lists);
     let usage = super::own_usage::build(paths, role, &candidates, &plans)?;
     let task_history = match task_id.as_deref() {
         Some(id) => super::task_history::build(paths, &repos, id)?,
         None => None,
     };
+    let mut unmatched = Vec::new();
+    let mut candidate_values = Vec::new();
+    for c in &candidates {
+        let p = &c.profile;
+        let (plan, plan_label) = plan_fields(&plans, p);
+        let mut value = json!({
+            "profile_id": p.profile_id, "provider": p.provider, "harness": p.harness,
+            "eligible": c.eligible, "reasons": c.reasons, "quota_state": c.quota_state, "peak_percent": c.peak_percent,
+            "quota_group": c.quota_group, "parked_group": c.parked_group, "newest_observed_at": c.newest_observed_at,
+            "recovered": c.recovered, "plan": plan, "plan_label": plan_label,
+        });
+        // CROSS-1: the account's models as `thoth models` lists them.
+        let discovered = super::models::discover(p, stored_lists.get(&p.profile_id));
+        let plan = plans.get(&p.profile_id).map(|s| s.plan.as_str());
+        let listed = super::models::listed(paths, &repos, &global, p, discovered.models, plan)?;
+        let account = super::cross::Account {
+            profile_id: &p.profile_id,
+            harness: &p.harness,
+            // A global.db older than the mark has no column: not shared.
+            shared: crate::db::global::profile_shared(&global, &p.profile_id).unwrap_or(false),
+            windows: c.windows.iter().map(Window::json).collect(),
+            models_source: discovered.source,
+            models_seen_at: discovered.seen_at,
+            models_note: discovered.note,
+            listed,
+        };
+        let (extra, missing) = super::cross::account(account, &tables, &usage);
+        if let Some(object) = value.as_object_mut() {
+            object.extend(extra);
+        }
+        unmatched.extend(missing);
+        candidate_values.push(value);
+    }
     let out = json!({
         "role": role,
         "task_id": task_id,
         "model": model,
-        "candidates": candidates.iter().map(|c| json!({
-            "profile_id": c.profile.profile_id, "provider": c.profile.provider, "harness": c.profile.harness,
-            "eligible": c.eligible, "reasons": c.reasons, "quota_state": c.quota_state, "peak_percent": c.peak_percent,
-            "quota_group": c.quota_group, "parked_group": c.parked_group, "newest_observed_at": c.newest_observed_at,
-            "recovered": c.recovered, "plan": field(&c.profile.profile_id).0, "plan_label": field(&c.profile.profile_id).1,
-            "available_models": available_models(&c.profile, stored_lists.get(&c.profile.profile_id)),
-        })).collect::<Vec<_>>(),
+        "candidates": candidate_values,
         "live_quota_refresh": refresh.json(),
         "score_refresh": score_refresh.json(),
-        "tables": tables,
-        "usage": usage.iter().map(super::own_usage::Row::json).collect::<Vec<_>>(),
+        "tables": if with_tables { tables.clone() } else { Value::Null },
+        "unmatched": unmatched,
         "task_history": task_history.as_ref().map(super::task_history::TaskHistory::json),
     });
-    let named = |id: &str| plan_label::named(id, field(id).1.as_deref(), Lang::En);
+    // The same text with or without --tables.
+    let lang = Lang::from_env();
     let mut lines: Vec<String> = Vec::new();
     if let Some(history) = &task_history {
         lines.extend(history.human(role));
     }
-    for c in &candidates {
-        lines.push(format!(
-            "{}  {} / {}  {} {}\n  {}",
-            named(&c.profile.profile_id),
-            c.profile.provider,
-            c.profile.harness,
-            if c.eligible { "eligible" } else { "ineligible" },
-            c.quota_state,
-            c.reasons.join("; ")
-        ));
+    let blocks: Vec<String> = candidate_values
+        .iter()
+        .map(|c| super::cross::human_block(c, &unmatched, lang).join("\n"))
+        .collect();
+    if !blocks.is_empty() {
+        lines.push(blocks.join("\n\n"));
+        lines.push(String::new());
     }
     lines.extend(super::tables::human_lines(&tables));
-    lines.extend(usage.iter().map(super::own_usage::Row::human));
-    lines.push("the filtered table rows are in --json (tables); nothing above picks for you".to_string());
+    lines.push("full filtered tables: add --tables --json; nothing above picks for you".to_string());
     output::emit(json_output, &out, &lines.join("\n"));
     Ok(0)
 }

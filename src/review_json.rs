@@ -48,8 +48,9 @@ impl Verdict {
 /// The two per-criterion answers v6 §10.5's comment block spells out.
 pub const CRITERION_VERDICTS: [&str; 2] = ["met", "unmet"];
 
-/// How big the smallest fix for a finding is. Collected for statistics only:
-/// nothing decides on it yet.
+/// How big the smallest fix for a finding is. `thoth retro` counts it, and an
+/// edit review's fix may be bound only to an S or M finding
+/// (`review_fix_edits::check_size`).
 pub const FIX_SIZES: [&str; 3] = ["S", "M", "L"];
 
 /// What the codex / agy schema offers for "no `fix_size` or `category`";

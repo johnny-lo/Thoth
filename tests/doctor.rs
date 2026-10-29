@@ -759,7 +759,7 @@ fn mcp() {
     assert_eq!(init["result"]["serverInfo"]["name"], "thoth");
     let list = s.send(2, "tools/list", json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 35);
+    assert_eq!(tools.len(), 36);
     let doctor = tools.iter().find(|t| t["name"] == "thoth_doctor").unwrap();
     assert_eq!(doctor["annotations"]["readOnlyHint"], true);
 

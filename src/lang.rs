@@ -364,6 +364,8 @@ const MESSAGES: &[(&str, &str, &str)] = &[
     ("setup.checks.path_pin_refused", "{0} was not approved: {1}", "{0} 沒有核准：{1}"),
     ("setup.yn", "[Y/n]", "[Y/n]"),
     ("setup.ny", "[y/N]", "[y/N]"),
+    // recommend: a cross-table cell without a fact (CROSS-1)
+    ("recommend.no_data", "no data", "無資料"),
 ];
 
 /// The text of `key` in `lang`; the key itself when the table lacks it.

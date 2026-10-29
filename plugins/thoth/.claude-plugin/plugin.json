@@ -1,6 +1,6 @@
 {
   "name": "thoth",
-  "version": "0.1.8",
+  "version": "0.1.11",
   "description": "Dispatch and review implementation work through Thoth.",
   "author": { "name": "Thoth contributors" },
   "types": "./types/index.d.ts",

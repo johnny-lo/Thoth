@@ -143,6 +143,11 @@
 // FAKE_REVIEW_GATE holds output until its file exists.
 #[path = "support/source_check.rs"]
 mod source_check;
+// RFIX-1: the same scenarios as fake-claude's, answered as
+// `structured_output` under a strict `--json-schema`; `fix_confirm_bad`
+// answers an object without `edits`.
+#[path = "support/review_fix.rs"]
+mod review_fix;
 
 use std::io::Write;
 use std::path::Path;
@@ -552,6 +557,52 @@ fn read_file(agy: &Agy<'_>, index: i64, path: &Path) -> Option<String> {
     emit(serde_json::json!({"event":"step_update","step_update":{"conversation_id":agy.id,
         "step_index":index,"state":"DONE","step_type":"tool","tool_name":"read_file","tool_info":info}}));
     text
+}
+
+/// RFIX-1: the edit reviewer and the confirmer.
+fn fix_review(agy: &Agy<'_>, scenario: &str, args: &[String]) {
+    let id = agy.id.as_str();
+    let schema = value(args, "--json-schema")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let Some(schema) = schema else {
+        result(id, "ERROR", "fake-agy: a reviewer run needs --json-schema", 1);
+        std::process::exit(1);
+    };
+    if let Some(bad) = review_fix::strict_violation(&schema, "schema") {
+        result(id, "ERROR", &format!("fake-agy: invalid schema: {bad}"), 1);
+        std::process::exit(1);
+    }
+    step(id, 0, "user_input", None);
+    step(id, 1, "agent_response", Some(40));
+    let plan = review_fix::plan();
+    let doc = if scenario == "review_fix" {
+        review_fix::side_effects(&plan);
+        review_fix::document(&plan)
+    } else {
+        let input = Path::new(".agent").join("review-fix-input");
+        let edits: Option<Vec<serde_json::Value>> = read_file(agy, 2, &input.join("edits.json"))
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .filter(|_| review_fix::read_edits().is_some());
+        let Some(edits) = edits else {
+            result(id, "ERROR", "fake-agy: .agent/review-fix-input is missing or malformed", 1);
+            std::process::exit(1);
+        };
+        review_fix::side_effects(&plan);
+        if scenario == "fix_confirm_bad" {
+            serde_json::json!({"verdict": "APPROVE"})
+        } else {
+            review_fix::confirm_override()
+                .unwrap_or_else(|| review_fix::confirm_document(&edits, scenario == "fix_confirm_revise"))
+        }
+    };
+    source_check::wait_gate();
+    let text = format!("{doc}\n");
+    response_step(id, 6, 120, &text);
+    let body = serde_json::json!({"conversation_id":id,"status":"SUCCESS","response":text,
+        "structured_output":doc,"duration_seconds":1,"num_turns":1,"usage":{"input_tokens":100,
+        "output_tokens":160,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":260}});
+    emit(serde_json::json!({"event":"result","result":body}));
 }
 
 /// The reviewer scenarios (see the module doc).
@@ -980,6 +1031,10 @@ fn main() {
     }
     if scenario == "spec_confirm_revise" {
         spec_confirm(&agy);
+        return;
+    }
+    if scenario == "review_fix" || scenario.starts_with("fix_confirm_") {
+        fix_review(&agy, &scenario, &args);
         return;
     }
     if scenario.starts_with("spec_review_") {

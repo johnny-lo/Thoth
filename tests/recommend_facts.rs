@@ -1,9 +1,11 @@
 //! RJ-2: what `thoth recommend` sends besides the account facts: the three
-//! external tables filtered to the organizations with an account here (AC4),
-//! Thoth's own usage with runs left (AC5), the task's reject history (AC6),
-//! each account's models (AC7), the human output (AC10) and the MCP tool
-//! (AC11). Always the fakes and a temporary THOTH_HOME; the caches are
-//! written by the tests; nothing reaches a network or a real harness.
+//! external tables filtered to the organizations with an account here (AC4;
+//! CROSS-1: only with `--tables`), Thoth's own usage with runs left (AC5;
+//! CROSS-1: under each account's model in `candidates[].models[].usage`),
+//! the task's reject history (AC6), each account's models (AC7; CROSS-1: the
+//! cross table's `models`), the human output (AC10) and the MCP tool (AC11).
+//! Always the fakes and a temporary THOTH_HOME; the caches are written by the
+//! tests; nothing reaches a network or a real harness.
 
 mod common;
 
@@ -44,6 +46,17 @@ fn recommend(f: &Fixture, role: &str, task: Option<&str>) -> Value {
     json_out(&mut c)
 }
 
+/// CROSS-1: `recommend --tables --json`, which also sends the three full
+/// filtered tables.
+fn recommend_tables(f: &Fixture, role: &str, task: Option<&str>) -> Value {
+    let mut c = f.cmd();
+    c.args(["recommend", "--role", role, "--tables", "--json"]);
+    if let Some(t) = task {
+        c.args(["--task", t]);
+    }
+    json_out(&mut c)
+}
+
 fn recommend_plain(f: &Fixture, role: &str, task: Option<&str>) -> String {
     let mut c = f.cmd();
     c.args(["recommend", "--role", role]);
@@ -53,6 +66,64 @@ fn recommend_plain(f: &Fixture, role: &str, task: Option<&str>) -> String {
     let out = c.output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap()
+}
+
+/// CROSS-1: the human output's table line of `profile`'s `model`, split into
+/// its cells (columns are at least two spaces apart, cells have single
+/// spaces).
+fn table_cells(plain: &str, profile: &str, model: &str) -> Vec<String> {
+    let block = plain
+        .split("\n\n")
+        .find(|b| b.starts_with(&format!("{profile}  ")) || b.starts_with(&format!("{profile} (")))
+        .unwrap_or_else(|| panic!("no block for {profile}: {plain}"));
+    let line = block
+        .lines()
+        .find(|l| l.starts_with(&format!("  {model} ")))
+        .unwrap_or_else(|| panic!("no line for {model} in {block}"));
+    line.split("  ").map(str::trim).filter(|c| !c.is_empty()).map(str::to_string).collect()
+}
+
+fn candidate<'a>(v: &'a Value, profile: &str) -> &'a Value {
+    v["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["profile_id"] == profile)
+        .unwrap_or_else(|| panic!("no candidate {profile}: {v}"))
+}
+
+/// CROSS-1: the usage rows of `profile`'s `model` row in the cross table.
+fn model_usage(v: &Value, profile: &str, model: &str) -> Vec<Value> {
+    candidate(v, profile)["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["model"] == model)
+        .unwrap_or_else(|| panic!("no model {model} for {profile}: {v}"))["usage"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// Every usage row in the output: under the models and under
+/// `usage_other_models`.
+fn all_usage(v: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    for c in v["candidates"].as_array().unwrap() {
+        for m in c["models"].as_array().unwrap().iter().chain(c["usage_other_models"].as_array().unwrap()) {
+            out.extend(m["usage"].as_array().unwrap().iter().cloned());
+        }
+    }
+    out
+}
+
+/// Whether `key` is a key anywhere in `v`.
+fn has_key(v: &Value, key: &str) -> bool {
+    match v {
+        Value::Object(m) => m.contains_key(key) || m.values().any(|x| has_key(x, key)),
+        Value::Array(a) => a.iter().any(|x| has_key(x, key)),
+        _ => false,
+    }
 }
 
 fn sorted_keys(v: &Value) -> Vec<String> {
@@ -144,6 +215,46 @@ fn names(rows: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
+// --- CROSS-1 AC1 -------------------------------------------------------------------------
+
+/// The top level: `usage` is gone (its rows sit under the models), `unmatched`
+/// is new, and `tables` is null without --tables. The human output is the
+/// same text either way.
+#[test]
+fn the_top_level_keys_and_tables_only_with_the_flag() {
+    let f = init();
+    f.add_profile("claude-a");
+    add_codex(&f, "codex-a", true);
+    write_caches(&f);
+    let (task, _) = f.create_task(Fixture::SPEC);
+    let keys = [
+        "candidates", "live_quota_refresh", "model", "role", "score_refresh", "tables", "task_history", "task_id",
+        "unmatched",
+    ];
+    for task in [None, Some(task.as_str())] {
+        let without = recommend(&f, "implementer", task);
+        assert_eq!(sorted_keys(&without), keys, "{without}");
+        assert!(without["tables"].is_null(), "{without}");
+        assert!(without["unmatched"].is_array(), "{without}");
+        let with = recommend_tables(&f, "implementer", task);
+        assert_eq!(sorted_keys(&with), keys, "{with}");
+        assert_eq!(sorted_keys(&with["tables"]), ["agent_arena", "ai_stupid_level", "artificial_analysis"]);
+        for key in ["candidates", "unmatched", "task_history", "role", "task_id", "model"] {
+            assert_eq!(without[key], with[key], "{key}");
+        }
+        let plain = recommend_plain(&f, "implementer", task);
+        let mut c = f.cmd();
+        c.args(["recommend", "--role", "implementer", "--tables"]);
+        if let Some(t) = task {
+            c.args(["--task", t]);
+        }
+        let plain_tables = String::from_utf8(c.assert().success().get_output().stdout.clone()).unwrap();
+        assert_eq!(plain, plain_tables);
+        assert!(plain.lines().last().unwrap() == "full filtered tables: add --tables --json; nothing above picks for you", "{plain}");
+        assert!(!plain.contains("rows are in --json") && !plain.contains("usage: implementer"), "{plain}");
+    }
+}
+
 // --- AC4 ---------------------------------------------------------------------------------
 
 #[test]
@@ -152,7 +263,9 @@ fn tables_keep_only_the_organizations_with_an_account_and_the_listed_columns() {
     f.add_profile("claude-a");
     add_codex(&f, "codex-a", true);
     write_caches(&f);
-    let v = recommend(&f, "implementer", None);
+    // CROSS-1: the full tables only with --tables
+    assert!(recommend(&f, "implementer", None)["tables"].is_null());
+    let v = recommend_tables(&f, "implementer", None);
     let tables = &v["tables"];
     assert_eq!(sorted_keys(tables), ["agent_arena", "ai_stupid_level", "artificial_analysis"]);
     for key in ["agent_arena", "ai_stupid_level", "artificial_analysis"] {
@@ -211,7 +324,7 @@ fn tables_keep_only_the_organizations_with_an_account_and_the_listed_columns() {
 fn tables_without_caches_are_absent_and_empty() {
     let f = init();
     f.add_profile("claude-a");
-    let v = recommend(&f, "implementer", None);
+    let v = recommend_tables(&f, "implementer", None);
     for key in ["agent_arena", "ai_stupid_level", "artificial_analysis"] {
         let t = &v["tables"][key];
         assert_eq!(t["present"], false, "{t}");
@@ -238,12 +351,13 @@ fn an_agy_account_alone_brings_anthropic_and_openai_rows() {
     let f = init();
     add_agy(&f, "agy-a");
     write_caches(&f);
-    let v = recommend(&f, "implementer", None);
+    let v = recommend_tables(&f, "implementer", None);
     assert_eq!(names(&v["tables"]["agent_arena"]["rows"], "organization"), ["google"], "no list stored yet: {v}");
-    assert_eq!(v["candidates"][0]["available_models"], json!([]), "no list stored yet: {v}");
+    assert_eq!(v["candidates"][0]["models"], json!([]), "no list stored yet: {v}");
+    assert!(v["candidates"][0].get("available_models").is_none(), "{v}");
 
     f.cmd().args(["profile", "check", "agy-a", "--json"]).assert().success();
-    let v = recommend(&f, "implementer", None);
+    let v = recommend_tables(&f, "implementer", None);
     assert_eq!(
         names(&v["tables"]["agent_arena"]["rows"], "organization"),
         ["anthropic", "openai", "google"],
@@ -251,17 +365,84 @@ fn an_agy_account_alone_brings_anthropic_and_openai_rows() {
     );
     assert_eq!(names(&v["tables"]["artificial_analysis"]["rows"], "name"), ["Claude Fable 5.1 (max)", "GPT 6.1 Sol (xhigh)", "Gemini 3.8 Pro"]);
     assert_eq!(names(&v["tables"]["ai_stupid_level"]["rows"], "name"), ["claude-sonnet-5", "gpt-6", "gemini-3-8-pro"]);
-    // AC7: the stored agy list is its available models, display names as
-    // `agy models` printed them
+    // AC7: the stored agy list is its models; CROSS-1: each model's names are
+    // the slug and the display name `agy models` printed
     let agy = &v["candidates"][0];
     assert_eq!(agy["profile_id"], "agy-a");
-    let models = agy["available_models"].as_array().unwrap();
+    let models = agy["models"].as_array().unwrap();
     assert!(
         models.iter().any(|m| m["model"] == "gemini-3.8-flash-high"
-            && m["display_name"] == "Fake display name for gemini-3.8-flash-high"),
+            && m["names"] == json!(["gemini-3.8-flash-high", "Fake display name for gemini-3.8-flash-high"])),
         "{agy}"
     );
     assert!(models.iter().any(|m| m["model"] == "claude-sonnet-4-6"), "{agy}");
+    assert_eq!(agy["models_source"], "agy_models", "{agy}");
+}
+
+/// CROSS-1 AC2 (b): an agy account's `models` is the list its last login
+/// check stored, one row each; none stored is `[]` with the note saying so.
+#[test]
+fn an_agy_account_has_a_model_row_per_stored_model() {
+    let f = init();
+    add_agy(&f, "agy-a");
+    let v = recommend(&f, "implementer", None);
+    let agy = candidate(&v, "agy-a");
+    assert_eq!(agy["models"], json!([]), "{agy}");
+    assert!(agy["models_note"].as_str().unwrap().contains("no model list stored yet"), "{agy}");
+    assert!(agy["models_seen_at"].is_null(), "{agy}");
+
+    f.cmd().env("FAKE_AGY_MODELS", "a-model,b-model").args(["profile", "check", "agy-a", "--json"]).assert().success();
+    let v = recommend(&f, "implementer", None);
+    let agy = candidate(&v, "agy-a");
+    let models: Vec<&str> = agy["models"].as_array().unwrap().iter().map(|m| m["model"].as_str().unwrap()).collect();
+    assert_eq!(models, ["a-model", "b-model"], "{agy}");
+    assert_eq!(agy["models_source"], "agy_models", "{agy}");
+    assert!(agy["models_seen_at"].is_string(), "{agy}");
+    let listed = json_out(f.cmd().args(["models", "--json"]));
+    let profile = listed["profiles"].as_array().unwrap().iter().find(|p| p["profile_id"] == "agy-a").unwrap();
+    assert_eq!(agy["models_seen_at"], profile["models_seen_at"], "{agy}");
+    assert_eq!(agy["models_note"], profile["note"], "{agy}");
+}
+
+/// CROSS-1 AC2 (c): a claude-code model a run proved unavailable leaves
+/// `models` for `models_excluded`, with the run that proved it, until
+/// `profile forget-model`.
+#[test]
+fn a_model_a_run_proved_unavailable_is_excluded_until_forgotten() {
+    let f = init();
+    f.add_profile("claude-b");
+    let (task, _) = f.create_task(Fixture::SPEC);
+    let mut c = f.cmd();
+    c.env("FAKE_SCENARIO", "credits_required")
+        .env("FAKE_TASK_ID", &task)
+        .args(["dispatch", &task, "--profile", "claude-b", "--model", "fable", "--effort", "medium", "--json"]);
+    let d: Value = serde_json::from_slice(&f.run_ok(c, "dispatch")).unwrap();
+    let run = d["run_id"].as_str().unwrap().to_string();
+    assert_eq!(f.wait_for(&task, "120s").1, "failed", "{}", f.explain_run(&run));
+
+    let v = recommend(&f, "implementer", None);
+    let b = candidate(&v, "claude-b");
+    let models: Vec<&str> = b["models"].as_array().unwrap().iter().map(|m| m["model"].as_str().unwrap()).collect();
+    assert_eq!(models, ["haiku", "sonnet", "opus"], "{b}");
+    let excluded = b["models_excluded"].as_array().unwrap();
+    assert_eq!(excluded.len(), 1, "{b}");
+    assert_eq!(sorted_keys(&excluded[0]), ["model", "reason", "run_id", "seen_at"]);
+    assert_eq!(excluded[0]["model"], "fable", "{b}");
+    assert_eq!(excluded[0]["run_id"], run.as_str(), "{b}");
+    assert!(excluded[0]["seen_at"].is_string() && excluded[0]["reason"].is_string(), "{b}");
+    // the failed fable run's usage row is still sent, once, under the other models
+    let other = b["usage_other_models"].as_array().unwrap();
+    assert!(other.iter().all(|o| o["model"] == "fable"), "{b}");
+    let plain = recommend_plain(&f, "implementer", None);
+    assert!(plain.lines().any(|l| l.starts_with("  unavailable: fable since ")), "{plain}");
+
+    f.cmd().args(["profile", "forget-model", "claude-b", "fable", "--json"]).assert().success();
+    let v = recommend(&f, "implementer", None);
+    let b = candidate(&v, "claude-b");
+    let models: Vec<&str> = b["models"].as_array().unwrap().iter().map(|m| m["model"].as_str().unwrap()).collect();
+    assert_eq!(models, ["haiku", "sonnet", "opus", "fable"], "{b}");
+    assert_eq!(b["models_excluded"], json!([]), "{b}");
+    assert_eq!(b["usage_other_models"], json!([]), "{b}");
 }
 
 // --- AC7 ---------------------------------------------------------------------------------
@@ -273,26 +454,65 @@ fn candidates_list_the_models_they_can_run() {
     add_codex(&f, "codex-a", true);
     add_codex(&f, "codex-b", false);
     let v = recommend(&f, "implementer", None);
-    let by_id = |id: &str| -> Value {
-        v["candidates"].as_array().unwrap().iter().find(|c| c["profile_id"] == id).unwrap().clone()
+    let model_names = |id: &str| -> Vec<String> {
+        candidate(&v, id)["models"].as_array().unwrap().iter().map(|m| m["model"].as_str().unwrap().to_string()).collect()
     };
-    assert_eq!(
-        by_id("codex-a")["available_models"],
-        json!([{"model": CODEX_MODEL, "display_name": "Luna"}, {"model": "gpt-5.6-sol", "display_name": "Sol"}])
-    );
-    assert_eq!(by_id("codex-b")["available_models"], json!([]));
-    assert_eq!(
-        by_id("claude-a")["available_models"],
-        json!([{"model":"haiku","display_name":"haiku"},{"model":"sonnet","display_name":"sonnet"},{"model":"opus","display_name":"opus"},{"model":"fable","display_name":"fable"}])
-    );
+    // CROSS-1 AC2 (a): `thoth models`' slugs in its order; the hidden one left out
+    assert_eq!(model_names("codex-a"), [CODEX_MODEL, "gpt-5.6-sol"]);
+    let listed = json_out(f.cmd().args(["models", "--json"]));
+    let listed_slugs = |id: &str| -> Vec<String> {
+        let p = listed["profiles"].as_array().unwrap().iter().find(|p| p["profile_id"] == id).unwrap();
+        p["models"].as_array().unwrap().iter().map(|m| m["model"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(model_names("codex-a"), listed_slugs("codex-a"));
+    let codex = candidate(&v, "codex-a");
+    assert_eq!(codex["models_source"], "codex_models_cache", "{codex}");
+    assert!(codex["models_seen_at"].is_string(), "{codex}");
+    assert!(codex["models_note"].is_null(), "{codex}");
+    assert_eq!(codex["models"][0]["names"], json!([CODEX_MODEL, "Luna"]), "{codex}");
+    assert_eq!(model_names("codex-b"), Vec::<String>::new());
+    let codex_b = candidate(&v, "codex-b");
+    assert!(codex_b["models_note"].as_str().unwrap().contains("missing or unreadable"), "{codex_b}");
+    assert!(codex_b["models_seen_at"].is_null(), "{codex_b}");
+    assert_eq!(model_names("claude-a"), ["haiku", "sonnet", "opus", "fable"]);
+    assert_eq!(model_names("claude-a"), listed_slugs("claude-a"));
+    for c in v["candidates"].as_array().unwrap() {
+        // AC2 (d), and RJ-1's no-`held` still holds
+        assert!(c.get("available_models").is_none(), "{c}");
+        assert!(c.get("held").is_none(), "{c}");
+        assert_eq!(c["shared"], false, "{c}");
+        assert_eq!(c["windows"], json!([]), "no reading: {c}");
+        assert_eq!(c["models_excluded"], json!([]), "{c}");
+        assert_eq!(c["usage_other_models"], json!([]), "{c}");
+        for m in c["models"].as_array().unwrap() {
+            assert_eq!(sorted_keys(m), MODEL_KEYS, "{m}");
+            assert_eq!(m["usage"], json!([]), "no runs: {m}");
+        }
+        // claude aliases that never ran have no name yet: three null cells
+        if c["harness"] == "claude-code" {
+            for m in c["models"].as_array().unwrap() {
+                assert_eq!(m["names"], json!([]), "{m}");
+                for key in ["agent_arena", "artificial_analysis", "ai_stupid_level"] {
+                    assert!(m[key].is_null(), "{m}");
+                }
+            }
+        }
+    }
+    // no cache at all: nothing is listed as unmatched
+    assert_eq!(v["unmatched"], json!([]), "{v}");
 }
 
 // --- AC5 ---------------------------------------------------------------------------------
 
-const USAGE_KEYS: [&str; 19] = [
-    "completed", "effort", "estimate_reliable", "machines", "model", "plan", "plan_label", "profile",
-    "quota_points_avg", "quota_points_weekly_avg", "quota_runs", "quota_runs_unreliable", "role", "runs",
-    "runs_left", "runs_left_window", "shared", "task_type", "tokens_avg",
+/// CROSS-1: the keys of a model row.
+const MODEL_KEYS: [&str; 6] = ["agent_arena", "ai_stupid_level", "artificial_analysis", "model", "names", "usage"];
+
+/// CROSS-1 AC4: a usage row under a model, without the account and model it
+/// sits under and the account's plan and shared mark.
+const USAGE_KEYS: [&str; 14] = [
+    "completed", "effort", "estimate_reliable", "machines", "quota_points_avg", "quota_points_weekly_avg",
+    "quota_runs", "quota_runs_unreliable", "role", "runs", "runs_left", "runs_left_window", "task_type",
+    "tokens_avg",
 ];
 
 fn review_doc(f: &Fixture, name: &str, verdict: &str) -> String {
@@ -319,14 +539,10 @@ fn dispatch_codex(f: &Fixture, task: &str) -> String {
     run
 }
 
-fn usage_rows(v: &Value) -> Vec<Value> {
-    v["usage"].as_array().unwrap().clone()
-}
-
 #[test]
 fn usage_counts_this_computers_runs_with_runs_left_and_never_a_verdict() {
     let f = init();
-    add_codex(&f, "codex-a", true);
+    let cfg = add_codex(&f, "codex-a", true);
     f.add_profile("claude-a");
     f.cmd().args(["config", "set", "machine-name", "alpha"]).assert().success();
     f.cmd().args(["profile", "set-shared", "codex-a", "on"]).assert().success();
@@ -336,16 +552,16 @@ fn usage_counts_this_computers_runs_with_runs_left_and_never_a_verdict() {
     let run2 = dispatch_codex(&f, &task2);
 
     let v = recommend(&f, "implementer", None);
-    let rows = usage_rows(&v);
+    // CROSS-1 AC4: the one row sits under codex-a's model, and only there
+    assert_eq!(all_usage(&v).len(), 1, "{v}");
+    let rows = model_usage(&v, "codex-a", CODEX_MODEL);
     assert_eq!(rows.len(), 1, "{v}");
     let row = &rows[0];
     assert_eq!(sorted_keys(row), USAGE_KEYS, "{row}");
     assert_eq!(row["role"], "implementer");
-    assert_eq!(row["profile"], "codex-a");
-    assert_eq!(row["model"], CODEX_MODEL);
     assert_eq!(row["effort"], "medium");
     assert!(row["task_type"].is_null(), "{row}");
-    assert_eq!(row["shared"], true);
+    assert_eq!(candidate(&v, "codex-a")["shared"], true);
     assert_eq!(row["machines"], json!(["alpha"]));
     assert_eq!(row["runs"], 2);
     assert_eq!(row["completed"], 2);
@@ -361,12 +577,13 @@ fn usage_counts_this_computers_runs_with_runs_left_and_never_a_verdict() {
     assert_eq!(row["runs_left"], 31, "{row}");
     assert_eq!(row["runs_left_window"], "five_hour", "{row}");
     let plain = recommend_plain(&f, "implementer", None);
-    let line = plain.lines().find(|l| l.starts_with("usage: implementer codex-a")).unwrap_or_else(|| panic!("{plain}"));
-    assert!(line.contains("runs left 31 (five_hour)") && line.contains("(estimate unreliable)"), "{line}");
-    assert!(plain.lines().last().unwrap().contains("--json"), "{plain}");
+    let cells = table_cells(&plain, "codex-a", CODEX_MODEL);
+    assert_eq!(cells[6], "31 five_hour", "{cells:?}");
+    assert!(cells[5].ends_with(" unreliable"), "{cells:?}");
+    assert!(plain.lines().last().unwrap().contains("--tables"), "{plain}");
     // the implementer runs are not the reviewer role's (that role's rows are
     // checked in `usage_keeps_reviewer_and_spec_reviewer_runs_in_rows_of_their_own`)
-    assert_eq!(usage_rows(&recommend(&f, "reviewer", None)), Vec::<Value>::new());
+    assert_eq!(all_usage(&recommend(&f, "reviewer", None)), Vec::<Value>::new());
 
     // verdicts change nothing in usage
     let pass = review_doc(&f, "pass.json", "PASS");
@@ -374,13 +591,17 @@ fn usage_counts_this_computers_runs_with_runs_left_and_never_a_verdict() {
     let reject = review_doc(&f, "reject.json", "REJECT");
     f.cmd().args(["review", "record", &task2, "-f", &reject, "--json"]).assert().success();
     let v = recommend(&f, "implementer", None);
-    let rows = usage_rows(&v);
+    let rows = model_usage(&v, "codex-a", CODEX_MODEL);
     assert_eq!(rows.len(), 1, "{v}");
     assert_eq!(sorted_keys(&rows[0]), USAGE_KEYS, "{v}");
     for key in ["pass", "reject", "pass_rate", "reviewed", "verdict"] {
         assert!(rows[0].get(key).is_none(), "{key} must not be sent: {v}");
     }
-    assert!(!v["usage"].to_string().contains("PASS") && !v["usage"].to_string().contains("REJECT"), "{v}");
+    for key in ["pass", "reject", "pass_rate"] {
+        assert!(!has_key(&v, key), "no {key} anywhere: {v}");
+    }
+    let usage = json!(all_usage(&v)).to_string();
+    assert!(!usage.contains("PASS") && !usage.contains("REJECT"), "{v}");
     let _ = (run1, run2);
 
     // a shared-folder line of another computer, same account and group:
@@ -406,7 +627,7 @@ fn usage_counts_this_computers_runs_with_runs_left_and_never_a_verdict() {
     fs::write(dir.join("third.jsonl"), format!("{line}\n")).unwrap();
     f.cmd().args(["config", "set", "records-dir"]).arg(&dir).assert().success();
     let v = recommend(&f, "implementer", None);
-    let rows = usage_rows(&v);
+    let rows = model_usage(&v, "codex-a", CODEX_MODEL);
     assert_eq!(rows.len(), 1, "{v}");
     assert_eq!(rows[0]["runs"], 3, "two local runs plus REMOTE-1 once: {v}");
     assert_eq!(rows[0]["completed"], 3, "{v}");
@@ -415,6 +636,26 @@ fn usage_counts_this_computers_runs_with_runs_left_and_never_a_verdict() {
     assert_eq!(rows[0]["quota_points_avg"], 3.0, "{v}");
     assert_eq!(rows[0]["runs_left"], 31, "{v}");
     assert_eq!(rows[0]["estimate_reliable"], false, "{v}");
+
+    // CROSS-1 AC4 (3): a model gone from the cache keeps its usage, once,
+    // under `usage_other_models`
+    fs::write(
+        cfg.join("models_cache.json"),
+        json!({"models":[{"slug":"gpt-5.6-sol","display_name":"Sol","visibility":"list","priority":3}]}).to_string(),
+    )
+    .unwrap();
+    let v = recommend(&f, "implementer", None);
+    let codex = candidate(&v, "codex-a");
+    assert!(!codex["models"].as_array().unwrap().iter().any(|m| m["model"] == CODEX_MODEL), "{codex}");
+    let other = codex["usage_other_models"].as_array().unwrap();
+    assert_eq!(other.len(), 1, "{codex}");
+    assert_eq!(other[0]["model"], CODEX_MODEL, "{codex}");
+    assert_eq!(other[0]["usage"].as_array().unwrap().len(), 1, "{codex}");
+    assert_eq!(other[0]["usage"][0]["runs"], 3, "{codex}");
+    assert_eq!(sorted_keys(&other[0]["usage"][0]), USAGE_KEYS, "{codex}");
+    assert_eq!(all_usage(&v).len(), 1, "{v}");
+    let plain = recommend_plain(&f, "implementer", None);
+    assert!(plain.lines().any(|l| l == format!("  other: {CODEX_MODEL} 3 run(s) (not in the list now)")), "{plain}");
 }
 
 /// Review of attempt 3 (AC5 (1)): a usage row's `role` is the run's own
@@ -454,33 +695,28 @@ fn usage_keeps_reviewer_and_spec_reviewer_runs_in_rows_of_their_own() {
     assert_eq!(w["role"], "reviewer", "{w}");
 
     let v = recommend(&f, "reviewer", None);
-    let rows = usage_rows(&v);
+    assert_eq!(all_usage(&v).len(), 2, "the implementer run left out: {v}");
+    let rows = model_usage(&v, "claude-a", "opus");
     let roles: Vec<&str> = rows.iter().map(|r| r["role"].as_str().unwrap()).collect();
-    assert_eq!(roles, ["reviewer", "spec_reviewer"], "a row per run role, the implementer run left out: {v}");
+    assert_eq!(roles, ["reviewer", "spec_reviewer"], "a row per run role: {v}");
     for row in &rows {
         assert_eq!(sorted_keys(row), USAGE_KEYS, "{row}");
-        assert_eq!(row["profile"], "claude-a", "{row}");
-        assert_eq!(row["model"], "opus", "{row}");
         assert_eq!(row["effort"], "high", "{row}");
         assert!(row["task_type"].is_null(), "{row}");
         assert_eq!(row["runs"], 1, "{row}");
         assert_eq!(row["completed"], 1, "{row}");
     }
+    // CROSS-1: the table shows one of the two rows and says there is another
     let plain = recommend_plain(&f, "reviewer", None);
-    for role in ["reviewer", "spec_reviewer"] {
-        let line = plain
-            .lines()
-            .find(|l| l.starts_with(&format!("usage: {role} claude-a")))
-            .unwrap_or_else(|| panic!("no usage line for {role}: {plain}"));
-        assert!(line.contains(" opus effort high null: runs 1 (completed 1)"), "{line}");
-    }
+    let cells = table_cells(&plain, "claude-a", "opus");
+    assert!(cells[6].ends_with(" (+1 rows)"), "{cells:?}");
 
     // the implementer role has the implementer run alone
     let v = recommend(&f, "implementer", None);
-    let rows = usage_rows(&v);
+    assert_eq!(all_usage(&v).len(), 1, "{v}");
+    let rows = model_usage(&v, "claude-b", "sonnet");
     assert_eq!(rows.len(), 1, "{v}");
     assert_eq!(rows[0]["role"], "implementer", "{v}");
-    assert_eq!(rows[0]["profile"], "claude-b", "{v}");
     assert_eq!(rows[0]["runs"], 1, "{v}");
 }
 
@@ -529,10 +765,11 @@ fn insert_windows(f: &Fixture, run_id: &str, five_hour: f64, seven_day: f64) {
         .unwrap();
 }
 
-fn usage_row<'a>(rows: &'a [Value], profile: &str, model: &str) -> &'a Value {
-    rows.iter()
-        .find(|r| r["profile"] == profile && r["model"] == model)
-        .unwrap_or_else(|| panic!("no usage row for {profile} {model} in {rows:?}"))
+/// The one usage row of `profile`'s `model`.
+fn usage_row(v: &Value, profile: &str, model: &str) -> Value {
+    let rows = model_usage(v, profile, model);
+    assert_eq!(rows.len(), 1, "one usage row for {profile} {model}: {rows:?}");
+    rows[0].clone()
 }
 
 /// Review of attempt 1 (AC10): an exhausted account whose runs give no
@@ -546,18 +783,16 @@ fn an_exhausted_account_without_an_average_prints_runs_left_zero_with_the_window
     insert_run_with_quota(&f, "R-NOREAD", "claude-a", "sonnet", &json!({"points": null, "reliable": true, "seven_day": {"points": null}}));
     insert_windows(&f, "R-NOREAD", 0.97, 0.10);
     let v = recommend(&f, "implementer", None);
-    let candidate = v["candidates"].as_array().unwrap().iter().find(|c| c["profile_id"] == "claude-a").unwrap();
-    assert_eq!(candidate["quota_state"], "exhausted", "{v}");
-    let rows = usage_rows(&v);
-    let row = usage_row(&rows, "claude-a", "sonnet");
+    assert_eq!(candidate(&v, "claude-a")["quota_state"], "exhausted", "{v}");
+    let row = usage_row(&v, "claude-a", "sonnet");
     assert!(row["quota_points_avg"].is_null() && row["quota_points_weekly_avg"].is_null(), "{row}");
     assert_eq!(row["quota_runs"], 0, "{row}");
     assert_eq!(row["runs_left"], 0, "{row}");
     assert!(row["runs_left_window"].is_null(), "{row}");
+    // CROSS-1: the known 0 alone, not `no data`
     let plain = recommend_plain(&f, "implementer", None);
-    let line = plain.lines().find(|l| l.starts_with("usage: implementer claude-a")).unwrap_or_else(|| panic!("{plain}"));
-    assert!(line.contains("runs left 0 (window unknown)"), "{line}");
-    assert!(!line.contains("runs left unknown"), "{line}");
+    let cells = table_cells(&plain, "claude-a", "sonnet");
+    assert_eq!(cells[6], "0", "{cells:?}");
 }
 
 /// Review of attempt 1: the averages prefer the reliable runs and fall back
@@ -589,9 +824,8 @@ fn usage_averages_prefer_reliable_runs_and_fall_back_to_unreliable_ones() {
     insert_windows(&f, "R-S1", 0.20, 0.10);
 
     let v = recommend(&f, "implementer", None);
-    let rows = usage_rows(&v);
-    assert_eq!(rows.len(), 3, "{v}");
-    let sonnet = usage_row(&rows, "claude-a", "sonnet");
+    assert_eq!(all_usage(&v).len(), 3, "{v}");
+    let sonnet = usage_row(&v, "claude-a", "sonnet");
     assert_eq!(sonnet["runs"], 3, "{sonnet}");
     assert_eq!(sonnet["quota_runs"], 2, "the reliable runs only: {sonnet}");
     assert_eq!(sonnet["quota_runs_unreliable"], 1, "{sonnet}");
@@ -602,7 +836,7 @@ fn usage_averages_prefer_reliable_runs_and_fall_back_to_unreliable_ones() {
     assert_eq!(sonnet["runs_left"], 25, "{sonnet}");
     assert_eq!(sonnet["runs_left_window"], "five_hour", "{sonnet}");
 
-    let opus = usage_row(&rows, "claude-a", "opus");
+    let opus = usage_row(&v, "claude-a", "opus");
     assert_eq!(opus["quota_runs"], 1, "the unreliable run with numbers: {opus}");
     assert_eq!(opus["quota_runs_unreliable"], 1, "{opus}");
     assert_eq!(opus["quota_points_avg"], 100.0, "{opus}");
@@ -611,7 +845,7 @@ fn usage_averages_prefer_reliable_runs_and_fall_back_to_unreliable_ones() {
     assert_eq!(opus["runs_left"], 0, "75 / 100 floors to 0: {opus}");
     assert_eq!(opus["runs_left_window"], "five_hour", "{opus}");
 
-    let haiku = usage_row(&rows, "claude-a", "haiku");
+    let haiku = usage_row(&v, "claude-a", "haiku");
     assert_eq!(haiku["quota_runs"], 0, "{haiku}");
     assert_eq!(haiku["quota_runs_unreliable"], 1, "{haiku}");
     assert!(haiku["quota_points_avg"].is_null() && haiku["quota_points_weekly_avg"].is_null(), "{haiku}");
@@ -620,14 +854,16 @@ fn usage_averages_prefer_reliable_runs_and_fall_back_to_unreliable_ones() {
 
     // a shared account's estimate is never its own, reliable runs or not
     f.cmd().args(["profile", "set-shared", "claude-a", "on"]).assert().success();
-    let rows = usage_rows(&recommend(&f, "implementer", None));
-    let sonnet = usage_row(&rows, "claude-a", "sonnet");
-    assert_eq!(sonnet["shared"], true, "{sonnet}");
+    let v = recommend(&f, "implementer", None);
+    assert_eq!(candidate(&v, "claude-a")["shared"], true, "{v}");
+    let sonnet = usage_row(&v, "claude-a", "sonnet");
     assert_eq!(sonnet["quota_points_avg"], 3.0, "{sonnet}");
     assert_eq!(sonnet["estimate_reliable"], false, "{sonnet}");
     let plain = recommend_plain(&f, "implementer", None);
-    let line = plain.lines().find(|l| l.starts_with("usage: implementer claude-a sonnet")).unwrap_or_else(|| panic!("{plain}"));
-    assert!(line.contains("runs left 25 (five_hour)") && line.contains("(estimate unreliable)"), "{line}");
+    let cells = table_cells(&plain, "claude-a", "sonnet");
+    assert_eq!(cells[6], "25 five_hour", "{cells:?}");
+    assert!(cells[5].ends_with(" unreliable"), "{cells:?}");
+    assert!(plain.lines().any(|l| l.starts_with("claude-a (shared)  anthropic / claude-code")), "{plain}");
 }
 
 /// Review of attempt 2 (AC5 (2)): the unreliable runs are used only when the
@@ -650,9 +886,8 @@ fn a_reliable_run_without_numbers_keeps_the_unreliable_numbers_out() {
     insert_windows(&f, "R-REL", 0.20, 0.10);
 
     let v = recommend(&f, "implementer", None);
-    let rows = usage_rows(&v);
-    assert_eq!(rows.len(), 1, "{v}");
-    let row = usage_row(&rows, "claude-a", "sonnet");
+    assert_eq!(all_usage(&v).len(), 1, "{v}");
+    let row = usage_row(&v, "claude-a", "sonnet");
     assert_eq!(row["runs"], 2, "{row}");
     assert_eq!(row["quota_runs_unreliable"], 1, "{row}");
     assert_eq!(row["quota_runs"], 0, "a reliable run exists, and none has a number: {row}");
@@ -660,10 +895,12 @@ fn a_reliable_run_without_numbers_keeps_the_unreliable_numbers_out() {
     assert!(row["quota_points_weekly_avg"].is_null(), "{row}");
     assert_eq!(row["estimate_reliable"], true, "the reliable side, of an account that is not shared: {row}");
     assert!(row["runs_left"].is_null() && row["runs_left_window"].is_null(), "no average, no count: {row}");
+    // CROSS-1: both averages null and no count read `no data`, not unreliable
     let plain = recommend_plain(&f, "implementer", None);
-    let line = plain.lines().find(|l| l.starts_with("usage: implementer claude-a sonnet")).unwrap_or_else(|| panic!("{plain}"));
-    assert!(line.contains("quota avg null/null per run (5h/7d, 0 run(s))"), "{line}");
-    assert!(line.contains("runs left unknown") && !line.contains("(estimate unreliable)"), "{line}");
+    let cells = table_cells(&plain, "claude-a", "sonnet");
+    assert_eq!(cells[5], "no data", "{cells:?}");
+    assert_eq!(cells[6], "no data", "{cells:?}");
+    assert!(!cells.iter().any(|c| c.contains("unreliable")), "{cells:?}");
 }
 
 /// AC5: a run fake-claude actually made on a `profile set-shared` account
@@ -680,14 +917,11 @@ fn a_shared_claude_account_run_by_fake_claude_has_an_average_marked_unreliable()
     assert_eq!(f.wait_for(&task, "180s").1, "in_review", "{}", f.explain_run(&run));
 
     let v = recommend(&f, "implementer", None);
-    let rows = usage_rows(&v);
-    assert_eq!(rows.len(), 1, "{v}");
-    let row = &rows[0];
+    assert_eq!(all_usage(&v).len(), 1, "{v}");
+    let row = &usage_row(&v, "claude-b", "sonnet");
     assert_eq!(sorted_keys(row), USAGE_KEYS, "{row}");
-    assert_eq!(row["profile"], "claude-b");
-    assert_eq!(row["model"], "sonnet");
     assert_eq!(row["effort"], "medium");
-    assert_eq!(row["shared"], true, "{row}");
+    assert_eq!(candidate(&v, "claude-b")["shared"], true, "{v}");
     assert_eq!(row["runs"], 1, "{row}");
     assert_eq!(row["completed"], 1, "{row}");
     assert_eq!(row["quota_runs_unreliable"], 1, "the shared mark makes the run unreliable: {row}");
@@ -699,9 +933,9 @@ fn a_shared_claude_account_run_by_fake_claude_has_an_average_marked_unreliable()
     // an average of 0 gives no count
     assert!(row["runs_left"].is_null() && row["runs_left_window"].is_null(), "{row}");
     let plain = recommend_plain(&f, "implementer", None);
-    let line = plain.lines().find(|l| l.starts_with("usage: implementer claude-b")).unwrap_or_else(|| panic!("{plain}"));
-    assert!(line.contains("quota avg 0.00/0.00 per run (5h/7d, 1 run(s))"), "{line}");
-    assert!(line.contains("runs left unknown (estimate unreliable)"), "{line}");
+    let cells = table_cells(&plain, "claude-b", "sonnet");
+    assert_eq!(cells[5], "0.00%/0.00% unreliable", "{cells:?}");
+    assert_eq!(cells[6], "no data", "{cells:?}");
 }
 
 // --- AC6 ---------------------------------------------------------------------------------
@@ -890,24 +1124,47 @@ fn the_mcp_recommend_tool_returns_the_same_document_as_the_cli() {
         .find(|t| t["name"] == "thoth_recommend")
         .unwrap();
     let description = tool["description"].as_str().unwrap();
-    for needle in ["quota", "models it can run", "external tables", "own usage", "runs are left", "reject", "does not choose"] {
+    const NEEDLES: [&str; 10] = [
+        "quota",
+        "windows",
+        "models it can run now",
+        "external tables",
+        "own usage",
+        "runs are left",
+        "no table matched",
+        "full filtered tables",
+        "reject",
+        "does not choose",
+    ];
+    for needle in NEEDLES {
         assert!(description.contains(needle), "{needle}: {description}");
     }
-    assert_eq!(sorted_keys(&tool["inputSchema"]["properties"]), ["repo", "role", "task"], "parameters unchanged");
+    // CROSS-1: `tables` joins the parameters
+    assert_eq!(sorted_keys(&tool["inputSchema"]["properties"]), ["repo", "role", "tables", "task"]);
+    assert_eq!(tool["inputSchema"]["properties"]["tables"], json!({"type": "boolean"}));
+    let help = String::from_utf8(f.cmd().args(["recommend", "--help"]).assert().success().get_output().stdout.clone()).unwrap();
+    for needle in NEEDLES.iter().chain(&["--tables"]) {
+        assert!(help.contains(needle), "{needle}: {help}");
+    }
 
     let response = s.send(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"thoth_recommend","arguments":{"role":"implementer","task":task}}}));
     assert_eq!(response["result"]["isError"], false, "{response}");
     let content = &response["result"]["structuredContent"];
     assert_eq!(sorted_keys(content), sorted_keys(&cli), "{content}");
-    for key in ["tables", "usage", "task_history", "score_refresh"] {
+    assert!(content["tables"].is_null(), "{content}");
+    for key in ["candidates", "unmatched", "task_history", "score_refresh"] {
         assert_eq!(content[key], cli[key], "{key} differs: {content}");
     }
     assert_eq!(content["candidates"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        sorted_keys(&content["candidates"][0]),
-        sorted_keys(&cli["candidates"][0]),
-    );
     assert_eq!(content["task_id"], task.as_str());
+
+    let response = s.send(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"thoth_recommend","arguments":{"role":"implementer","task":task,"tables":true}}}));
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let content = &response["result"]["structuredContent"];
+    let with_tables = recommend_tables(&f, "implementer", Some(&task));
+    assert!(content["tables"].is_object(), "{content}");
+    assert_eq!(content["tables"], with_tables["tables"], "{content}");
+    assert_eq!(content["candidates"], with_tables["candidates"], "{content}");
 }
 
 /// Nothing in `recommend` writes: the caches, databases and the profile
@@ -920,6 +1177,9 @@ fn recommend_with_tables_is_still_read_only() {
     let before = snapshot(&f.home_path());
     recommend(&f, "implementer", None);
     recommend(&f, "reviewer", None);
+    // CROSS-1: the full tables are read the same way
+    recommend_tables(&f, "implementer", None);
+    recommend_tables(&f, "reviewer", None);
     assert_eq!(before, snapshot(&f.home_path()));
     assert!(cfg.is_dir());
 }

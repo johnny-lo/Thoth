@@ -360,7 +360,7 @@ fn mcp_has_no_setup_tool() {
         .find(|v| v["id"] == 2)
         .unwrap_or_else(|| panic!("no tools/list answer in {stdout}"));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 35);
+    assert_eq!(tools.len(), 36);
     for t in tools {
         assert!(!t["name"].as_str().unwrap().contains("setup"), "{t}");
     }

@@ -6,6 +6,7 @@
 //! `Edit`), and the fact that it reads the implementer's evidence rather than
 //! the implementer's summary.
 
+use crate::commands::review_fix;
 use crate::config::Paths;
 use crate::db;
 use crate::db::global;
@@ -19,6 +20,7 @@ use crate::output;
 use crate::plan_label;
 use crate::review_json::{self, Verdict};
 use crate::spec;
+use crate::spec_edits::ReviewMode;
 use crate::worktree;
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -60,6 +62,8 @@ pub struct StartArgs<'a> {
     pub effort: Option<&'a str>,
     /// `--reason`, as typed (DT-2); trimmed and checked by `start`.
     pub reason: Option<&'a str>,
+    /// RFIX-1: `--edit`, the reviewer may attach a fix to its REJECT.
+    pub edit: bool,
     pub json: bool,
 }
 
@@ -187,12 +191,45 @@ fn prepare_protected_evidence(
     (warnings, again)
 }
 
+/// GATE-1: makes an edit review's fix checkable before the confirm's gate
+/// reads it. When the edit run has no diff evidence, or its newest one has
+/// no readable `protected_changes` (AC2: recorded before LEAN-1 too), the
+/// fix's diff (`from`, the candidate, to the fix commit) is recorded again
+/// on the edit run, labelled as the fix. Returns notes for a missing diff and
+/// the error of recording an unreadable one again; nothing is refused here.
+fn prepare_fix_evidence(
+    conn: &Connection,
+    paths: &Paths,
+    repo_id: &str,
+    edit_run: &Run,
+    from: &str,
+    fix_commit: &str,
+    root: &Path,
+) -> (Vec<String>, Option<String>) {
+    let ctx = evidence::EvidenceContext {
+        paths,
+        repo_id,
+        task_id: &edit_run.task_id,
+        run_id: &edit_run.run_id,
+    };
+    let record = || evidence::record_review_fix_diff(conn, &ctx, root, from, fix_commit);
+    match crate::protected::latest_diff(conn, edit_run) {
+        Ok(None) => match record() {
+            Ok(_) => (Vec::new(), None),
+            Err(e) => (vec![format!("could not record the fix diff: {e:#}")], None),
+        },
+        Ok(Some(d)) if d.changes.is_none() => (Vec::new(), record().err().map(|e| format!("{e:#}"))),
+        _ => (Vec::new(), None),
+    }
+}
+
 /// Why a PASS cannot be reached yet for `target`'s candidate, or `None`: no
 /// diff evidence, a diff evidence whose `protected_changes` cannot be read,
-/// or a protected test or check-word change nobody approved with `checks
+/// or a protected test, inline test or check-word change nobody approved with `checks
 /// approve --run`. `notes` and `again_error` (from
 /// `prepare_protected_evidence`) are added to the first two refusals.
-fn protected_refusal(
+/// GATE-1: `target` may be an edit review run, judged on its fix's diff.
+pub(crate) fn protected_refusal(
     conn: &Connection,
     task_id: &str,
     target: &Run,
@@ -294,7 +331,67 @@ fn ensure_candidate_evidence(
 }
 
 pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
+    launch(paths, cwd, args, false)
+}
+
+pub struct ConfirmArgs<'a> {
+    pub task: &'a str,
+    pub profile: &'a str,
+    pub model: &'a str,
+    pub timeout_seconds: u64,
+    pub effort: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub json: bool,
+}
+
+/// RFIX-1: `thoth review confirm TASK`: launch the confirmer of the pending
+/// fix, in the fix worktree. `review start`'s refusals, plus: no pending fix,
+/// no usable verify of the fix, or the edit review's model and effort.
+pub fn confirm(paths: &Paths, cwd: &Path, args: ConfirmArgs<'_>) -> Result<i32> {
+    launch(
+        paths,
+        cwd,
+        StartArgs {
+            task: args.task,
+            profile: args.profile,
+            model: Some(args.model),
+            timeout_seconds: args.timeout_seconds,
+            effort: args.effort,
+            reason: args.reason,
+            edit: false,
+            json: args.json,
+        },
+        true,
+    )
+}
+
+/// What `review confirm` reads about the fix it launches against.
+struct PendingFix {
+    review: state::Review,
+    edit_run: Run,
+    /// The commit the fix was made on (the candidate).
+    fix_base: String,
+    fix_commit: String,
+    fix_branch: String,
+    verify_seq: i64,
+    fix_verify: serde_json::Value,
+}
+
+/// `review start` (`--edit` too) and `review confirm`: one launch path, the
+/// mode deciding the worktree, the extra refusals and the started keys.
+fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Result<i32> {
     use crate::commands::auto_pick;
+    let mode = match (confirm, args.edit) {
+        (true, _) => ReviewMode::Confirm,
+        (false, true) => ReviewMode::Edit,
+        (false, false) => ReviewMode::Review,
+    };
+    let is_confirm = mode == ReviewMode::Confirm;
+    let is_edit = mode == ReviewMode::Edit;
+    let command = if is_confirm { "review confirm" } else { "review start" };
+    if is_confirm && std::env::var_os("THOTH_RUN_ID").is_some() {
+        bail!("review confirm refuses to run with THOTH_RUN_ID set: the confirmer is chosen by the supervising session, not by a run");
+    }
     // RJ-1: `auto` is refused before anything else.
     auto_pick::refuse_auto(role::REVIEWER, args.task, args.profile, args.model, args.effort)?;
     // S3-7: reject a bad level before a run row, worktree or event exists.
@@ -310,10 +407,15 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
         .ok_or_else(|| anyhow::anyhow!("task {task_id} disappeared"))?;
     if task.status != TaskStatus::InReview.as_str() {
         bail!(
-            "task {task_id} is '{}'; review start needs in_review",
+            "task {task_id} is '{}'; {command} needs in_review",
             task.status
         );
     }
+    let refusal_head = if is_confirm {
+        format!("refusing to start the confirm of task {task_id}")
+    } else {
+        format!("refusing to start a review of task {task_id}")
+    };
 
     // Fix round 1 (I3): the H2 rule keeps the task at `in_review` for the whole
     // review, which removes the mutex every other launch path leans on -
@@ -338,14 +440,7 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
     // because an implementer run in flight is just as good a reason not to
     // start reviewing a candidate that is still moving.
     if let Some(live) = state::list_live_runs_for_task(&conn, &task_id)?.into_iter().next() {
-        bail!(
-            "{}",
-            crate::commands::live_run_refusal(
-                &format!("refusing to start a review of task {task_id}"),
-                &task_id,
-                &live,
-            )
-        );
+        bail!("{}", crate::commands::live_run_refusal(&refusal_head, &task_id, &live));
     }
 
     let target = state::latest_completed_run_for_role(&conn, &task_id, role::IMPLEMENTER)?
@@ -366,10 +461,15 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
     };
 
     // DT-2: the newest reviewer run of the attempt under review, whose model
-    // and effort a left-out `--model` / `--effort` keeps (RJ-1).
-    let previous_run = state::list_runs_for_task(&conn, &task_id)?
-        .into_iter()
-        .rfind(|r| r.attempt == target.attempt && r.role == role::REVIEWER);
+    // and effort a left-out `--model` / `--effort` keeps (RJ-1). A confirm
+    // keeps nothing: the commander names the confirmer every time.
+    let previous_run = if is_confirm {
+        None
+    } else {
+        state::list_runs_for_task(&conn, &task_id)?
+            .into_iter()
+            .rfind(|r| r.attempt == target.attempt && r.role == role::REVIEWER)
+    };
 
     let gconn = db::open_global(paths)?;
     let profile = match global::get_profile(&gconn, args.profile)? {
@@ -395,13 +495,60 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
             model: args.model,
             effort: effort_given,
             previous: previous_run.as_ref(),
-            retry: auto_pick::Retry::KeepsPrevious,
+            retry: if is_confirm { auto_pick::Retry::Confirm } else { auto_pick::Retry::KeepsPrevious },
         },
         &profile,
         |m| adapter.check_model(&profile.profile_id, m, &known_models),
     )?;
     let require_reason = crate::commands::settings::require_reason(&paths.home);
-    auto_pick::require_reason_gate(&task_id, "review start", reason.as_deref(), require_reason)?;
+    auto_pick::require_reason_gate(&task_id, command, reason.as_deref(), require_reason)?;
+    let launch = auto_pick::launch_settings(&choice, &profile);
+
+    // RFIX-1: a fix is attached to code only, and refused before the
+    // candidate's evidence is recorded.
+    if is_edit && spec::is_document_task(&task.spec) {
+        bail!(
+            "task {task_id} is a document task (task_type docs, research or review); review start --edit attaches fixes to code only, review it without --edit"
+        );
+    }
+    // RFIX-1: what a confirm needs, before any evidence or login check.
+    let pending: Option<PendingFix> = if is_confirm {
+        let st = review_fix::state(&conn, &task)?;
+        let Some((review, applied)) = st.applied.clone().filter(|_| st.pending_fix) else {
+            bail!("{}", review_fix::no_pending_fix(&task_id, &st, &conn)?);
+        };
+        let edit_run_id = review.reviewer_run_id.clone().unwrap_or_default();
+        let edit_run = state::get_run(&conn, &edit_run_id)?
+            .ok_or_else(|| anyhow::anyhow!("the edit review's run {edit_run_id} is gone"))?;
+        let fix_commit = applied["fix_commit"].as_str().unwrap_or_default().to_string();
+        let fix_branch = applied["fix_branch"].as_str().unwrap_or_default().to_string();
+        let fix_base = applied["base_commit"].as_str().unwrap_or(&candidate).to_string();
+        let (verify_seq, verify_detail) = match review_fix::usable_verify(&conn, &edit_run_id, &fix_commit)? {
+            Ok(v) => v,
+            Err(why) => bail!("{refusal_head}: {why}"),
+        };
+        // 2026-10-17: the confirmer is never the fixer again at the same
+        // effort; another profile of the same model does not count.
+        let edit_effort = crate::adapter::effort::parse_launch(&edit_run.spec).and_then(|l| l.effort);
+        if choice.model == edit_run.model && launch.effort == edit_effort {
+            bail!(
+                "{refusal_head}: model {} at effort {} is the edit review's own (run {edit_run_id}); pick another model, or the same model at another effort",
+                choice.model,
+                launch.effort.as_deref().unwrap_or("none")
+            );
+        }
+        Some(PendingFix {
+            fix_verify: review_fix::fix_verify_for(verify_seq, &verify_detail),
+            review,
+            edit_run,
+            fix_base,
+            fix_commit,
+            fix_branch,
+            verify_seq,
+        })
+    } else {
+        None
+    };
 
     // LESS-5: the protected test files the candidate changed must have been
     // approved (`checks approve --run`) before a review starts. The candidate's
@@ -412,7 +559,18 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
     let (mut warnings, again_error) =
         prepare_protected_evidence(&conn, paths, &repo_id, &task.base_commit, &target, &candidate, &root);
     if let Some(why) = protected_refusal(&conn, &task_id, &target, &warnings, again_error.as_deref())? {
-        bail!("refusing to start a review of task {task_id}: {why}");
+        bail!("{refusal_head}: {why}");
+    }
+    // GATE-1: a confirm also waits for the fix's own protected changes, read
+    // from the edit review run's diff evidence and approved on that run
+    // (`checks approve --run EDIT_RUN`); an approval of the implementer run
+    // does not cover them.
+    if let Some(p) = &pending {
+        let (notes, again) =
+            prepare_fix_evidence(&conn, paths, &repo_id, &p.edit_run, &p.fix_base, &p.fix_commit, &root);
+        if let Some(why) = protected_refusal(&conn, &task_id, &p.edit_run, &notes, again.as_deref())? {
+            bail!("{refusal_head}: {why}");
+        }
     }
 
     // FC-1 (H4): read only to see whether the profile has recovered or is
@@ -430,7 +588,6 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
         .find(|c| c.profile.profile_id == profile.profile_id)
         .is_some_and(|c| c.recovered && c.profile.status == "rate_limited");
     let allowed_tools = adapter.reviewer_allowed_tools(REVIEWER_ALLOWED_TOOLS, research);
-    let launch = auto_pick::launch_settings(&choice, &profile);
     let run_spec = crate::adapter::effort::with_launch(&task.spec, &launch)?;
     // Same pre-flight as `dispatch`: do not burn a worktree on a profile that
     // is not logged in.
@@ -445,6 +602,7 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
         );
     }
     plan_label::remember_or_warn(&gconn, &profile.profile_id, auth.subscription_type.as_deref());
+    crate::login_name::remember_or_warn(&gconn, &profile.profile_id, auth.email.as_deref());
     // MODELS-1: store the list just read, then check the model against it
     // (agy) or against the account's recorded unavailable models (Claude),
     // before the worktree and the run row.
@@ -459,10 +617,27 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
     // active again once the run row exists (below).
     let logged_in_again = profile.status == "logged_out";
 
-    let wt = review_worktree_path(paths, &repo_id, &task_id, target.attempt);
-    let ensured = worktree::ensure_detached_worktree(&root, &wt, &candidate)?;
-    let outcome = ensured.outcome;
-    let worktree_warning = ensured.warning;
+    // A review gets its own detached checkout of the candidate, made here. An
+    // edit review's fix worktree is made or reset inside the transaction
+    // below, under the authoritative checks, so a refused start cannot clear
+    // a live run's files; a confirm runs in the fix worktree as it is.
+    let fix_branch = review_fix::fix_branch(&task_id, target.attempt);
+    let wt = match mode {
+        ReviewMode::Review => review_worktree_path(paths, &repo_id, &task_id, target.attempt),
+        _ => review_fix::fix_worktree_path(paths, &repo_id, &task_id, target.attempt),
+    };
+    let mut outcome = worktree::EnsureOutcome::Reused;
+    let mut worktree_warning = None;
+    if mode == ReviewMode::Review {
+        let ensured = worktree::ensure_detached_worktree(&root, &wt, &candidate)?;
+        outcome = ensured.outcome;
+        worktree_warning = ensured.warning;
+    }
+    if let Some(p) = &pending {
+        if let Err(why) = review_fix::fix_worktree_ready(&root, &wt, &p.fix_branch, &p.fix_commit) {
+            bail!("{refusal_head}: {why}");
+        }
+    }
 
     // Where a previous reviewer's report would be if it crashed after writing
     // one. Only named here, because the path needs `wt`; it is deleted in the
@@ -474,6 +649,7 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
     let run_id = ids::new_run_id();
     let run_dir = paths.run_dir(&repo_id, &run_id);
     std::fs::create_dir_all(&run_dir)?;
+    let reviewed_commit = pending.as_ref().map(|p| p.fix_commit.clone()).unwrap_or_else(|| candidate.clone());
     let run = Run {
         run_id: run_id.clone(),
         task_id: task_id.clone(),
@@ -496,8 +672,8 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
         worktree: wt.display().to_string(),
         // The commit under review is this run's own base; a reviewer that
         // produced a different candidate would be a bug, and this makes that
-        // visible in `status`.
-        base_commit: candidate.clone(),
+        // visible in `status`. A confirm's is the fix.
+        base_commit: reviewed_commit.clone(),
         candidate_commit: None,
         spec: run_spec,
         status: RunStatus::Queued.as_str().to_string(),
@@ -531,14 +707,59 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
     let tx = db::write_tx(&conn)?;
     if let Some(live) = state::list_live_runs_for_task(&tx, &task_id)?.into_iter().next() {
         drop(tx); // explicit: rolls back, though nothing has been written yet
-        bail!(
-            "{}",
-            crate::commands::live_run_refusal(
-                &format!("refusing to start a review of task {task_id}"),
-                &task_id,
-                &live,
-            )
-        );
+        bail!("{}", crate::commands::live_run_refusal(&refusal_head, &task_id, &live));
+    }
+    let current = state::get_task(&tx, &task_id)?
+        .ok_or_else(|| anyhow::anyhow!("task {task_id} disappeared"))?;
+    if mode != ReviewMode::Review {
+        let newest = state::latest_completed_run_for_role(&tx, &task_id, role::IMPLEMENTER)?;
+        if current.status != TaskStatus::InReview.as_str()
+            || newest.as_ref().map(|r| r.run_id.as_str()) != Some(target.run_id.as_str())
+        {
+            drop(tx);
+            bail!("{refusal_head}: the task or its newest implementer run changed while {command} was starting; run it again");
+        }
+    }
+    if is_edit {
+        // The fix worktree at the candidate, with nothing of an earlier
+        // review's left but Thoth's own `.agent/` files (cleared below).
+        if wt.join(".git").exists() {
+            if let Err(e) = crate::review_fix_edits::reset_worktree(&wt, &candidate) {
+                drop(tx);
+                bail!("{refusal_head}: resetting the fix worktree {} failed: {e:#}", wt.display());
+            }
+        } else {
+            match worktree::ensure_detached_worktree(&root, &wt, &candidate) {
+                Ok(ensured) => {
+                    outcome = ensured.outcome;
+                    worktree_warning = ensured.warning;
+                }
+                Err(e) => {
+                    drop(tx);
+                    return Err(e);
+                }
+            }
+        }
+        let stale_input = wt.join(crate::review_fix_edits::INPUT_DIR);
+        if let Err(e) = std::fs::remove_dir_all(&stale_input) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                drop(tx);
+                bail!("could not clear {}: {e}", stale_input.display());
+            }
+        }
+    }
+    if let Some(p) = &pending {
+        let st = review_fix::state(&tx, &current)?;
+        let same = st.pending_fix && st.applied.as_ref().map(|(r, _)| r.review_id.as_str()) == Some(p.review.review_id.as_str());
+        let verify_now = review_fix::latest_verify(&tx, &p.edit_run.run_id)?.map(|(seq, _)| seq);
+        if !same || verify_now != Some(p.verify_seq) {
+            drop(tx);
+            bail!("{refusal_head}: the fix or its verify changed while review confirm was starting; run `thoth review show {task_id}` and start again");
+        }
+        if let Err(why) = review_fix::fix_worktree_ready(&root, &wt, &p.fix_branch, &p.fix_commit) {
+            drop(tx);
+            bail!("{refusal_head}: {why}");
+        }
     }
     // Fix round 1 (I3's related check), moved under the guard above: the
     // review worktree is reused across retries of the same (task_id,
@@ -563,26 +784,47 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
         }
     };
     state::insert_run(&tx, &run)?;
+    let mut started = serde_json::json!({
+        "target_run_id": target.run_id,
+        "attempt": target.attempt,
+        "candidate_commit": reviewed_commit,
+        "worktree": wt.display().to_string(),
+        "worktree_reused": outcome == worktree::EnsureOutcome::Reused,
+        "cleared_stale_report": cleared_stale_report,
+        "profile": profile.profile_id,
+        "model": choice.model,
+        "allowed_tools": allowed_tools,
+        "timeout_seconds": args.timeout_seconds,
+        "mode": mode.as_str(),
+    });
+    let mut extra = serde_json::Map::new();
+    if is_edit {
+        extra.insert("fix_branch".into(), serde_json::json!(fix_branch));
+    }
+    if let Some(p) = &pending {
+        extra.insert("confirms_review_id".into(), serde_json::json!(p.review.review_id));
+        extra.insert("fix_commit".into(), serde_json::json!(p.fix_commit));
+        extra.insert("fix_branch".into(), serde_json::json!(p.fix_branch));
+        extra.insert("fix_verify".into(), p.fix_verify.clone());
+        extra.insert("implementer_provider".into(), serde_json::json!(target.provider));
+        extra.insert(
+            "same_provider_as_implementer".into(),
+            serde_json::json!(target.provider == profile.provider),
+        );
+    }
+    if let Some(o) = started.as_object_mut() {
+        o.extend(extra.clone());
+    }
     state::append_event(
         &tx,
         &NewEvent {
             task_id: Some(task_id.clone()),
             run_id: Some(run_id.clone()),
             event_type: event_type::REVIEW_STARTED.to_string(),
-            detail: serde_json::json!({
-                "target_run_id": target.run_id,
-                "attempt": target.attempt,
-                "candidate_commit": candidate,
-                "worktree": wt.display().to_string(),
-                "worktree_reused": outcome == worktree::EnsureOutcome::Reused,
-                "cleared_stale_report": cleared_stale_report,
-                "profile": profile.profile_id,
-                "model": choice.model,
-                "allowed_tools": allowed_tools,
-                "timeout_seconds": args.timeout_seconds,
-            }),
+            detail: started,
         },
     )?;
+    let source = if is_confirm { auto_pick::SOURCE_REVIEW_CONFIRM } else { auto_pick::SOURCE_REVIEW_START };
     // RJ-1: what was launched and why.
     state::append_event(
         &tx,
@@ -592,7 +834,7 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
             event_type: event_type::LAUNCH_CHOICE.to_string(),
             detail: auto_pick::LaunchChoice {
                 role: role::REVIEWER,
-                source: auto_pick::SOURCE_REVIEW_START,
+                source,
                 task_spec: &task.spec,
                 risk: &task.risk,
                 profile: &profile.profile_id,
@@ -630,7 +872,7 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
             &profile.profile_id,
             &task_id,
             &run_id,
-            auto_pick::SOURCE_REVIEW_START,
+            source,
         ) {
             warnings.push(format!(
                 "profile {} passed its auth check, but marking it active again failed: {e}; run \
@@ -666,13 +908,13 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
             masked_eprintln!("warning: {w}");
         }
     }
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "ok": true,
         "run_id": run_id,
         "task_id": task_id,
         "target_run_id": target.run_id,
         "attempt": target.attempt,
-        "candidate_commit": candidate,
+        "candidate_commit": reviewed_commit,
         "profile": profile.profile_id,
         "model": choice.model,
         "worktree": wt.display().to_string(),
@@ -685,16 +927,26 @@ pub fn start(paths: &Paths, cwd: &Path, args: StartArgs<'_>) -> Result<i32> {
         "effort": launch.effort,
         "effort_note": launch.effort_note,
         "warnings": warnings,
+        "mode": mode.as_str(),
     });
+    if let Some(o) = v.as_object_mut() {
+        o.extend(extra);
+    }
+    let what = match mode {
+        ReviewMode::Review => "review",
+        ReviewMode::Edit => "review (edit mode)",
+        ReviewMode::Confirm => "confirm",
+    };
     output::emit(
         args.json,
         &v,
         &format!(
-            "review {run_id} started on {} (task {task_id}, candidate {}, profile {}, runner pid {runner_pid})\n\
+            "{what} {run_id} started on {} (task {task_id}, {} {}, profile {}, runner pid {runner_pid})\n\
              the task stays in_review until the verdict lands; block on it with \
              `thoth wait --run {run_id}`, or watch `thoth events`",
             choice.model,
-            crate::evidence::short_sha(&candidate),
+            if is_confirm { "fix" } else { "candidate" },
+            crate::evidence::short_sha(&reviewed_commit),
             plan_label::named(
                 &profile.profile_id,
                 plan_label::labels(&gconn).get(&profile.profile_id).map(String::as_str),
@@ -714,9 +966,15 @@ pub struct ReviewIngest {
     pub verdict: Option<Verdict>,
     /// Codes the review cites that it never opened (brief §8). A warning only.
     pub unopened_citations: Vec<String>,
+    /// RFIX-1: the ingest already wrote the task's status (a confirm), or
+    /// must leave it alone; the runner writes none.
+    pub settled: bool,
+    /// RFIX-1: the run's `candidate_commit` when the ingest moved the
+    /// worktree (an edit review's fix, or its reset).
+    pub candidate_commit: Option<String>,
 }
 
-fn review_invalid(
+pub(crate) fn review_invalid(
     conn: &Connection,
     run: &Run,
     reason: String,
@@ -743,6 +1001,8 @@ fn review_invalid(
         // invalid leaves the task `unverified`, never `pass`.
         verdict: Some(Verdict::Unverified),
         unopened_citations: Vec::new(),
+        settled: false,
+        candidate_commit: None,
     }
 }
 
@@ -751,9 +1011,9 @@ fn review_invalid(
 /// (`schema` / `spec` / `coverage` / `citation`), *before* `reason` is merged
 /// into it - both callers merge it in the same way, so it lives here rather
 /// than in the error itself.
-struct ReviewValidationError {
-    reason: String,
-    detail: serde_json::Value,
+pub(crate) struct ReviewValidationError {
+    pub(crate) reason: String,
+    pub(crate) detail: serde_json::Value,
 }
 
 /// v6 §4/§8, thin-adapter Task 1: parse a `review.json` document, check it
@@ -763,7 +1023,7 @@ struct ReviewValidationError {
 /// from a commander outside thoth), so both are held to identical rules -
 /// same stage names, same messages - and the reviewer-run path's existing
 /// tests keep exercising this logic unedited.
-fn validate_review_document(
+pub(crate) fn validate_review_document(
     conn: &Connection,
     task_id: &str,
     task: &state::Task,
@@ -838,7 +1098,7 @@ fn validate_review_document(
 /// thin-adapter Task 1 fix round 1 (F3): the `reviews` row shape, shared by
 /// the reviewer-run path and `record` - only `target_run_id` and
 /// `reviewer_run_id` differ between the two.
-fn new_review_row(
+pub(crate) fn new_review_row(
     target_run_id: String,
     reviewer_run_id: Option<String>,
     verdict: Verdict,
@@ -866,20 +1126,20 @@ fn new_review_row(
 /// the two keys `record` needs on top - `reviewer_run_id: null` and
 /// `source: "external"` - without touching the reviewer-run path's shape at
 /// all.
-struct VerdictEventShape<'a> {
-    verdict: Verdict,
-    review_id: &'a str,
-    target_run_id: &'a str,
-    doc: &'a review_json::ReviewDocument,
-    cited: &'a [String],
-    opened: Option<&'a [String]>,
-    unopened: Option<&'a [String]>,
-    source: Option<&'a str>,
+pub(crate) struct VerdictEventShape<'a> {
+    pub(crate) verdict: Verdict,
+    pub(crate) review_id: &'a str,
+    pub(crate) target_run_id: &'a str,
+    pub(crate) doc: &'a review_json::ReviewDocument,
+    pub(crate) cited: &'a [String],
+    pub(crate) opened: Option<&'a [String]>,
+    pub(crate) unopened: Option<&'a [String]>,
+    pub(crate) source: Option<&'a str>,
 }
 
 /// The `verdict` event's `detail`, shared by the reviewer-run path and
 /// `record`. See `VerdictEventShape` for what each field means.
-fn verdict_event_detail(shape: VerdictEventShape<'_>) -> serde_json::Value {
+pub(crate) fn verdict_event_detail(shape: VerdictEventShape<'_>) -> serde_json::Value {
     let VerdictEventShape {
         verdict,
         review_id,
@@ -1009,18 +1269,24 @@ pub fn ingest_review(
         );
     }
 
+    let note = if doc.findings.sources.is_empty() {
+        format!("{} over {} criteria", verdict.as_str(), doc.findings.criteria.len())
+    } else {
+        format!("{} over {} sources", verdict.as_str(), doc.findings.sources.len())
+    };
     ReviewIngest {
         outcome: IngestOutcome::Ok {
-            summary: if doc.findings.sources.is_empty() { format!(
-                "{} over {} criteria",
-                verdict.as_str(),
-                doc.findings.criteria.len()
-            ) } else { format!("{} over {} sources", verdict.as_str(), doc.findings.sources.len()) },
+            summary: note.clone(),
             // `claims` belong to the implementer; a review writes none.
             claim_count: 0,
+            // A review writes no `result_ingested`, so its run note keeps
+            // this text.
+            brief: note,
         },
         verdict: Some(verdict),
         unopened_citations: unopened,
+        settled: false,
+        candidate_commit: None,
     }
 }
 
@@ -1367,10 +1633,18 @@ pub fn record(paths: &Paths, cwd: &Path, args: RecordArgs<'_>) -> Result<i32> {
     Ok(0)
 }
 
-pub fn show(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> {
-    let (_repo_id, _root, conn) = crate::commands::task::open_repo(paths, cwd)?;
+/// `thoth review show <task>`. BRIEF-1: `brief` leads with the newest
+/// review's short conclusion; the worker's `claims` are left out (`null`)
+/// unless `full` asks for them, since `task result` already has them.
+pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> Result<i32> {
+    let (_repo_id, root, conn) = crate::commands::task::open_repo(paths, cwd)?;
     let task_id = ids::resolve_prefix(&state::list_task_ids(&conn)?, needle)?;
     let reviews = state::list_reviews_for_task(&conn, &task_id)?;
+    let task = state::get_task(&conn, &task_id)?
+        .ok_or_else(|| anyhow::anyhow!("task {task_id} disappeared"))?;
+    // RFIX-1: the fix and what to merge.
+    let fix_state = review_fix::state(&conn, &task)?;
+    let (merge_branch, merge_commit) = review_fix::merge_target(&conn, &root, &task, &fix_state)?;
     // L10: one schema, whether or not a review exists. A script reading
     // `review show --json` should test `review_count` (or `verdict == null`),
     // never have to cope with a different set of keys.
@@ -1389,8 +1663,14 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> 
                 "cited": [],
                 "opened": [],
                 "unopened_citation": [],
-                "claims": [],
+                "claims": if full { serde_json::json!([]) } else { serde_json::Value::Null },
                 "source": serde_json::Value::Null,
+                "brief": serde_json::Value::Null,
+                "mode": serde_json::Value::Null,
+                "pending_fix": false,
+                "fix": serde_json::Value::Null,
+                "merge_branch": serde_json::Value::Null,
+                "merge_commit": serde_json::Value::Null,
             }),
             &format!("no review recorded for {task_id}; run `thoth review start {task_id} --profile <id>`"),
         );
@@ -1409,7 +1689,9 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> 
     // is nothing to attribute a run-less `evidence_opened` event to, so
     // "opened" and "unopened_citation" are reported as not applicable rather
     // than as an empty (and misleadingly clean-looking) list.
-    let source = if latest.reviewer_run_id.is_some() {
+    let source = if fix_state.mode.as_deref() == Some(ReviewMode::Confirm.as_str()) {
+        review_fix::SOURCE_AUTHOR_CHECK
+    } else if latest.reviewer_run_id.is_some() {
         "reviewer_run"
     } else {
         "external"
@@ -1457,6 +1739,7 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> 
         })
         .collect();
 
+    let brief = crate::brief::for_review(&crate::redact::Masker::current(), &latest.verdict, &doc.findings);
     let v = serde_json::json!({
         "task_id": task_id,
         "review_count": reviews.len(),
@@ -1469,8 +1752,14 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> 
         "cited": cited,
         "opened": opened,
         "unopened_citation": unopened,
-        "claims": claims,
+        "claims": if full { serde_json::json!(claims) } else { serde_json::Value::Null },
         "source": source,
+        "brief": brief.as_ref().map(|b| b.text.clone()),
+        "mode": fix_state.mode,
+        "pending_fix": fix_state.pending_fix,
+        "fix": fix_state.fix,
+        "merge_branch": merge_branch,
+        "merge_commit": merge_commit,
     });
 
     let reviewer_label = match &latest.reviewer_run_id {
@@ -1483,6 +1772,10 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> 
         reviews.len(),
         reviews.len(),
     )];
+    // BRIEF-1: the findings below are the full text.
+    if let Some(b) = &brief {
+        lines.push(crate::brief::human_lines(b, "the findings below"));
+    }
     for c in &doc.findings.criteria {
         lines.push(format!(
             "  {:<6} {:<6} {:<20} {}",
@@ -1513,7 +1806,8 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> 
             ));
         }
     }
-    for c in &claims {
+    lines.extend(fix_lines(&task_id, &fix_state, &v));
+    for c in claims.iter().filter(|_| full) {
         lines.push(format!(
             "  claim  {:<14} {:<22} {}",
             c["kind"].as_str().unwrap_or(""),
@@ -1530,4 +1824,55 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> 
     }
     output::emit(json, &v, &lines.join("\n"));
     Ok(0)
+}
+
+/// RFIX-1: `review show`'s human lines about the fix: one for the fix, one
+/// per edit, the next step while it is pending, and what to merge after a
+/// PASS.
+fn fix_lines(task_id: &str, st: &review_fix::State, shown: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let fix = &st.fix;
+    if fix.is_object() {
+        if fix["applied"] == serde_json::json!(true) {
+            lines.push(format!(
+                "  fix    applied  commit {} on {}, {} file(s), {} line(s)",
+                fix["fix_commit"].as_str().map(crate::evidence::short_sha).unwrap_or_default(),
+                fix["fix_branch"].as_str().unwrap_or(""),
+                fix["file_count"].as_u64().unwrap_or(0),
+                fix["changed_lines"].as_u64().unwrap_or(0)
+            ));
+        } else if let Some(stage) = fix["stage"].as_str() {
+            lines.push(format!(
+                "  fix    refused  stage {stage}: {}",
+                fix["reason"].as_str().unwrap_or("")
+            ));
+        }
+        for e in fix["edits"].as_array().into_iter().flatten() {
+            let reason: String = e["reason"].as_str().unwrap_or("").chars().take(60).collect();
+            lines.push(format!(
+                "  edit {}  {}  {}  {}  {reason}",
+                e["index"].as_u64().unwrap_or(0),
+                e["path"].as_str().unwrap_or(""),
+                e["criterion"].as_str().unwrap_or(""),
+                e["fix_size"].as_str().unwrap_or("-"),
+            ));
+        }
+    }
+    if st.pending_fix {
+        let run = st
+            .applied
+            .as_ref()
+            .and_then(|(r, _)| r.reviewer_run_id.clone())
+            .unwrap_or_default();
+        lines.push(format!(
+            "  next: thoth verify {run}, then thoth review confirm {task_id} --profile P --model M --effort E"
+        ));
+    }
+    if let (Some(b), Some(c)) = (shown["merge_branch"].as_str(), shown["merge_commit"].as_str()) {
+        lines.push(format!(
+            "  merge: {b} at {}; read the change before you merge it",
+            crate::evidence::short_sha(c)
+        ));
+    }
+    lines
 }

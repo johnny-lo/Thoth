@@ -55,18 +55,20 @@ fn prompt_of(f: &Fixture, run_id: &str) -> String {
     std::fs::read_to_string(std::path::Path::new(&run_dir).join("prompt.txt")).unwrap()
 }
 
-/// The newest `result_invalid` detail of a run.
-fn invalid_detail(f: &Fixture, run_id: &str) -> Value {
-    let detail: String = f
-        .state_conn()
-        .query_row(
-            "SELECT detail FROM events WHERE run_id = ?1 AND type = 'result_invalid' \
-             ORDER BY seq DESC LIMIT 1",
-            [run_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    serde_json::from_str(&detail).unwrap()
+/// LEAN-1: a run's prompt.txt, found through `status TASK --json`'s
+/// `runs[].run_dir`.
+fn prompt_via_status(f: &Fixture, task_id: &str, run_id: &str) -> String {
+    let run = f.run_of(task_id, run_id);
+    std::fs::read_to_string(std::path::Path::new(run["run_dir"].as_str().unwrap()).join("prompt.txt"))
+        .unwrap()
+}
+
+/// LEAN-1: a run's events of one type, from `events --task TASK --json`.
+fn run_events(f: &Fixture, task_id: &str, run_id: &str, ty: &str) -> Vec<Value> {
+    f.events_json(task_id)
+        .into_iter()
+        .filter(|e| e["run_id"] == run_id && e["type"] == ty)
+        .collect()
 }
 
 /// The `protected_changes` of a run's diff evidence.
@@ -195,10 +197,11 @@ fn an_added_test_file_is_not_a_protected_change() {
     assert_eq!(section.matches("- (none)\n").count(), 2, "no changes, no claims:\n{section}");
 }
 
-/// AC2 + AC3 + AC4: a file matching one of the repo's extra patterns is a
-/// protected test file; modifying it undeclared is rule 6.
+/// AC2 + AC3: a file matching one of the repo's extra patterns is a
+/// protected test file. LEAN-1: modifying it undeclared is listed, not
+/// refused (rule 6 is retired).
 #[test]
-fn modifying_a_file_under_an_extra_pattern_must_be_declared() {
+fn modifying_a_file_under_an_extra_pattern_is_listed_without_a_declaration() {
     let f = initialised();
     f.add_profile("claude-b");
     f.cmd().args(["checks", "protect", "a.txt"]).assert().success();
@@ -206,30 +209,21 @@ fn modifying_a_file_under_an_extra_pattern_must_be_declared() {
     let d = dispatch_hooks(&f, &task_id, &[("FAKE_WRITE_FILE", "a.txt")]);
     let run_id = d["run_id"].as_str().unwrap().to_string();
     let (_, status) = f.wait_for(&task_id, "180s");
-    assert_eq!(status, "unverified");
+    assert_eq!(status, "in_review", "{}", f.explain_task(&task_id));
 
     assert_eq!(
         diff_protected(&f, &task_id, &run_id),
         json!([{"path": "a.txt", "status": "modified", "kind": "test"}])
     );
-    let detail = invalid_detail(&f, &run_id);
-    assert_eq!(detail["rule"], 6);
-    assert_eq!(
-        detail["reason"],
-        "claim missing for protected file a.txt (modified): add a claim of kind protected_change \
-         whose text starts with the path and explains the change"
-    );
-    assert_eq!(detail["path"], "a.txt");
-    assert_eq!(detail["status"], "modified");
-    assert_eq!(detail["kind"], "test");
+    assert!(run_events(&f, &task_id, &run_id, "result_invalid").is_empty());
+    assert_eq!(run_events(&f, &task_id, &run_id, "result_ingested").len(), 1);
 }
 
 /// AC9, AC5, AC6 end to end. The catalogue holds `cargo test`; the worker adds
-/// `cargo.bat` without declaring it and is refused by rule 6; the reroute
-/// prompt quotes the reason; the worker declares it and is accepted; the
-/// packet and the Claude reviewer's prompt both list the file.
+/// `cargo.bat` and (optionally, LEAN-1) declares it; the delivery is
+/// accepted; the packet and the Claude reviewer's prompt both list the file.
 #[test]
-fn an_added_file_named_like_a_check_word_must_be_declared() {
+fn an_added_file_named_like_a_check_word_is_listed_and_approved() {
     let f = initialised();
     f.add_profile("claude-b");
     f.add_profile("claude-a");
@@ -239,46 +233,31 @@ fn an_added_file_named_like_a_check_word_must_be_declared() {
         .success();
     let (task_id, _) = f.create_task(Fixture::SPEC_TWO_AC);
 
-    // --- first run: cargo.bat added, not declared ---------------------------
-    let d = dispatch_hooks(&f, &task_id, &[("FAKE_WRITE_FILE", "cargo.bat")]);
+    // --- the run: cargo.bat added, with an optional declaration ---------------
+    let d = dispatch_hooks(
+        &f,
+        &task_id,
+        &[
+            ("FAKE_WRITE_FILE", "cargo.bat"),
+            ("FAKE_PROTECTED_CLAIM", "cargo.bat: a wrapper the task asked for"),
+        ],
+    );
     let first_run = d["run_id"].as_str().unwrap().to_string();
     let (_, status) = f.wait_for(&task_id, "180s");
-    assert_eq!(status, "unverified");
+    assert_eq!(status, "in_review", "{}", f.explain_task(&task_id));
 
     assert_eq!(
         diff_protected(&f, &task_id, &first_run),
         json!([{"path": "cargo.bat", "status": "added", "kind": "check_word"}]),
         "tests/added_test.rs is added too, and is not listed"
     );
-    let detail = invalid_detail(&f, &first_run);
-    assert_eq!(detail["rule"], 6);
-    let reason = detail["reason"].as_str().unwrap().to_string();
-    assert!(reason.contains("cargo.bat"), "{reason}");
-    assert!(reason.contains("added"), "{reason}");
-    assert_eq!(detail["status"], "added");
-    assert_eq!(detail["kind"], "check_word");
+    assert!(run_events(&f, &task_id, &first_run, "result_invalid").is_empty());
 
-    // AC5: the first prompt told the worker about protected files and the words
-    let first_prompt = prompt_of(&f, &first_run);
+    // AC5: the prompt told the worker about protected files and the words
+    let first_prompt = prompt_via_status(&f, &task_id, &first_run);
     let section = &first_prompt[first_prompt.find("\n## Protected files\n").expect("section")..];
     assert!(section.contains("Check words: cargo, test\n"), "{section}");
     assert!(!first_prompt.contains("was not accepted"));
-
-    // --- second run: same worktree, the file is declared ---------------------
-    let d2 = dispatch_hooks(
-        &f,
-        &task_id,
-        &[("FAKE_PROTECTED_CLAIM", "cargo.bat: a wrapper the task asked for")],
-    );
-    let second_run = d2["run_id"].as_str().unwrap().to_string();
-    assert_eq!(d2["worktree_reused"].as_bool(), Some(true));
-    let (_, status) = f.wait_for(&task_id, "180s");
-    assert_eq!(status, "in_review", "{}", f.explain_task(&task_id));
-
-    // AC5: the reroute prompt quotes rule 6's reason
-    let second_prompt = prompt_of(&f, &second_run);
-    assert!(second_prompt.contains("was not accepted"), "{second_prompt}");
-    assert!(second_prompt.contains(&reason), "{second_prompt}");
 
     // --- AC6: the packet ------------------------------------------------------
     let md = String::from_utf8(
@@ -303,8 +282,8 @@ fn an_added_file_named_like_a_check_word_must_be_declared() {
             .clone(),
     );
     let listed = v["protected_changes"].as_array().unwrap();
-    assert_eq!(listed.len(), 2, "one per diff evidence: {listed:?}");
-    for (entry, run) in listed.iter().zip([&first_run, &second_run]) {
+    assert_eq!(listed.len(), 1, "one per diff evidence: {listed:?}");
+    for (entry, run) in listed.iter().zip([&first_run]) {
         let mut keys: Vec<&str> = entry.as_object().unwrap().keys().map(|s| s.as_str()).collect();
         keys.sort();
         assert_eq!(keys, ["code", "kind", "path", "run_id", "status"]);
@@ -318,7 +297,7 @@ fn an_added_file_named_like_a_check_word_must_be_declared() {
     // --- AC6: the Claude reviewer's prompt -------------------------------------
     // LESS-5: review start waits until the run's check-word file is approved.
     f.cmd()
-        .args(["checks", "approve", "--run", &second_run, "--reason", "test approval", "--json"])
+        .args(["checks", "approve", "--run", &first_run, "--reason", "test approval", "--json"])
         .assert()
         .success();
     let r = f.review_start(&task_id, "claude-a", "review_pass", &["--model", "haiku"]);
@@ -327,7 +306,7 @@ fn an_added_file_named_like_a_check_word_must_be_declared() {
         .args(["wait", "--run", &reviewer_run, "--timeout", "180s", "--json"])
         .assert()
         .success();
-    let review_prompt = prompt_of(&f, &reviewer_run);
+    let review_prompt = prompt_via_status(&f, &task_id, &reviewer_run);
     let list_at = review_prompt
         .find("Protected files this candidate changed")
         .expect(&review_prompt);
@@ -476,10 +455,10 @@ fn a_change_a_merge_of_main_brought_in_needs_no_claim() {
 }
 
 /// SMALL-4 AC5 (t3): after a merge commit of main, the task edits a
-/// pre-existing test itself; that one still needs a claim, the test main
-/// changed does not.
+/// pre-existing test itself; that one is still listed, the test main changed
+/// is not. LEAN-1: listed, and accepted without a claim.
 #[test]
-fn a_pre_existing_test_the_task_edits_after_merging_main_still_needs_a_claim() {
+fn a_pre_existing_test_the_task_edits_after_merging_main_is_still_listed() {
     let f = initialised();
     f.add_profile("claude-b");
     let repo = f.repo_path();
@@ -512,24 +491,10 @@ fn a_pre_existing_test_the_task_edits_after_merging_main_still_needs_a_claim() {
     let d2 = dispatch_hooks(&f, &task, &[("FAKE_WRITE_FILE", "tests/pre_test.rs")]);
     let run2 = d2["run_id"].as_str().unwrap().to_string();
     let (_, status) = f.wait_for(&task, "180s");
-    assert_eq!(status, "unverified");
+    assert_eq!(status, "in_review", "{}", f.explain_task(&task));
     assert_eq!(
         diff_protected(&f, &task, &run2),
         json!([{"path": "tests/pre_test.rs", "status": "modified", "kind": "test"}])
     );
-    let detail = invalid_detail(&f, &run2);
-    assert_eq!(detail["rule"], 6);
-    assert_eq!(detail["path"], "tests/pre_test.rs");
-    assert_eq!(detail["status"], "modified");
-
-    dispatch_hooks(
-        &f,
-        &task,
-        &[
-            ("FAKE_WRITE_FILE", "tests/pre_test.rs"),
-            ("FAKE_PROTECTED_CLAIM", "tests/pre_test.rs: AC1 needs the new assertion"),
-        ],
-    );
-    let (_, status) = f.wait_for(&task, "180s");
-    assert_eq!(status, "in_review", "{}", f.explain_task(&task));
+    assert!(run_events(&f, &task, &run2, "result_invalid").is_empty());
 }

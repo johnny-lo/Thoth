@@ -1,22 +1,30 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { ThothCheck, ThothSnapshot, ThothTable, ThothWorker } from '../types'
+import type { ThothCheck, ThothConfirm, ThothLogin, ThothSnapshot, ThothTable, ThothTask, ThothWorker } from '../types'
 import { langOf, t } from './i18n'
 import type { Lang } from './i18n'
 import {
+  accountOf,
+  actionArgs,
   bandText,
   checkLine,
+  CLOSABLE,
   commanderCount,
+  confirmStillFits,
+  confirmText,
   cursorKey,
+  errorText,
   fit,
   groupTasks,
-  named,
+  loginNames,
+  newestImplementerRun,
   newestRun,
   nextDelay,
   needsYouCount,
   parseChecks,
   parseEvents,
+  parseLogins,
   parseOutsideRepo,
   parseProfiles,
   parseRuns,
@@ -43,16 +51,20 @@ import {
 } from './model'
 import type { Ran } from './model'
 
-// The panel only reads: every value comes from the thoth CLI's --json output.
+// Every value comes from the thoth CLI's --json output. The panel writes only after a second press:
+// cancel a live run, close a task, or dispatch it again exactly as its last run.
 const PANE = 'thoth'
 const RUN_PANE = 'thoth-run'
 const TITLE = 'Thoth'
 const THOTH_TIMEOUT_MS = 20_000
+const WRITE_TIMEOUT_MS = 60_000
 const snapshot = atom({ plugin: 'thoth', key: 'snapshot' } as const, null)
 const project = atom({ plugin: 'thoth', key: 'project' } as const, '')
 // The task whose worker the run pane shows, and what was last read of that worker.
 const watching = atom({ plugin: 'thoth', key: 'watching' } as const, null)
 const worker = atom({ plugin: 'thoth', key: 'worker' } as const, null)
+// The Cancel, Close task or Dispatch again waiting for its second press.
+const confirming = atom({ plugin: 'thoth', key: 'confirming' } as const, null)
 
 // A Text prop set that marks a line red, or leaves it as it is.
 const red = (isRed: boolean) => (isRed ? { color: 'red' } : {})
@@ -76,13 +88,13 @@ async function projectOf($: EngineInterface): Promise<string> {
 }
 
 /** Runs thoth in `cwd`, else the repository's root; null when it could not start or timed out. */
-async function thoth($: EngineInterface, options: Options, args: string[], cwd = ''): Promise<Ran> {
+async function thoth($: EngineInterface, options: Options, args: string[], cwd = '', timeoutMs = THOTH_TIMEOUT_MS): Promise<Ran> {
   const env: Record<string, string> = options.thothHome ? { THOTH_HOME: options.thothHome } : {}
   try {
     return await $.process.run([options.thothBin || 'thoth', ...args], {
       cwd: cwd || (await read($, project)),
       env,
-      timeoutMs: THOTH_TIMEOUT_MS,
+      timeoutMs,
     })
   } catch {
     return null
@@ -121,6 +133,19 @@ async function readTable($: EngineInterface, options: Options, force: boolean): 
   return tableKnown
 }
 
+// `profile list --json` names each account's login: at most once a minute too; a failure is no names.
+const LOGINS_EVERY_MS = 60_000
+let loginsAt: number | null = null
+let loginsKnown: ThothLogin[] = []
+
+async function readLogins($: EngineInterface, options: Options, force: boolean): Promise<ThothLogin[]> {
+  const now = await $.clock.now()
+  if (!force && loginsAt !== null && now - loginsAt < LOGINS_EVERY_MS) return loginsKnown
+  loginsAt = now
+  loginsKnown = parseLogins(await thoth($, options, ['profile', 'list', '--json'])) ?? []
+  return loginsKnown
+}
+
 // The decisions plugin's cards, read only; none when it is not installed or unreadable.
 async function cardCount($: EngineInterface): Promise<number> {
   try {
@@ -132,7 +157,7 @@ async function cardCount($: EngineInterface): Promise<number> {
 }
 
 async function readSnapshot($: EngineInterface, options: Options, force: boolean): Promise<ThothSnapshot> {
-  const fetched = { tasks: [], outsideRepo: false, checks: [], table: null, profiles: [], usageFailed: false, problemText: '' }
+  const fetched = { tasks: [], outsideRepo: false, checks: [], table: null, profiles: [], usageFailed: false, logins: [], problemText: '' }
   const status = await thoth($, options, ['status', '--json'])
   const problem = statusProblem(status)
   if (problem !== null || status === null) {
@@ -143,6 +168,7 @@ async function readSnapshot($: EngineInterface, options: Options, force: boolean
   // Checks belong to one repository: outside one there are none to list.
   const checks = outsideRepo ? [] : await readChecks($, options, force)
   const table = await readTable($, options, force)
+  const logins = await readLogins($, options, force)
   return {
     ...fetched,
     tasks: parseTasks(status.stdout),
@@ -151,6 +177,7 @@ async function readSnapshot($: EngineInterface, options: Options, force: boolean
     table,
     profiles: profiles ?? [],
     usageFailed: profiles === null,
+    logins,
     fetchedAt: await $.clock.now(),
     problem: null,
   }
@@ -203,6 +230,7 @@ async function announce($: EngineInterface, options: Options, current: ThothSnap
     await read($, titles),
     options.language,
     planLabels(current.profiles),
+    loginNames(current.logins),
   )
   if (fresh.lastSeq > seen) {
     await update($, cursor, () => fresh.lastSeq)
@@ -310,6 +338,9 @@ async function refresh($: EngineInterface, options: Options, force = false): Pro
     const fresh = await readSnapshot($, options, force)
     drawn = fresh
     await update($, snapshot, () => fresh)
+    try {
+      await dropUnfitConfirm($, fresh)
+    } catch {}
     if (fresh.problem === null) {
       try {
         await update($, titles, known => rememberTitles(known, fresh.tasks))
@@ -332,6 +363,100 @@ async function refresh($: EngineInterface, options: Options, force = false): Pro
   })
 }
 
+/** Drops a waiting action once the task left its section or its live run changed. */
+async function dropUnfitConfirm($: EngineInterface, current: ThothSnapshot): Promise<void> {
+  const waiting = await read($, confirming)
+  if (waiting !== null && !confirmStillFits(waiting, current)) await update($, confirming, () => null)
+}
+
+/** Where a task's commands run: its own repository outside one, else the project. */
+const repoOf = (task: ThothTask, outsideRepo: boolean) => (outsideRepo ? task.repo : '')
+
+function waitingAction(kind: ThothConfirm['kind'], task: ThothTask, outsideRepo: boolean): ThothConfirm {
+  return {
+    kind,
+    task_id: task.task_id,
+    title: task.title,
+    repo: repoOf(task, outsideRepo),
+    run_id: '',
+    role: '',
+    profile: '',
+    model: '',
+    effort: null,
+    blocked: null,
+  }
+}
+
+/** First press of Cancel: nothing runs; the live run is the one a confirm stops. */
+async function askCancel($: EngineInterface, task: ThothTask, outsideRepo: boolean): Promise<void> {
+  const live = task.live_run
+  if (!live) return
+  const next = { ...waitingAction('cancel', task, outsideRepo), run_id: live.run_id, role: live.role, profile: live.profile, model: live.model }
+  await update($, confirming, () => next)
+}
+
+/** First press of Close task: nothing runs. */
+async function askClose($: EngineInterface, task: ThothTask, outsideRepo: boolean): Promise<void> {
+  const next = waitingAction('close', task, outsideRepo)
+  await update($, confirming, () => next)
+}
+
+/** First press of Dispatch again: reads the task's last implementer run, writes nothing. */
+async function askAgain($: EngineInterface, options: Options, task: ThothTask, outsideRepo: boolean): Promise<void> {
+  const lang = options.language
+  const title = taskName(task.title, lang)
+  const ran = await thoth($, options, ['status', task.task_id, '--json'], repoOf(task, outsideRepo))
+  if (ran === null) {
+    $.ui.toast(t(lang, 'actionTimedOut'))
+    return
+  }
+  const runs = parseRuns(ran)
+  if (runs === null) {
+    $.ui.toast(t(lang, 'actionFailed', { title, text: errorText(ran) }))
+    return
+  }
+  const last = newestImplementerRun(runs)
+  if (last === null) {
+    $.ui.toast(t(lang, 'noEarlierRun', { title }))
+    return
+  }
+  // The same account is out of quota or logged out: say what to do, offer no confirm.
+  const stuck = last.interrupted_reason === 'quota' || last.interrupted_reason === 'auth'
+  const next = {
+    ...waitingAction('again', task, outsideRepo),
+    run_id: last.run_id,
+    profile: last.profile,
+    model: last.model,
+    effort: last.effort_requested,
+    blocked: stuck ? (last.next_step ?? '') : null,
+  }
+  await update($, confirming, () => next)
+}
+
+// The tasks whose confirmed action is running: another confirm meanwhile runs nothing.
+const acting = new Set<string>()
+
+/** Second press: runs the waiting action once, says how it went, and refreshes. */
+async function runConfirmed($: EngineInterface, options: Options, taskId: string): Promise<void> {
+  const lang = options.language
+  const waiting = await read($, confirming)
+  if (waiting === null || waiting.task_id !== taskId || waiting.blocked !== null || acting.has(taskId)) return
+  acting.add(taskId)
+  try {
+    await update($, confirming, () => null)
+    if (!confirmStillFits(waiting, await read($, snapshot))) return
+    const ran = await thoth($, options, actionArgs(waiting), waiting.repo, WRITE_TIMEOUT_MS)
+    const title = taskName(waiting.title, lang)
+    const done = waiting.kind === 'cancel' ? 'done.cancel' : waiting.kind === 'close' ? 'done.close' : 'done.again'
+    if (ran === null) $.ui.toast(t(lang, 'actionTimedOut'))
+    else if (ran.exitCode === 0) $.ui.toast(t(lang, done, { title }))
+    else $.ui.toast(t(lang, 'actionFailed', { title, text: errorText(ran) }))
+  } finally {
+    acting.delete(taskId)
+  }
+  await refresh($, options)
+}
+
 async function openReport($: EngineInterface, options: Options, section?: string): Promise<void> {
   const ran = await thoth($, options, section ? ['report', '--open', '--section', section] : ['report', '--open'])
   if (ran === null || ran.exitCode !== 0) $.ui.toast(t(options.language, 'reportFailed'))
@@ -348,9 +473,12 @@ export const register: Register = (on, raw) => {
     checksKnown = []
     tableAt = null
     tableKnown = null
-    // The engine keeps the last session's state: nothing is being watched yet, and a pane left over
-    // from before a reload would only show an empty list.
+    loginsAt = null
+    loginsKnown = []
+    // The engine keeps the last session's state: nothing is being watched yet, no action waits for a
+    // second press, and a pane left over from before a reload would only show an empty list.
     try {
+      await update($, confirming, () => null)
       await update($, watching, () => null)
       await update($, worker, () => null)
       await $.ui.close({ id: 'thoth-run' })
@@ -408,7 +536,32 @@ export const register: Register = (on, raw) => {
     const cards = await cardCount($)
     const rule = (label: string) => fit(`── ${label} ${'─'.repeat(Math.max(0, columns - textWidth(label) - 4))}`, columns)
     const outside = current.outsideRepo
-    const line = (task: (typeof current.tasks)[number]) => fit(taskLineIn(task, outside, lang), columns)
+    const account = accountOf(current, lang)
+    const line = (task: (typeof current.tasks)[number]) => fit(taskLineIn(task, outside, lang, account), columns)
+    // The action waiting for its second press, while it still fits the task as drawn.
+    const waiting = await read($, confirming)
+    const open = waiting !== null && confirmStillFits(waiting, current) ? waiting : null
+    const yes = { cancel: 'yesCancel', close: 'yesClose', again: 'yesAgain' } as const
+    const confirmBlock = (task: ThothTask) => {
+      if (open === null || open.task_id !== task.task_id) return null
+      return (
+        <Box key={`confirming:${task.task_id}`} flexDirection="column">
+          <Text color="yellow" wrap="wrap">
+            {open.blocked ?? confirmText(open, lang, account)}
+          </Text>
+          <Box flexDirection="row" gap={1}>
+            {open.blocked === null && (
+              <Button
+                key={`confirm:${task.task_id}`}
+                label={t(lang, yes[open.kind])}
+                onPress={() => runConfirmed($, options, task.task_id)}
+              />
+            )}
+            <Button key={`back:${task.task_id}`} label={t(lang, 'back')} onPress={() => update($, confirming, () => null)} />
+          </Box>
+        </Box>
+      )
+    }
     const watch = async (task: { task_id: string; title: string; repo: string }) => {
       // Outside a repository the worker is read in its task's repository; inside, in the project.
       await update($, watching, () => ({ task_id: task.task_id, title: task.title, repo: outside ? task.repo : '' }))
@@ -443,7 +596,14 @@ export const register: Register = (on, raw) => {
               />
               <Button key={`report:${task.task_id}`} label={t(lang, 'report')} onPress={() => openReport($, options)} />
               <Button key={`watch:${task.task_id}`} label={t(lang, 'watch')} onPress={() => watch(task)} />
+              {CLOSABLE.includes(task.status) && (
+                <Button key={`close:${task.task_id}`} label={t(lang, 'closeTask')} onPress={() => askClose($, task, outside)} />
+              )}
+              {CLOSABLE.includes(task.status) && (
+                <Button key={`again:${task.task_id}`} label={t(lang, 'again')} onPress={() => askAgain($, options, task, outside)} />
+              )}
             </Box>
+            {confirmBlock(task)}
           </Box>
         ))}
         {current.checks.map(check => (
@@ -454,14 +614,20 @@ export const register: Register = (on, raw) => {
         {inProgress.map(task => (
           <Box key={`task:${task.task_id}`} flexDirection="column">
             <Text {...red(task.any_heartbeat_stale)}>{line(task)}</Text>
-            <Button key={`watch:${task.task_id}`} label={t(lang, 'watch')} onPress={() => watch(task)} />
+            <Box flexDirection="row" gap={1}>
+              <Button key={`watch:${task.task_id}`} label={t(lang, 'watch')} onPress={() => watch(task)} />
+              {task.live_run && (
+                <Button key={`cancel:${task.task_id}`} label={t(lang, 'cancel')} onPress={() => askCancel($, task, outside)} />
+              )}
+            </Box>
+            {confirmBlock(task)}
           </Box>
         ))}
         <Text color="green">{rule(t(lang, 'quota'))}</Text>
         {current.usageFailed && <Text dimColor>{fit(t(lang, 'usageFailed'), columns)}</Text>}
         {current.profiles.map(profile => (
           <Text key={`quota:${profile.profile_id}`} {...red(profile.quota_state === 'exhausted')}>
-            {fit(quotaText(profile, lang), columns)}
+            {fit(quotaText(profile, lang, loginNames(current.logins)), columns)}
           </Text>
         ))}
         <Text color="blue">{rule(t(lang, 'table'))}</Text>
@@ -485,13 +651,12 @@ export const register: Register = (on, raw) => {
       tick = undefined
       $.ui.invalidate('ui.render')
     })
-    // The account's label comes from the last refresh; the id itself stays as thoth gave it.
+    // The account's login name and label come from the last refresh; the id itself stays as thoth gave it.
     const shown = await read($, snapshot)
-    const labels = shown === null ? new Map<string, string>() : planLabels(shown.profiles)
     const head = [
       taskName(watched.title, lang),
       roleLabel(current.role, lang),
-      named(current.profile, labels.get(current.profile), lang),
+      accountOf(shown, lang)(current.profile),
       current.model,
       statusLabel(current.status, lang),
     ].join(' · ')

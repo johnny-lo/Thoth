@@ -198,6 +198,24 @@ fn run_json(
     })
 }
 
+/// PANEL-3: the newest `queued` or `running` run of a task (run ids sort by
+/// time), or null. The panel uses it to list a task under review as in
+/// progress; `profile` is the account id only.
+fn live_run(runs: &[Run]) -> serde_json::Value {
+    runs.iter()
+        .filter(|r| r.status == "queued" || r.status == "running")
+        .max_by(|a, b| a.run_id.cmp(&b.run_id))
+        .map_or(serde_json::Value::Null, |r| {
+            serde_json::json!({
+                "run_id": r.run_id,
+                "role": r.role,
+                "profile": r.account,
+                "model": r.model,
+                "status": r.status,
+            })
+        })
+}
+
 /// What `status` with no TASK says first, outside a git repository.
 pub const OUTSIDE_REPO_NOTE: &str = "not inside a git repository: open tasks of every registered \
                                      repository are listed; run dispatch, verify and review inside a repository";
@@ -234,6 +252,7 @@ fn open_task_rows(
             "any_heartbeat_stale": stale,
             "updated_at": t.updated_at,
             "repo": repo,
+            "live_run": live_run(&runs),
         });
         let line = format!(
             "{}  {:<11} runs={} {}{}",

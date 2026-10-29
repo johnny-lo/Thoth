@@ -130,8 +130,11 @@ pub fn run(cwd: &Path, shell_flag: Option<&str>, json: bool) -> Result<i32> {
     items.push(profiles_item(&c, &profiles));
     if let Profiles::Listed(list) = &profiles {
         let labels = plan_label::read_only_labels(&paths);
+        let logins = crate::login_name::read_only_names(&paths);
         for p in list {
-            items.push(profile_item(&c, p, labels.get(&p.profile_id).map(String::as_str)));
+            let label = labels.get(&p.profile_id).map(String::as_str);
+            let login = logins.get(&p.profile_id).map(String::as_str);
+            items.push(profile_item(&c, p, label, login));
         }
     }
     let (repo, state) = repo_item(&c, &paths, cwd);
@@ -425,15 +428,22 @@ pub(crate) fn profiles_item(c: &Ctx, profiles: &Profiles) -> Item {
     }
 }
 
-/// `label` is the stored bracket text (TIER-1), so the heading reads
-/// `Profile claude-a (Max)` / `帳號 claude-a（Max）`; the detail is what this
-/// check just saw.
-pub(crate) fn profile_item(c: &Ctx, p: &Profile, label: Option<&str>) -> Item {
+/// `label` is the stored bracket text (TIER-1) and the heading also names the
+/// login (PANEL-3): `Profile claude-a (alice, Max)` / `帳號 claude-a（alice，Max）`.
+/// The login name comes from the email this check just saw, else
+/// `stored_login`. The detail is what this check just saw.
+pub(crate) fn profile_item(c: &Ctx, p: &Profile, label: Option<&str>, stored_login: Option<&str>) -> Item {
     let id = format!("profile:{}", p.profile_id);
     let key = "doctor.label.profile";
-    let label = Txt {
-        en: lang::fill(lang::text(Lang::En, key), &[&plan_label::named(&p.profile_id, label, Lang::En)]),
-        local: lang::fill(lang::text(c.lang, key), &[&plan_label::named(&p.profile_id, label, c.lang)]),
+    let heading = |login: Option<&str>| Txt {
+        en: lang::fill(
+            lang::text(Lang::En, key),
+            &[&crate::login_name::named(&p.profile_id, login, label, Lang::En)],
+        ),
+        local: lang::fill(
+            lang::text(c.lang, key),
+            &[&crate::login_name::named(&p.profile_id, login, label, c.lang)],
+        ),
     };
     let mut data = json!({
         "harness": p.harness,
@@ -447,9 +457,11 @@ pub(crate) fn profile_item(c: &Ctx, p: &Profile, label: Option<&str>) -> Item {
         Ok(a) => a,
         Err(e) => {
             let detail = c.t("doctor.profile.error", &[&format!("{e:#}")]);
-            return c.item(&id, label, Status::Unknown, detail, None, data);
+            return c.item(&id, heading(stored_login), Status::Unknown, detail, None, data);
         }
     };
+    let fresh_login = auth.email.as_deref().and_then(crate::login_name::from_email);
+    let label = heading(fresh_login.as_deref().or(stored_login));
     data["logged_in"] = json!(auth.logged_in);
     data["email"] = json!(auth.email);
     data["subscription_type"] = json!(auth.subscription_type);

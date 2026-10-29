@@ -1,4 +1,17 @@
-import type { ThothCheck, ThothEvent, ThothProblem, ThothProfile, ThothSnapshot, ThothStep, ThothTable, ThothTask, ThothWindow } from '../types'
+import type {
+  ThothCheck,
+  ThothConfirm,
+  ThothEvent,
+  ThothLiveRun,
+  ThothLogin,
+  ThothProblem,
+  ThothProfile,
+  ThothSnapshot,
+  ThothStep,
+  ThothTable,
+  ThothTask,
+  ThothWindow,
+} from '../types'
 import { hasKey, t } from './i18n'
 import type { Lang } from './i18n'
 
@@ -6,6 +19,8 @@ import type { Lang } from './i18n'
 export const WAITING_ON_COMMANDER = ['in_review', 'unverified', 'interrupted', 'failed', 'reject']
 /** Statuses with a worker queued or at work. */
 export const IN_PROGRESS = ['queued', 'running']
+/** Statuses of the commander's tasks the panel can close or dispatch again. */
+export const CLOSABLE = ['failed', 'interrupted', 'unverified', 'reject']
 /** Task statuses a `status_change` event is announced for. */
 export const TOAST_STATUSES = ['in_review', 'pass', 'reject', 'unverified', 'failed', 'interrupted']
 
@@ -29,10 +44,16 @@ export function repoName(project: string): string {
   return project.split(/[\\/]/).filter(Boolean).pop() ?? ''
 }
 
+/** Whether a run of the task is queued or running, whatever the task's status (a review, a spec review). */
+export function hasLiveRun(task: ThothTask): boolean {
+  return task.live_run !== null && task.live_run !== undefined
+}
+
+/** A task with a live run is in progress; only a waiting status without one is the commander's. */
 export function groupTasks(tasks: readonly ThothTask[]): { waitingOnCommander: ThothTask[]; inProgress: ThothTask[] } {
   return {
-    waitingOnCommander: tasks.filter(task => WAITING_ON_COMMANDER.includes(task.status)),
-    inProgress: tasks.filter(task => IN_PROGRESS.includes(task.status)),
+    waitingOnCommander: tasks.filter(task => WAITING_ON_COMMANDER.includes(task.status) && !hasLiveRun(task)),
+    inProgress: tasks.filter(task => IN_PROGRESS.includes(task.status) || hasLiveRun(task)),
   }
 }
 
@@ -64,6 +85,18 @@ export function statusProblem(ran: Ran): { problem: ThothProblem; text: string }
   return null
 }
 
+function asLiveRun(value: unknown): ThothLiveRun | null {
+  if (!isObject(value) || typeof value.run_id !== 'string' || !value.run_id) return null
+  const text = (field: unknown) => (typeof field === 'string' ? field : '')
+  return {
+    run_id: value.run_id,
+    role: text(value.role),
+    profile: text(value.profile),
+    model: text(value.model),
+    status: text(value.status),
+  }
+}
+
 function asTask(value: unknown): ThothTask | null {
   if (!isObject(value) || typeof value.task_id !== 'string') return null
   return {
@@ -75,6 +108,7 @@ function asTask(value: unknown): ThothTask | null {
     any_heartbeat_stale: value.any_heartbeat_stale === true,
     updated_at: typeof value.updated_at === 'string' ? value.updated_at : '',
     repo: typeof value.repo === 'string' ? value.repo : '',
+    live_run: asLiveRun(value.live_run),
   }
 }
 
@@ -117,10 +151,40 @@ export function parseProfiles(ran: Ran): ThothProfile[] | null {
   })
 }
 
-/** The account as a person reads it: `id (Label)`, `id（Label）` in Traditional Chinese, the id alone without a label. */
-export function named(id: string, label: string | null | undefined, lang: Lang): string {
-  if (!label) return id
-  return lang === 'zh-TW' ? `${id}（${label}）` : `${id} (${label})`
+/**
+ * The account as a person reads it: `id (login, Label)`, `id（login，Label）` in Traditional Chinese; either
+ * part is left out when there is none, and the id stands alone without both.
+ */
+export function named(id: string, label: string | null | undefined, lang: Lang, login?: string | null): string {
+  const parts = [login, label].filter((part): part is string => typeof part === 'string' && part !== '')
+  if (parts.length === 0) return id
+  return lang === 'zh-TW' ? `${id}（${parts.join('，')}）` : `${id} (${parts.join(', ')})`
+}
+
+/** The login names of `thoth profile list --json`, or null when it failed. */
+export function parseLogins(ran: Ran): ThothLogin[] | null {
+  if (ran === null || ran.exitCode !== 0) return null
+  const parsed = parseJson(ran.stdout)
+  if (!isObject(parsed) || !Array.isArray(parsed.profiles)) return null
+  return parsed.profiles.flatMap(value =>
+    isObject(value) && typeof value.profile_id === 'string' && typeof value.login_name === 'string' && value.login_name.trim()
+      ? [{ profile_id: value.profile_id, login_name: value.login_name.trim() }]
+      : [],
+  )
+}
+
+/** Each profile's login name by profile_id; a Map, so an id like `constructor` finds nothing. */
+export function loginNames(logins: readonly ThothLogin[] | undefined): ReadonlyMap<string, string> {
+  const names = new Map<string, string>()
+  for (const login of logins ?? []) names.set(login.profile_id, login.login_name)
+  return names
+}
+
+/** How the snapshot names an account: its login name and label, as `named` writes them. */
+export function accountOf(snapshot: ThothSnapshot | null, lang: Lang): (id: string) => string {
+  const labels = snapshot === null ? new Map<string, string>() : planLabels(snapshot.profiles)
+  const logins = snapshot === null ? new Map<string, string>() : loginNames(snapshot.logins)
+  return id => named(id, labels.get(id), lang, logins.get(id))
 }
 
 /** Each profile's non-blank plan_label by profile_id; a Map, so an id like `constructor` finds nothing. */
@@ -229,6 +293,7 @@ export function toastFor(
   known: Readonly<Record<string, string>>,
   lang: Lang,
   labels: ReadonlyMap<string, string> = new Map(),
+  logins: ReadonlyMap<string, string> = new Map(),
 ): string | null {
   const detail = event.detail
   if (event.type === 'status_change' && detail.entity === 'task') {
@@ -242,7 +307,7 @@ export function toastFor(
   }
   if (event.type === 'quota_exceeded') {
     const id = String(detail.profile ?? '')
-    return t(lang, 'toast.quota_exceeded', { profile: named(id, labels.get(id), lang) })
+    return t(lang, 'toast.quota_exceeded', { profile: named(id, labels.get(id), lang, logins.get(id)) })
   }
   return null
 }
@@ -255,10 +320,11 @@ export function toastsFor(
   known: Readonly<Record<string, string>>,
   lang: Lang,
   labels: ReadonlyMap<string, string> = new Map(),
+  logins: ReadonlyMap<string, string> = new Map(),
 ): string[] {
   return events
     .filter(event => event.seq > cursor)
-    .map(event => toastFor(event, tasks, known, lang, labels))
+    .map(event => toastFor(event, tasks, known, lang, labels, logins))
     .filter((text): text is string => text !== null)
 }
 
@@ -286,7 +352,7 @@ export function localTime(iso: string | null): string {
 }
 
 /** One profile's quota line: each window's share left and reset time, joined by ` · `. */
-export function quotaText(profile: ThothProfile, lang: Lang): string {
+export function quotaText(profile: ThothProfile, lang: Lang, logins: ReadonlyMap<string, string> = new Map()): string {
   const parts = profile.windows.map(window => {
     const left = t(lang, 'left', { label: windowLabel(window.name, lang), n: percentLeft(window) })
     const time = localTime(window.resets_at)
@@ -294,7 +360,7 @@ export function quotaText(profile: ThothProfile, lang: Lang): string {
   })
   const body = parts.length > 0 ? parts.join(' · ') : t(lang, 'noReading')
   const tail = profile.quota_state === 'exhausted' ? `  ${t(lang, 'exhausted')}` : ''
-  return `${named(profile.profile_id, profile.plan_label, lang)}  ${body}${tail}`
+  return `${named(profile.profile_id, profile.plan_label, lang, logins.get(profile.profile_id))}  ${body}${tail}`
 }
 
 /** What a person calls the task: its title, or a plain word when it has none. */
@@ -309,15 +375,29 @@ export function rememberTitles(known: Readonly<Record<string, string>>, tasks: r
   return next
 }
 
-export function taskLine(task: ThothTask, lang: Lang): string {
-  const parts = ['●', taskName(task.title, lang), statusLabel(task.status, lang)]
+/**
+ * The task's line: its title and status, or, while a review or spec review runs, `under review` with the
+ * reviewer's account (as `account` writes it) and model.
+ */
+export function taskLine(task: ThothTask, lang: Lang, account: (id: string) => string = id => id): string {
+  const live = task.live_run
+  const review = live && (live.role === 'reviewer' || live.role === 'spec_reviewer') ? live : null
+  const state = review
+    ? `${t(lang, review.role === 'reviewer' ? 'underReview' : 'specUnderReview')} · ${account(review.profile)} · ${review.model}`
+    : statusLabel(task.status, lang)
+  const parts = ['●', taskName(task.title, lang), state]
   if (task.any_heartbeat_stale) parts.push(t(lang, 'stale'))
   return parts.join(' ')
 }
 
 /** The task's line; outside a repository, the name of the task's repository after it. */
-export function taskLineIn(task: ThothTask, outsideRepo: boolean, lang: Lang): string {
-  const line = taskLine(task, lang)
+export function taskLineIn(
+  task: ThothTask,
+  outsideRepo: boolean,
+  lang: Lang,
+  account: (id: string) => string = id => id,
+): string {
+  const line = taskLine(task, lang, account)
   return outsideRepo ? `${line} · ${repoName(task.repo)}` : line
 }
 
@@ -345,7 +425,7 @@ export function bandText(snapshot: ThothSnapshot | null, lang: Lang, cards = 0):
   const lowest = lowestWindow(snapshot.profiles)
   if (lowest) {
     const label = windowLabel(lowest.window.name, lang)
-    const name = named(lowest.profile, planLabels(snapshot.profiles).get(lowest.profile), lang)
+    const name = accountOf(snapshot, lang)(lowest.profile)
     parts.push(`${name} ${t(lang, 'left', { label, n: percentLeft(lowest.window) })}`)
   }
   return parts.join(' · ')
@@ -365,9 +445,9 @@ export function problemHint(snapshot: ThothSnapshot, lang: Lang): string | null 
   }
 }
 
-/** How long until the next refresh: soon while a worker is queued or running. */
+/** How long until the next refresh: soon while any task is in progress (a review counts). */
 export function nextDelay(snapshot: ThothSnapshot | null): number {
-  return snapshot !== null && snapshot.tasks.some(task => IN_PROGRESS.includes(task.status)) ? FAST_MS : IDLE_MS
+  return snapshot !== null && groupTasks(snapshot.tasks).inProgress.length > 0 ? FAST_MS : IDLE_MS
 }
 
 /** Cells a character takes on a terminal: two for wide East Asian characters. */
@@ -417,6 +497,9 @@ export type ThothRunRow = {
   status: string
   heartbeat_stale: boolean
   worktree: string
+  effort_requested: string | null
+  interrupted_reason: string | null
+  next_step: string | null
 }
 
 /** The runs of `thoth status TASK --json`, or null when it failed. */
@@ -425,6 +508,7 @@ export function parseRuns(ran: Ran): ThothRunRow[] | null {
   const parsed = parseJson(ran.stdout)
   if (!isObject(parsed) || !Array.isArray(parsed.runs)) return null
   const text = (value: unknown) => (typeof value === 'string' ? value : '')
+  const orNull = (value: unknown) => (typeof value === 'string' && value !== '' ? value : null)
   return parsed.runs.flatMap(value =>
     isObject(value) && typeof value.run_id === 'string'
       ? [{
@@ -435,9 +519,78 @@ export function parseRuns(ran: Ran): ThothRunRow[] | null {
           status: text(value.status),
           heartbeat_stale: value.heartbeat_stale === true,
           worktree: text(value.worktree),
+          effort_requested: orNull(value.effort_requested),
+          interrupted_reason: orNull(value.interrupted_reason),
+          next_step: orNull(value.next_step),
         }]
       : [],
   )
+}
+
+/** The newest implementer run, the one Dispatch again repeats; null when the task has none. */
+export function newestImplementerRun(runs: readonly ThothRunRow[]): ThothRunRow | null {
+  return newestRun(runs.filter(run => run.role === 'implementer'))
+}
+
+/** What thoth said went wrong: `error` of the `--json` error line on stderr, else stderr's first line. */
+export function errorText(ran: { stdout: string; stderr: string }): string {
+  for (const line of ran.stderr.split(/\r?\n/)) {
+    const parsed = parseJson(line.trim())
+    if (isObject(parsed) && typeof parsed.error === 'string' && parsed.error) return parsed.error
+  }
+  return firstLine(ran.stderr) || firstLine(ran.stdout)
+}
+
+/**
+ * Whether a waiting action still fits the task as the snapshot shows it: a Cancel while the same run is live,
+ * a Close task or Dispatch again while the task waits on the commander in a status that allows it.
+ */
+export function confirmStillFits(confirm: ThothConfirm, snapshot: ThothSnapshot | null): boolean {
+  if (snapshot === null || snapshot.problem !== null) return false
+  const { waitingOnCommander, inProgress } = groupTasks(snapshot.tasks)
+  if (confirm.kind === 'cancel') {
+    const task = inProgress.find(task => task.task_id === confirm.task_id)
+    return task?.live_run?.run_id === confirm.run_id
+  }
+  const task = waitingOnCommander.find(task => task.task_id === confirm.task_id)
+  return task !== undefined && CLOSABLE.includes(task.status)
+}
+
+/** The sentence a waiting action asks to confirm. */
+export function confirmText(confirm: ThothConfirm, lang: Lang, account: (id: string) => string = id => id): string {
+  const title = taskName(confirm.title, lang)
+  switch (confirm.kind) {
+    case 'cancel':
+      if (confirm.role === 'reviewer') {
+        return t(lang, 'confirmCancelReview', { title, account: account(confirm.profile), model: confirm.model })
+      }
+      if (confirm.role === 'spec_reviewer') return t(lang, 'confirmCancelSpecReview', { title })
+      return t(lang, 'confirmCancelRun', { title })
+    case 'close':
+      return t(lang, 'confirmClose', { title })
+    case 'again':
+      return t(lang, confirm.effort === null ? 'confirmAgainNoEffort' : 'confirmAgain', {
+        title,
+        account: account(confirm.profile),
+        model: confirm.model,
+        effort: confirm.effort ?? '',
+      })
+  }
+}
+
+/** The thoth arguments a confirmed action runs. */
+export function actionArgs(confirm: ThothConfirm): string[] {
+  switch (confirm.kind) {
+    case 'cancel':
+      return ['cancel', confirm.run_id, '--json']
+    case 'close':
+      return ['task', 'close', confirm.task_id, '--reason', 'closed from the Thoth panel', '--json']
+    case 'again': {
+      const effort = confirm.effort === null ? [] : ['--effort', confirm.effort]
+      const reason = `dispatched again from the Thoth panel: same profile, model and effort as run ${confirm.run_id}`
+      return ['dispatch', confirm.task_id, '--profile', confirm.profile, '--model', confirm.model, ...effort, '--reason', reason, '--json']
+    }
+  }
 }
 
 /** The newest run: ULIDs sort by time, so the largest id. */

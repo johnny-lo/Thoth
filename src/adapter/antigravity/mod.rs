@@ -1339,7 +1339,7 @@ mod tests {
             StreamTally { result: Some(r), ..Default::default() }
         };
         let ok = tally(r#"{"event":"result","result":{"conversation_id":"c","status":"SUCCESS","response":"DONE","usage":{"output_tokens":1}}}"#);
-        let ingested = IngestOutcome::Ok { summary: "s".into(), claim_count: 1 };
+        let ingested = IngestOutcome::Ok { summary: "s".into(), claim_count: 1, brief: "s".into() };
         assert_eq!(classify_outcome(&ok, Some(0), &ingested, None).task_status, TaskStatus::InReview);
         assert_eq!(classify_outcome(&ok, Some(1), &ingested, None).run_status, RunStatus::Failed);
         let error = tally(r#"{"event":"result","result":{"conversation_id":"","status":"ERROR","error":"invalid model selection","usage":{}}}"#);

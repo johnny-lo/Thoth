@@ -1,7 +1,9 @@
 //! The three external tables `recommend` sends, filtered by fact only (RJ-2):
 //! the organizations the registered accounts belong to, and the columns the
-//! commander can use. Thoth neither maps a row to an account nor ranks; the
-//! full tables stay in the caches and at their sources.
+//! commander can use. The tables themselves name no account and Thoth never
+//! ranks; `cross` puts the rows whose name matches an account's model next
+//! to that model (CROSS-1). The full tables stay in the caches and at their
+//! sources.
 
 use crate::commands::{arena, models};
 use crate::config::Paths;

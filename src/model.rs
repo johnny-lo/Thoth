@@ -224,6 +224,10 @@ pub mod event_type {
     pub const REVIEW_STARTED: &str = "review_started";
     /// Written by `commands::review::review_invalid` (Task 7).
     pub const REVIEW_INVALID: &str = "review_invalid";
+    /// RFIX-1: an edit review's fix, applied on the fix branch.
+    pub const REVIEW_FIX_APPLIED: &str = "review_fix_applied";
+    /// RFIX-1: an edit review's fix, refused at a stage.
+    pub const REVIEW_FIX_REFUSED: &str = "review_fix_refused";
     /// Written by `commands::decision::add` (Task 9).
     pub const DECISION_ADDED: &str = "decision_added";
     /// Written by `commands::task::update_spec` (Task 8).

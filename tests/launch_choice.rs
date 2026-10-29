@@ -507,13 +507,16 @@ fn recommend_lists_account_facts_only() {
             let v = json_out(&mut c);
             let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
             keys.sort_unstable();
-            // RJ-2: the filtered tables, Thoth's own usage, the score refresh
-            // and (with --task) the task's history join the account facts.
+            // RJ-2: the filtered tables, the score refresh and (with --task)
+            // the task's history join the account facts. CROSS-1: Thoth's own
+            // usage moved under each candidate's models, `unmatched` is new
+            // and `tables` is null without --tables.
             assert_eq!(
                 keys,
-                ["candidates", "live_quota_refresh", "model", "role", "score_refresh", "tables", "task_history", "task_id", "usage"],
+                ["candidates", "live_quota_refresh", "model", "role", "score_refresh", "tables", "task_history", "task_id", "unmatched"],
                 "{v}"
             );
+            assert!(v["tables"].is_null(), "{v}");
             match given {
                 Some(_) => {
                     assert_eq!(v["task_id"], task.as_str(), "{v}");
@@ -527,10 +530,16 @@ fn recommend_lists_account_facts_only() {
             let candidates = v["candidates"].as_array().unwrap();
             assert_eq!(candidates.len(), 2, "{v}");
             for c in candidates {
-                assert!(c.get("models").is_none(), "{c}");
+                // CROSS-1: `models` is back, as the account's models and
+                // their matching scores, not RJ-1's picked models
+                for m in c["models"].as_array().unwrap() {
+                    let mut keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+                    keys.sort_unstable();
+                    assert_eq!(keys, ["agent_arena", "ai_stupid_level", "artificial_analysis", "model", "names", "usage"], "{c}");
+                }
                 assert!(c.get("held").is_none(), "{c}");
                 assert!(c.get("eligible").is_some(), "{c}");
-                assert!(c["available_models"].is_array(), "{c}");
+                assert!(c.get("available_models").is_none(), "{c}");
             }
 
             let mut c = f.cmd();

@@ -11,7 +11,7 @@ fn version_prints_name_and_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("thoth 0.1.8"));
+        .stdout(predicate::str::contains("thoth 0.1.11"));
 }
 
 #[test]

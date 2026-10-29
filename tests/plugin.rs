@@ -121,7 +121,7 @@ fn ac4_skill_keeps_the_workflow_steps_and_details() {
         // RJ-3: the commander chooses and says why on every launch
         "--reason \"...\"",
         "task_history",
-        "available_models",
+        "unmatched",
         "agy models",
     ] {
         assert!(skill.contains(required), "missing {required}");

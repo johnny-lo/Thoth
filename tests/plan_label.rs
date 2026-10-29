@@ -711,7 +711,10 @@ fn plan_report_and_doctor_show_the_stored_plan() {
         );
     }
     let page = report_page(&f);
-    assert!(page.contains("<span class=\"acct-name\">claude-a（Pro）</span>"), "{page}");
+    // PANEL-3: the account block also names the login the check stored
+    // (fake-claude's default email is fake@example.com); the decision table
+    // does not.
+    assert!(page.contains("<span class=\"acct-name\">claude-a（fake，Pro）</span>"), "{page}");
     assert!(page.contains("<td>sonnet</td><td>claude-a（Pro）</td>"), "{page}");
     // RJ-3: the choice cell names the profile with its plan; there is no
     // recommended column any more
@@ -721,12 +724,13 @@ fn plan_report_and_doctor_show_the_stored_plan() {
     let mut c = f.cmd();
     c.env("FAKE_SUBSCRIPTION_TYPE", "max").env_remove("THOTH_LANG").arg("doctor");
     let (_, en, _) = run(&mut c);
-    let line = line_starting(&en, "Profile claude-a (Pro) … ");
+    // PANEL-3: the heading names the login doctor's own check saw.
+    let line = line_starting(&en, "Profile claude-a (fake, Pro) … ");
     assert!(line.contains("max"), "{en}");
     let mut c = f.cmd();
     c.env("FAKE_SUBSCRIPTION_TYPE", "max").env("THOTH_LANG", "zh-TW").arg("doctor");
     let (_, zh, _) = run(&mut c);
-    assert!(has_line_starting(&zh, "帳號 claude-a（Pro） … "), "{zh}");
+    assert!(has_line_starting(&zh, "帳號 claude-a（fake，Pro） … "), "{zh}");
     let mut c = f.cmd();
     c.args(["doctor", "--json"]);
     let (_, doc, _) = run(&mut c);
@@ -817,8 +821,8 @@ fn plan_an_old_global_db_is_read_without_migrating() {
     assert_eq!(entry(&v["profiles"], "claude-b")["plan_label"], "second", "{v}");
     let cols = columns(&f);
     assert!(cols.iter().any(|c| c == "plan") && cols.iter().any(|c| c == "plan_seen_at"), "{cols:?}");
-    // MODELS-1: the migration now ends at v4.
-    assert_eq!(version(&f), 4);
+    // MODELS-1 made it v4; PANEL-3 (login names) makes the migration end at v5.
+    assert_eq!(version(&f), 5);
 }
 
 #[test]

@@ -5,7 +5,8 @@ use rusqlite::Connection;
 /// `profiles.shared`: the operator's mark that a profile is also used by hand.
 /// v3 (TIER-1) adds `profiles.plan` and `profiles.plan_seen_at`. v4
 /// (MODELS-1) adds `profiles.models` (JSON) and `profiles.models_seen_at`.
-pub const GLOBAL_SCHEMA_VERSION: i64 = 4;
+/// v5 (PANEL-3) adds `profiles.login_name` and `profiles.login_name_seen_at`.
+pub const GLOBAL_SCHEMA_VERSION: i64 = 5;
 /// `repos/<id>/state.db` is v2 as of Phase 2: `tasks.attempt_cap`,
 /// `runs.harness_bin`, and the evidence/review indexes. v3 adds the approved
 /// `checks` catalogue. v4 adds `checks.exe_pin` (`hash` or `path`). v5 adds
@@ -82,7 +83,7 @@ pub fn migrate_global(conn: &Connection) -> Result<()> {
     if current_version(conn)? >= GLOBAL_SCHEMA_VERSION {
         return Ok(());
     }
-    // v1's tables, then the v2 column, then the v3 and v4 columns; every
+    // v1's tables, then the v2 column, then the v3, v4 and v5 columns; every
     // step tolerates being replayed.
     conn.execute_batch(GLOBAL_V1)?;
     add_column_if_missing(conn, "profiles", "shared", "INTEGER NOT NULL DEFAULT 0")?;
@@ -90,6 +91,8 @@ pub fn migrate_global(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "profiles", "plan_seen_at", "TEXT")?;
     add_column_if_missing(conn, "profiles", "models", "TEXT")?;
     add_column_if_missing(conn, "profiles", "models_seen_at", "TEXT")?;
+    add_column_if_missing(conn, "profiles", "login_name", "TEXT")?;
+    add_column_if_missing(conn, "profiles", "login_name_seen_at", "TEXT")?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
         [GLOBAL_SCHEMA_VERSION],
@@ -421,7 +424,7 @@ mod tests {
 
         migrate_global(&conn).unwrap();
         // MODELS-1: the migration now ends at v4.
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), GLOBAL_SCHEMA_VERSION);
         assert!(column_exists(&conn, "profiles", "plan").unwrap());
         assert!(column_exists(&conn, "profiles", "plan_seen_at").unwrap());
         let (plan, seen): (Option<String>, Option<String>) = conn
@@ -441,7 +444,7 @@ mod tests {
 
         migrate_global(&conn).unwrap();
         migrate_global(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), GLOBAL_SCHEMA_VERSION);
     }
 
     // MODELS-1: a v3 global.db gains `profiles.models` and
@@ -473,7 +476,7 @@ mod tests {
         assert!(!column_exists(&conn, "profiles", "models_seen_at").unwrap());
 
         migrate_global(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), GLOBAL_SCHEMA_VERSION);
         assert!(column_exists(&conn, "profiles", "models").unwrap());
         assert!(column_exists(&conn, "profiles", "models_seen_at").unwrap());
         let (models, seen, plan, shared): (Option<String>, Option<String>, Option<String>, i64) = conn
@@ -495,7 +498,58 @@ mod tests {
 
         migrate_global(&conn).unwrap();
         migrate_global(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), GLOBAL_SCHEMA_VERSION);
+    }
+
+    // PANEL-3: a v4 global.db gains `profiles.login_name` and
+    // `profiles.login_name_seen_at`, NULL for every existing profile; the
+    // other columns are untouched, and the step can be replayed.
+    #[test]
+    fn a_v4_global_db_gains_the_login_name_columns_as_null_and_the_step_is_reentrant() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(GLOBAL_V1).unwrap();
+        for (col, ty) in [
+            ("shared", "INTEGER NOT NULL DEFAULT 0"),
+            ("plan", "TEXT"),
+            ("plan_seen_at", "TEXT"),
+            ("models", "TEXT"),
+            ("models_seen_at", "TEXT"),
+        ] {
+            add_column_if_missing(&conn, "profiles", col, ty).unwrap();
+        }
+        conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (4)", [])
+            .unwrap();
+        let profile = crate::db::global::Profile {
+            profile_id: "claude-a".into(),
+            provider: "anthropic".into(),
+            harness: "claude-code".into(),
+            account_label: None,
+            config_dir: "/a".into(),
+            default_models: None,
+            status: "active".into(),
+        };
+        crate::db::global::insert_profile(&conn, &profile).unwrap();
+        crate::db::global::set_profile_plan(&conn, "claude-a", "max", "2026-10-01T00:00:00Z").unwrap();
+        assert!(!column_exists(&conn, "profiles", "login_name").unwrap());
+
+        migrate_global(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert!(column_exists(&conn, "profiles", "login_name").unwrap());
+        assert!(column_exists(&conn, "profiles", "login_name_seen_at").unwrap());
+        let (name, seen, plan): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT login_name, login_name_seen_at, plan FROM profiles WHERE profile_id = 'claude-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((name, seen), (None, None));
+        assert_eq!(plan.as_deref(), Some("max"));
+        assert!(crate::db::global::profile_login_names(&conn).unwrap().is_empty());
+
+        migrate_global(&conn).unwrap();
+        migrate_global(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 5);
     }
 
     #[test]

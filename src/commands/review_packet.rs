@@ -541,7 +541,7 @@ fn render_markdown(doc: &Value, handoff_reasons: &std::collections::HashMap<Stri
     // reviewer reads them knowing where to look hardest
     m.push_str("## Protected files changed\n\n");
     m.push_str(
-        "Existing test files and check input files that a diff modified or deleted, and added or modified files named like a word of a check's command. Worked out by the control plane from each diff. Whether a change weakened a check is for you to judge, file by file.\n\n",
+        "Existing test files and check input files that a diff modified or deleted, existing Rust source files whose inline test region was changed or deleted (inline_test), and added or modified files named like a word of a check's command. Worked out by the control plane from each diff; the worker does not have to declare them, and the commander approves them with thoth checks approve --run. Whether a change weakened a check is for you to judge, file by file.\n\n",
     );
     let protected = doc["protected_changes"].as_array().cloned().unwrap_or_default();
     if protected.is_empty() {
@@ -557,7 +557,7 @@ fn render_markdown(doc: &Value, handoff_reasons: &std::collections::HashMap<Stri
             p["run_id"].as_str().unwrap_or("-"),
         ));
     }
-    m.push_str("\nWhat the worker declared (its protected_change claims):\n");
+    m.push_str("\nWhat the worker declared (its optional protected_change claims):\n");
     let declared: Vec<&Value> = doc["claims"]
         .as_array()
         .map(|a| {

@@ -687,7 +687,9 @@ pub fn result(paths: &Paths, cwd: &Path, needle: &str, run: Option<&str>, json: 
         Some(r) => state::get_run(&conn, r)?,
         None => None,
     };
-    let v = serde_json::json!({
+    let masker = crate::redact::Masker::load(Some(&paths.home));
+    let brief =crate::brief::for_result_event(&masker, &detail);
+    let mut v = serde_json::json!({
         "ok": true,
         "task_id": task_id,
         "task_status": task.status,
@@ -705,6 +707,7 @@ pub fn result(paths: &Paths, cwd: &Path, needle: &str, run: Option<&str>, json: 
         "claim_count": claim_count,
         "claims": claims,
     });
+    crate::brief::insert_keys(&mut v, Some(&brief));
 
     let text = |v: &serde_json::Value| v.as_str().unwrap_or("-").to_string();
     let mut human = format!("{task_id}  {}  {}", task.status, task.title);
@@ -717,12 +720,19 @@ pub fn result(paths: &Paths, cwd: &Path, needle: &str, run: Option<&str>, json: 
         text(&v["model"]),
         text(&v["candidate_commit"]),
     ));
+    human.push('\n');
+    human.push_str(&crate::brief::human_lines(
+        &brief,
+        &match &event.run_id {
+            Some(r) => format!("thoth task result {task_id} --run {r}"),
+            None => format!("thoth task result {task_id}"),
+        },
+    ));
     human.push_str("\nsummary:");
     for line in summary.lines() {
         human.push_str(&format!("\n  {line}"));
     }
     human.push_str(&format!("\nclaims ({}):", claims.len()));
-    let masker = crate::redact::Masker::load(Some(&paths.home));
     for c in &claims {
         let codes: Vec<String> = c["evidence"]
             .as_array()

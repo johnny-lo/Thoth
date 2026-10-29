@@ -177,6 +177,8 @@ pub fn list(paths: &Paths, json: bool) -> Result<i32> {
         .collect::<Result<_>>()?;
     let plans = global::profile_plans(&conn)?;
     let stored = |p: &Profile| plans.get(&p.profile_id);
+    let logins = global::profile_login_names(&conn)?;
+    let login = |p: &Profile| logins.get(&p.profile_id);
     let bracket = |p: &Profile| {
         plan_label::label(stored(p).map(|s| s.plan.as_str()), p.account_label.as_deref())
     };
@@ -195,6 +197,9 @@ pub fn list(paths: &Paths, json: bool) -> Result<i32> {
                 "plan": stored(p).map(|s| &s.plan),
                 "plan_label": bracket(p),
                 "plan_seen_at": stored(p).and_then(|s| s.seen_at.as_ref()),
+                // PANEL-3: the login name for the panel; never in MCP results.
+                "login_name": login(p).map(|s| &s.name),
+                "login_name_seen_at": login(p).and_then(|s| s.seen_at.as_ref()),
             })
         })
         .collect();
@@ -323,9 +328,15 @@ pub fn check(paths: &Paths, id: &str, json: bool) -> Result<i32> {
         match db::open_global(paths) {
             Ok(conn) => {
                 plan_label::remember_or_warn(&conn, id, status.subscription_type.as_deref());
+                crate::login_name::remember_or_warn(&conn, id, status.email.as_deref());
                 fresh_models = crate::model_list::remember_or_warn(&conn, id, &status).filter(|f| f.stored);
             }
-            Err(e) => masked_eprintln!("warning: could not store the plan of {id}: {e:#}"),
+            Err(e) => {
+                masked_eprintln!("warning: could not store the plan of {id}: {e:#}");
+                if status.email.as_deref().and_then(crate::login_name::from_email).is_some() {
+                    crate::login_name::warn(id, &e);
+                }
+            }
         }
     }
 

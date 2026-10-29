@@ -10,6 +10,45 @@ export type ThothTask = {
   updated_at: string
   /** The root of the task's repository; empty when thoth did not say. */
   repo: string
+  /** The task's newest queued or running run; null when it has none, or when thoth did not say (older thoth). */
+  live_run: ThothLiveRun | null
+}
+
+/** `tasks[].live_run` of `thoth status --json`. */
+export type ThothLiveRun = {
+  run_id: string
+  /** `implementer`, `reviewer` or `spec_reviewer`. */
+  role: string
+  /** The account id. */
+  profile: string
+  model: string
+  /** `queued` or `running`. */
+  status: string
+}
+
+/** One profile's login name, from `thoth profile list --json`. */
+export type ThothLogin = {
+  profile_id: string
+  login_name: string
+}
+
+/** A Cancel, Close task or Dispatch again that waits for its second press. */
+export type ThothConfirm = {
+  kind: 'cancel' | 'close' | 'again'
+  task_id: string
+  title: string
+  /** Where the command runs: the task's repository outside one, else empty (the project). */
+  repo: string
+  /** cancel: the live run to stop; again: the earlier run repeated; close: empty. */
+  run_id: string
+  /** cancel: the live run's role. */
+  role: string
+  profile: string
+  model: string
+  /** again: the earlier run's effort_requested. */
+  effort: string | null
+  /** again: the earlier run stopped on quota or a login; its next_step, shown without a confirm. */
+  blocked: string | null
 }
 
 /** One quota window of a profile, as `thoth profile usage --json` reports it. */
@@ -70,6 +109,8 @@ export type ThothSnapshot = {
   profiles: ThothProfile[]
   /** True when `thoth profile usage --json` failed; `profiles` is then empty. */
   usageFailed: boolean
+  /** Login names from `thoth profile list --json`; empty when it failed. */
+  logins: ThothLogin[]
   /** When the refresh finished, ms since the epoch. */
   fetchedAt: number
   problem: ThothProblem | null
@@ -122,6 +163,8 @@ declare module 'claude-code' {
       /** `repo` is where the worker's commands run; empty: the project. */
       watching: { task_id: string; title: string; repo: string } | null
       worker: ThothWorker | null
+      /** The action waiting for its second press; one at a time. */
+      confirming: ThothConfirm | null
     }
   }
 }

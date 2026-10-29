@@ -844,11 +844,13 @@ fn mcp_starts_a_spec_review_and_waits_for_it() {
 
     let list = srv.send(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 35);
+    // thoth_review_confirm sits after thoth_review_start, one place before
+    // these.
+    assert_eq!(tools.len(), 36);
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names[19], "thoth_spec_review_start");
-    assert_eq!(names[20], "thoth_spec_review_confirm");
-    assert_eq!(names[21], "thoth_resume");
+    assert_eq!(names[20], "thoth_spec_review_start");
+    assert_eq!(names[21], "thoth_spec_review_confirm");
+    assert_eq!(names[22], "thoth_resume");
     assert_eq!(*names.last().unwrap(), "thoth_guide");
     let tool = tools.iter().find(|t| t["name"] == "thoth_spec_review_start").unwrap();
     assert_eq!(tool["annotations"]["readOnlyHint"], false);
