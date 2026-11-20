@@ -67,13 +67,13 @@ jobs:
       # assert deadlines, and turn falsely red when run next to the rest).
       - name: test
         id: test
-        run: cargo test --locked --no-fail-fast -- --skip process::
+        run: 'cargo test --locked --no-fail-fast -- --skip process::'
 
       # Runs whenever `test` ran, red or green, so one group's red does not
       # hide the other's result; not when `test` was skipped or cancelled.
       - name: test-process
         if: ${{ !cancelled() && (steps.test.outcome == 'success' || steps.test.outcome == 'failure') }}
-        run: cargo test --locked --no-fail-fast --bin thoth -- process:: --test-threads=1
+        run: 'cargo test --locked --no-fail-fast --bin thoth -- process:: --test-threads=1'
 
   linux:
     if: github.repository == 'johnny-lo/Thoth'
@@ -251,11 +251,11 @@ jobs:
       - name: test-full
         id: test-full
         if: steps.probe.outputs.ok == 'true'
-        run: cargo test --locked --no-fail-fast -- --skip process::
+        run: 'cargo test --locked --no-fail-fast -- --skip process::'
 
       - name: test-process
         if: ${{ !cancelled() && steps.probe.outputs.ok == 'true' && (steps.test-full.outcome == 'success' || steps.test-full.outcome == 'failure') }}
-        run: cargo test --locked --no-fail-fast --bin thoth -- process:: --test-threads=1
+        run: 'cargo test --locked --no-fail-fast --bin thoth -- process:: --test-threads=1'
 
       # No usable user manager: run everything that does not start a runner.
       # Any red here is still a code problem.
