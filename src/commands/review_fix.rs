@@ -519,7 +519,7 @@ fn write_plain(
         }
     }
     let written = (|| -> Result<()> {
-        let tx = conn.unchecked_transaction()?;
+        let tx = db::write_tx(conn)?;
         if let Some((_, r)) = &refused {
             state::append_event(
                 &tx,

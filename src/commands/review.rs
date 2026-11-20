@@ -1328,7 +1328,7 @@ pub fn ingest_review(
         &doc.findings,
     );
 
-    let tx = match conn.unchecked_transaction() {
+    let tx = match db::write_tx(conn) {
         Ok(t) => t,
         Err(e) => {
             return review_invalid(

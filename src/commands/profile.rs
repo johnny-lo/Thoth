@@ -303,7 +303,7 @@ pub fn probe_auth_profile(profile: &Profile) -> Result<crate::adapter::AuthStatu
 /// (`profile check`, `profile login`). `source` names the command.
 pub(crate) fn restore_login(paths: &Paths, id: &str, source: &str) -> Result<()> {
     let conn = db::open_global(paths)?;
-    let tx = conn.unchecked_transaction()?;
+    let tx = db::write_tx(&conn)?;
     global::set_profile_status(&tx, id, "active")?;
     global::insert_quota_event(
         &tx,

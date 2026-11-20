@@ -28,7 +28,13 @@ fn open_tuned(path: &Path) -> Result<Connection> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+    // Every transaction on a thoth connection writes, so every one takes the
+    // write lock at `BEGIN`; see `write_tx` for why a deferred one cannot be
+    // trusted next to a live runner. Call sites use `write_tx` by name; this
+    // default covers a `transaction()` or `unchecked_transaction()` all the
+    // same.
+    conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
     tune(&conn)?;
     Ok(conn)
 }
@@ -46,23 +52,42 @@ pub fn open_state(paths: &crate::config::Paths, repo_id: &str) -> Result<Connect
 }
 
 /// A transaction that takes SQLite's write lock at `BEGIN` (`BEGIN IMMEDIATE`)
-/// rather than at its first write.
+/// rather than at its first write. Every transaction thoth opens uses it.
 ///
-/// Whole-branch review Important 1/3/5: the live-run guards in `dispatch`,
-/// `resume`, `submit` and `review start` all *read* (is any run of this task
-/// still `queued`/`running`?) and then *write* on the strength of that read.
-/// `Connection::unchecked_transaction` is `DEFERRED`, so a read taken before
-/// the transaction's first write establishes a WAL snapshot that another
-/// connection can commit past - and the later write then fails with
-/// `SQLITE_BUSY_SNAPSHOT` instead of the guard cleanly refusing. `IMMEDIATE`
-/// makes the read authoritative: exactly one writer at a time holds the lock,
-/// competing writers wait out the 5 s `busy_timeout` and then see the
-/// committed truth. Use this wherever a decision is read inside a transaction
-/// and acted on by a later write in the same transaction; a transaction whose
-/// *first* statement is its write does not need it.
+/// A `DEFERRED` transaction that reads before its first write holds a read
+/// snapshot when that write asks for the lock, and SQLite does not call the
+/// busy handler for a connection that already holds a snapshot: if another
+/// connection is writing at that moment the write fails at once with
+/// `SQLITE_BUSY` ("database is locked"), without waiting out the 5 s
+/// `busy_timeout`; if another connection committed since the read, it fails
+/// with `SQLITE_BUSY_SNAPSHOT`. A live run's runner commits a row for every
+/// stream line and heartbeat, so any CLI command running next to it could
+/// hit that window (on Linux it is routine: a fresh runner's first writes
+/// land while the next command is already in its transaction).
+/// `IMMEDIATE` asks for the lock before anything is read, while the
+/// connection holds no snapshot, so it waits for the busy timeout like a
+/// lone write does, and what it then reads is the committed truth: exactly
+/// one writer at a time, and the live-run guards in `dispatch`, `resume`,
+/// `submit` and `review start` decide on what they read. A transaction
+/// whose first statement is its write would wait as well, but uses this
+/// anyway so that a read added in front of it later cannot bring the
+/// failure back.
 pub fn write_tx(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
-    Ok(rusqlite::Transaction::new_unchecked(
-        conn,
-        rusqlite::TransactionBehavior::Immediate,
-    )?)
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    #[cfg(debug_assertions)]
+    hold_write_lock_for_test();
+    Ok(tx)
+}
+
+/// Test seam, for tests/write_lock.rs only; debug builds only, so a release
+/// build has no such pause. When `THOTH_TEST_WRITE_TX_PAUSE_FILE` names a
+/// file, the process's first write transaction, once it holds the write
+/// lock, creates that file and waits until the test deletes it: the test can
+/// then run another command while a writer holds the lock, which otherwise
+/// only happens by timing. Only the first, so the rest of the command runs
+/// without another pause.
+#[cfg(debug_assertions)]
+fn hold_write_lock_for_test() {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| crate::commands::spec_review::test_pause("THOTH_TEST_WRITE_TX_PAUSE_FILE"));
 }

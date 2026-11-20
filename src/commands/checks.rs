@@ -218,7 +218,8 @@ pub(crate) fn add_check(paths: &Paths, cwd: &Path, args: &AddArgs<'_>) -> Result
             bail!("{reason}");
         }
     }
-    let tx = conn.unchecked_transaction()?;
+    // `put_check` reads before it writes; see `write_tx`.
+    let tx = crate::db::write_tx(&conn)?;
     checks::put_check(&tx, &check)?;
     state::append_event(
         &tx,
@@ -772,7 +773,7 @@ pub fn unprotect(paths: &Paths, cwd: &Path, pattern: &str, json: bool) -> Result
 pub fn remove(paths: &Paths, cwd: &Path, id: &str, json: bool) -> Result<i32> {
     refuse_inside_a_run("remove")?;
     let (_repo_id, _root, conn) = crate::commands::task::open_repo(paths, cwd)?;
-    let tx = conn.unchecked_transaction()?;
+    let tx = crate::db::write_tx(&conn)?;
     let Some(before) = checks::get_check(&tx, id)? else {
         bail!("no check '{id}'");
     };

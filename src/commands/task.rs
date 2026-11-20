@@ -118,7 +118,7 @@ pub fn create(
     };
     // #7 (final review): one transaction, so a crash between the two writes
     // can never leave a task row with no task_created event behind it.
-    let tx = conn.unchecked_transaction()?;
+    let tx = db::write_tx(&conn)?;
     state::insert_task(&tx, &task)?;
     state::append_event(
         &tx,
@@ -297,7 +297,7 @@ pub fn update_spec(
     // The `WHERE ... AND status IN (...)` inside `set_task_spec` makes the
     // check and the write atomic; zero rows means the state moved, and the
     // whole transaction (event included) rolls back.
-    let tx = conn.unchecked_transaction()?;
+    let tx = db::write_tx(&conn)?;
     if !state::set_task_spec(&tx, &task_id, UPDATE_SPEC_STATUSES, &raw, &parsed.risk, &now)? {
         let now_status = state::get_task(&tx, &task_id)?
             .map(|t| t.status)

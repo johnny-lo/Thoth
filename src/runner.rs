@@ -671,7 +671,7 @@ fn record_quota_interruption(
     note: &str,
     quota_group: Option<&str>,
 ) -> Result<()> {
-    let tx = gconn.unchecked_transaction()?;
+    let tx = db::write_tx(gconn)?;
     global::insert_quota_event(
         &tx,
         &ids::now_rfc3339(),
@@ -860,7 +860,7 @@ fn record_login_failure(
         return;
     }
     let write = || -> Result<()> {
-        let tx = gconn.unchecked_transaction()?;
+        let tx = db::write_tx(gconn)?;
         global::insert_quota_event(
             &tx,
             &ids::now_rfc3339(),
@@ -1097,7 +1097,7 @@ pub(crate) fn settle_terminal(
     interrupted_detail: Option<serde_json::Value>,
     mut status_change_detail: serde_json::Value,
 ) -> Result<bool> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = db::write_tx(conn)?;
     if !state::finish_run(&tx, &run.run_id, finish)? {
         // Rolls back on drop; nothing was written by this call.
         return Ok(false);

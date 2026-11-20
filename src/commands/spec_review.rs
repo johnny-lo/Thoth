@@ -1655,7 +1655,8 @@ pub fn ingest_run(
     let verdict = SpecVerdict::parse(&doc.verdict)
         .expect("the document parser accepted only APPROVE or REVISE");
     let written = (|| -> Result<()> {
-        let tx = conn.unchecked_transaction()?;
+        // `state` reads before the writes below; see `write_tx`.
+        let tx = db::write_tx(conn)?;
         let before = state(&tx, task)?;
         let revise_streak = if verdict == SpecVerdict::Revise {
             before.revise_streak + 1
