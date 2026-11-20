@@ -376,6 +376,13 @@ pub fn ingest_edit(
             json!({"stage": "target"}),
         );
     }
+    // REV-3: every verdict this report records is held to the required
+    // checks exactly as a plain review's is. Edit mode is `review start`'s
+    // default for a code task (RFIX-2), so skipping this let a PASS settle
+    // the task while a required check had not run. A REJECT whose fix is
+    // applied records no verdict: the confirm does, and holds the fix's own
+    // verify to the rule; a refused fix puts the report back under it.
+    let gate = review::required_checks_gate(conn, task, &doc, target_run_id);
     let raw: Value = serde_json::from_str(review::strip_bom(json_text)).unwrap_or(Value::Null);
     let items = match review_fix_edits::edit_list(&raw) {
         Ok(i) => i,
@@ -391,7 +398,11 @@ pub fn ingest_edit(
         );
     }
     if items.is_empty() {
-        return write_plain(conn, run, target_run_id, &doc, &cited, verdict, json!({"mode": "edit", "fix": null}), None);
+        let not_run = match gate {
+            Ok(list) => list,
+            Err((why, detail)) => return review::review_invalid(conn, run, why, detail),
+        };
+        return write_plain(conn, run, target_run_id, &doc, &cited, verdict, &not_run, json!({"mode": "edit", "fix": null}), None);
     }
 
     let started = started_detail(conn, &run.run_id).ok().flatten().unwrap_or(Value::Null);
@@ -435,6 +446,14 @@ pub fn ingest_edit(
             crate::runner::log_runner_error(Path::new(&run.run_dir), &format!("restoring branch {branch} failed: {e:#}"));
         }
     }
+    // REV-3: with no fix pending, this REJECT is recorded as a verdict.
+    let not_run = match gate {
+        Ok(list) => list,
+        Err((why, detail)) => {
+            let why = format!("{why} (its fix was refused at stage {})", refusal.stage);
+            return review::review_invalid(conn, run, why, detail);
+        }
+    };
     let mut refused = json!({
         "review_id": review_id,
         "stage": refusal.stage,
@@ -453,6 +472,7 @@ pub fn ingest_edit(
         &doc,
         &cited,
         verdict,
+        &not_run,
         json!({"mode": "edit", "fix": {"applied": false, "stage": refusal.stage}}),
         Some((review_id, refused)),
     );
@@ -471,6 +491,7 @@ fn write_plain(
     doc: &review_json::ReviewDocument,
     cited: &[String],
     verdict: Verdict,
+    not_run: &[crate::required_checks::NotRun],
     extra: Value,
     refused: Option<(String, Value)>,
 ) -> ReviewIngest {
@@ -489,6 +510,8 @@ fn write_plain(
         opened: Some(&opened),
         unopened: Some(&unopened),
         source: None,
+        // REV-3: what the edit review was checked against.
+        checks_not_run: Some(not_run),
     });
     if let (Some(d), Some(x)) = (detail.as_object_mut(), extra.as_object()) {
         for (k, v) in x {
@@ -814,7 +837,6 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
     let author = doc;
     let approve = author.verdict.trim() == "APPROVE";
     let verify_ok = fix_verify["ok"] == json!(true);
-    let verdict = if approve && verify_ok { Verdict::Pass } else { Verdict::Reject };
     let verify_detail = fix_verify["seq"]
         .as_i64()
         .and_then(|seq| {
@@ -827,7 +849,7 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
         .unwrap_or(Value::Null);
 
     type Stop = (&'static str, String);
-    let written: Result<std::result::Result<(), Stop>> = (|| {
+    let written: Result<std::result::Result<Verdict, Stop>> = (|| {
         let tx = db::write_tx(conn)?;
         let current = state::get_task(&tx, &run.task_id)?.ok_or_else(|| anyhow::anyhow!("task {} disappeared", run.task_id))?;
         if current.status != TaskStatus::InReview.as_str() {
@@ -850,10 +872,16 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
         if applied["fix_commit"].as_str() != Some(fix_commit.as_str()) {
             return Ok(Err(("superseded", "the applied fix is not the commit this confirm judged".to_string())));
         }
+        let edit_run_id = edit_row.reviewer_run_id.clone().unwrap_or_default();
+        // REV-3: the fix is what a PASS settles, and its verify is recorded on
+        // the edit review run; a required check that did not run there, by
+        // REV-3's own rule, keeps the confirm from passing, whatever the
+        // confirmer said and whatever `fix_verify.ok` is.
+        let not_run = crate::required_checks::for_run(&tx, &run.task_id, &current.spec, Some(&edit_run_id))?;
+        let verdict = if approve && verify_ok && not_run.is_empty() { Verdict::Pass } else { Verdict::Reject };
         // GATE-1: the fix's protected changes, approved on the edit review
         // run, checked again under the write lock before a PASS is written.
         if verdict == Verdict::Pass {
-            let edit_run_id = edit_row.reviewer_run_id.clone().unwrap_or_default();
             let why = match state::get_run(&tx, &edit_run_id)? {
                 None => Some(format!("the edit review's run {edit_run_id} is gone")),
                 Some(edit_run) => review::protected_refusal(&tx, &run.task_id, &edit_run, &[], None)?,
@@ -866,7 +894,7 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
         let findings = if verdict == Verdict::Pass {
             pass_findings(&original, &edits, &applied, &verify_detail, &fix_commit, &branch, &run.run_id)
         } else {
-            reject_findings(&original, &edits, &author, &verify_detail, verify_ok, &fix_commit, &applied)
+            reject_findings(&original, &edits, &author, &verify_detail, verify_ok, &not_run, &fix_commit, &applied)
         };
         let copied = if verdict == Verdict::Pass {
             findings.extra_findings.len()
@@ -901,6 +929,8 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
             opened: Some(&opened),
             unopened: Some(&unopened),
             source: None,
+            // REV-3: the required checks not run on the fix's verify run.
+            checks_not_run: Some(&not_run),
         });
         if let Some(d) = detail.as_object_mut() {
             d.insert("source".into(), json!(SOURCE_AUTHOR_CHECK));
@@ -921,12 +951,12 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
             },
         )?;
         tx.commit()?;
-        Ok(Ok(()))
+        Ok(Ok(verdict))
     })();
     match written {
         Err(e) => confirm_invalid(conn, run, stage::WRITE, format!("recording the confirm failed: {e:#}")),
         Ok(Err((s, why))) => confirm_invalid(conn, run, s, why),
-        Ok(Ok(())) => {
+        Ok(Ok(verdict)) => {
             let note = format!(
                 "confirmer {} over {} edit(s), fix verify {}: {}",
                 author.verdict.trim(),
@@ -970,9 +1000,23 @@ fn bound_extras(edits: &[Value]) -> Vec<usize> {
         .collect()
 }
 
-/// A confirmed fix's PASS record: every criterion met; an originally unmet
-/// one cites the fix's diff and its verify; only the extra findings no edit
-/// was bound to stay.
+/// Which criteria an edit list binds, trimmed.
+fn bound_criteria(edits: &[Value]) -> Vec<String> {
+    edits
+        .iter()
+        .filter_map(|e| e["criterion"].as_str().map(str::trim))
+        .filter(|c| !c.starts_with("extra_findings["))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A confirmed fix's PASS record: an unmet criterion an edit was bound to is
+/// met and cites the fix's diff and its verify; only the extra findings no
+/// edit was bound to stay. REV-2 (AC4): an unmet criterion no edit was bound
+/// to (after `check_size`, only an advisory one) stays exactly as the edit
+/// review judged it, because the fix did not touch it; an unbound extra
+/// finding whose category is advisory keeps its `fix_size` and `category`,
+/// every other one loses both (`strip_extra`) and so counts as blocking.
 fn pass_findings(
     original: &Findings,
     edits: &[Value],
@@ -984,14 +1028,19 @@ fn pass_findings(
 ) -> Findings {
     let mut evidence: Vec<String> = applied["diff_code"].as_str().map(str::to_string).into_iter().collect();
     evidence.extend(verify_codes(verify));
+    let bound_ids = bound_criteria(edits);
     let criteria = original
         .criteria
         .iter()
         .map(|c| {
+            let unmet = c.verdict.trim() == "unmet";
+            if unmet && !bound_ids.iter().any(|id| id == c.id.trim()) {
+                return c.clone();
+            }
             let mut c = c.clone();
             c.fix_size = None;
             c.category = None;
-            if c.verdict.trim() == "unmet" {
+            if unmet {
                 c.verdict = "met".into();
                 c.evidence = evidence.clone();
                 c.note = Some(format!(
@@ -1007,20 +1056,29 @@ fn pass_findings(
         .iter()
         .enumerate()
         .filter(|(i, _)| !bound.contains(i))
-        .map(|(_, e)| strip_extra(e))
+        .map(|(_, e)| {
+            if review_json::category_blocks(e.category.as_deref()) {
+                strip_extra(e)
+            } else {
+                e.clone()
+            }
+        })
         .collect();
     Findings { criteria, extra_findings, sources: Vec::new() }
 }
 
 /// A refused confirm's REJECT record: the edit review's findings as they
 /// were, then one extra finding per revise, one for a red verify, and one
-/// saying the fix was not adopted.
+/// saying the fix was not adopted. REV-3: one blocking `check_not_run`
+/// finding per required check that did not run on the fix's verify run.
+#[allow(clippy::too_many_arguments)]
 fn reject_findings(
     original: &Findings,
     edits: &[Value],
     author: &spec_edits::ConfirmDocument,
     verify: &Value,
     verify_ok: bool,
+    not_run: &[crate::required_checks::NotRun],
     fix_commit: &str,
     applied: &Value,
 ) -> Findings {
@@ -1062,6 +1120,18 @@ fn reject_findings(
             .collect();
         let what = if failing.is_empty() { "no check ran".to_string() } else { failing.join(", ") };
         extra_findings.push(new(format!("verify of the fix {fix_commit} is not green: {what}"), verify_codes(verify)));
+    }
+    for n in not_run {
+        extra_findings.push(ExtraFinding {
+            category: Some(crate::required_checks::CATEGORY.to_string()),
+            ..new(
+                format!(
+                    "required check {} did not run on the verify of the fix {fix_commit} ({})",
+                    n.check_id, n.reason
+                ),
+                Vec::new(),
+            )
+        });
     }
     extra_findings.push(new(
         format!(

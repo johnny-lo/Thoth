@@ -314,7 +314,10 @@ pub fn build_review_prompt(
     s.push_str("\n## Your input\n");
     s.push_str(&format!("Read {input}/packet.md first. It is the review packet: the full spec, the evidence index with every code, the candidate diff and the implementer's claims.\n"));
     s.push_str(&format!("The whole stored output behind each code in the index is in {input}/evidence/<CODE>.txt (for example {input}/evidence/E001.txt). Open them with your file-viewing tool, and read the worktree's own files to check the code itself.\n"));
+    s.push_str(&crate::review_json::result_file_line(input));
     s.push_str("Do not run thoth: you have no shell to run it with, and everything it would show you is already in those files.\n");
+    // RVI-1: what the delivered result and a silent check do and do not prove.
+    s.push_str(&crate::review_json::delivery_and_checks_section(input, &spec.checks));
 
     s.push_str("\n## Rules\n");
     match diff_code {
@@ -327,11 +330,15 @@ pub fn build_review_prompt(
     }
     s.push_str("2. Judge every acceptance criterion exactly once, as met or unmet. Every met criterion must cite at least one code from the packet's evidence index; an unmet one needs a code or a note saying what is missing. Do not invent codes.\n");
     s.push_str("3. Do not trust the implementer's summary or claims. A claim is not evidence.\n");
-    s.push_str("4. PASS only if every criterion is met. REJECT when a criterion is unmet. UNVERIFIED when the evidence available cannot settle it.\n");
+    // REV-1 (AC2): only a blocking finding is a reason to REJECT; the same
+    // rule text for all three harnesses.
+    s.push_str(&format!("4. {}\n", crate::review_json::VERDICT_RULE));
     s.push_str(&format!("5. {}\n", crate::review_json::INTERFACE_TEST_RULE));
     // TESTS-1 (AC6): the whole suite is the control plane's verify row, not
     // something the implementer proves itself.
     s.push_str(&format!("6. {}\n", crate::review_json::SUITE_EVIDENCE_RULE));
+    // REV-3 (AC2): a required check that did not run blocks.
+    s.push_str(&format!("7. {}\n", crate::review_json::REQUIRED_CHECKS_RULE));
 
     s.push_str("\n## Output\n");
     s.push_str("Your final message is the review document: a JSON object in the output schema you were given, and nothing else. thoth stores it as .agent/review.json; do not try to write that file yourself. Leave \"note\" empty (\"\") when you have nothing to add. For example:\n");
@@ -937,23 +944,38 @@ mod tests {
         let suite = p.find(SUITE_RULE).expect("the suite rule");
         assert!(rule < suite && suite < output, "{p}");
         assert_eq!(p.matches(SUITE_RULE).count(), 1, "{p}");
+        // REV-3 (AC2): the required-checks rule follows it as rule 7, the
+        // last rule before ## Output.
         assert!(p.contains(&format!(
-            "\n5. {}\n6. {SUITE_RULE}\n\n## Output\n",
-            crate::review_json::INTERFACE_TEST_RULE
+            "\n5. {}\n6. {SUITE_RULE}\n7. {}\n\n## Output\n",
+            crate::review_json::INTERFACE_TEST_RULE,
+            crate::review_json::REQUIRED_CHECKS_RULE
         )), "{p}");
-        assert!(!p.contains("\n7. "), "{p}");
+        assert!(!p.contains("\n8. "), "{p}");
         assert!(p.contains("\"verdict\":\"met\",\"evidence\":[\"E001\"],\"note\":\"\",\"fix_size\":\"none\",\"category\":\"none\"}"), "{p}");
         assert!(p.contains("\"note\":\"...\",\"evidence\":[\"E001\"],\"fix_size\":\"S\",\"category\":\"docs\"}"), "{p}");
         let after = &p[output..];
         for line in [
             "Every id in \"criteria\" must be one of: AC1, AC2.\nEvery unmet criterion and every extra finding carries \"fix_size\" and \"category\". \"fix_size\" is the smallest fix that would resolve it: S (at most 10 changed lines in one file), M (at most about 50 changed lines, or more than one file, no design change), L (larger, or it needs a design or spec change).\n",
             "Every \"fix_size\" must be one of: S, M, L.\n",
-            "Every \"category\" must be one of: spec_mismatch, spec_error, test_missing, test_interface, error_path, concurrency, platform, docs, evidence, files, security, other.\n",
-            "- security: a secret, credential or permission is exposed\n",
-            "- other: none of the above\nPut \"none\" in both on a met criterion.\n",
+            "Every \"category\" must be one of: spec_mismatch, spec_error, test_missing, test_incomplete, test_interface, error_path, concurrency, platform, docs, evidence, check_not_run, files, security, other.\n",
+            "- security (blocking): a secret, credential or permission is exposed\n",
+            "- other (advisory): none of the above\n",
+            "or branches.\nPut \"none\" in both on a met criterion.\n",
         ] {
             assert!(after.contains(line), "missing {line:?} in:\n{after}");
         }
+        // REV-1 (AC2): the shared verdict rule replaces "PASS only if every
+        // criterion is met", and every category line names its class, both
+        // taken from the public definitions in src/review_json.rs.
+        assert!(p.contains(&format!("\n4. {}\n", crate::review_json::VERDICT_RULE)), "{p}");
+        assert!(!p.contains("PASS only if every criterion is met"), "{p}");
+        for c in crate::review_json::CATEGORIES {
+            let line = format!("- {} ({}): {}\n", c.name, c.class.as_str(), c.about);
+            assert!(after.contains(&line), "missing {line:?} in:\n{after}");
+        }
+        assert!(after.contains("A finding with no category counts as blocking.\n"), "{after}");
+        assert!(after.contains("Use test_missing when no test of the new or changed behaviour would fail on the old code; use test_incomplete when such a test exists but misses some cases or branches.\n"), "{after}");
         assert!(!p.contains("cat "), "{p}");
         assert!(!p.contains("sandbox"), "{p}");
     }

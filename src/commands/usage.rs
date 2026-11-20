@@ -75,6 +75,13 @@ pub(crate) struct RankedCandidate {
     /// The profile's current windows, for `own_usage`'s runs-left count
     /// (RJ-2); every window, not only the decision group's.
     pub(crate) windows: Vec<Window>,
+    /// SMALL-9a: the windows that decide `quota_state` (an antigravity
+    /// profile's selected group, every window otherwise), which the quota
+    /// reserve is checked against.
+    pub(crate) decision: Vec<Window>,
+    /// SMALL-9a: the window `quota-reserve-percent` holds the profile back
+    /// for; `None` when the reserve is off or no deciding window is that full.
+    pub(crate) reserve_block: Option<super::quota_reserve::Block>,
 }
 
 /// FC-1 (H4): the `quota_group` of the profile's newest `rate_limited`
@@ -191,7 +198,7 @@ pub(crate) fn registered_repos(conn: &Connection) -> Result<Vec<String>> {
     Ok(rows)
 }
 
-fn normalize_rfc(value: &str) -> String {
+pub(crate) fn normalize_rfc(value: &str) -> String {
     OffsetDateTime::parse(value, &Rfc3339)
         .map(|t| {
             t.to_offset(UtcOffset::UTC)
@@ -201,7 +208,7 @@ fn normalize_rfc(value: &str) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
-fn rfc_from_epoch(value: i64) -> Option<String> {
+pub(crate) fn rfc_from_epoch(value: i64) -> Option<String> {
     OffsetDateTime::from_unix_timestamp(value)
         .ok()?
         .to_offset(UtcOffset::UTC)
@@ -741,6 +748,7 @@ pub(crate) fn ranked_candidates(
         None
     };
     let now = OffsetDateTime::now_utc().unix_timestamp();
+    let reserve = super::settings::quota_reserve_percent(&paths.home);
     let mut candidates = Vec::new();
     for p in profiles {
         let Reading { windows: ws, usage_not_allowed_at, .. } = reading(paths, &p, &repos)?;
@@ -829,6 +837,12 @@ pub(crate) fn ranked_candidates(
                 reasons.push(format!("{} is at least 95% and has not reset", w.name));
             }
         }
+        // SMALL-9a: the reserve the user set; the launches refuse the same.
+        let reserve_block = super::quota_reserve::blocking_window(&decision, reserve);
+        if let Some(block) = &reserve_block {
+            eligible = false;
+            reasons.push(block.reason());
+        }
         reasons.push(format!("{} live run(s)", live));
         let different = task_provider
             .as_ref()
@@ -854,6 +868,8 @@ pub(crate) fn ranked_candidates(
             parked_elsewhere,
             reasons,
             windows: ws,
+            decision,
+            reserve_block,
         });
     }
     candidates.sort_by(|a, b| {
@@ -933,6 +949,7 @@ pub fn recommend(
             "eligible": c.eligible, "reasons": c.reasons, "quota_state": c.quota_state, "peak_percent": c.peak_percent,
             "quota_group": c.quota_group, "parked_group": c.parked_group, "newest_observed_at": c.newest_observed_at,
             "recovered": c.recovered, "plan": plan, "plan_label": plan_label,
+            "reserve_blocked": c.reserve_block.is_some(),
         });
         // CROSS-1: the account's models as `thoth models` lists them.
         let discovered = super::models::discover(p, stored_lists.get(&p.profile_id));
@@ -966,6 +983,7 @@ pub fn recommend(
         "tables": if with_tables { tables.clone() } else { Value::Null },
         "unmatched": unmatched,
         "task_history": task_history.as_ref().map(super::task_history::TaskHistory::json),
+        "quota_reserve_percent": super::settings::quota_reserve_percent(&paths.home),
     });
     // The same text with or without --tables.
     let lang = Lang::from_env();

@@ -749,7 +749,11 @@ fn mcp_records_shows_and_skips() {
     let tools = list["result"]["tools"].as_array().unwrap();
     // thoth_review_confirm sits after thoth_review_start, one place before
     // these.
-    assert_eq!(tools.len(), 36);
+    // AUTO-1a: no hard-coded total (the pipeline tools were added); every
+    // tool is listed once and thoth_guide stays last.
+    let unique: std::collections::BTreeSet<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(unique.len(), tools.len());
+    assert_eq!(tools.last().unwrap()["name"], "thoth_guide");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names[18], "thoth_spec_review_record");
     assert_eq!(names[19], "thoth_spec_review_show");
@@ -940,4 +944,51 @@ fn a_spec_changed_during_dispatch_is_refused() {
     assert_eq!(count_events(&f, &task, "spec_review_skipped"), 0);
     let wt = worktree_a1(&f, &task);
     assert!(!wt.exists(), "{}", wt.display());
+}
+
+/// SR-4 (AC3): an externally recorded review carries `refused_edits` `[]`
+/// in its event and in `show --json`'s `newest`, and an `edits` key in the
+/// recorded file is still ignored, so nothing there is refused. Every command
+/// drops the inherited variables whose names hold KEY, TOKEN, SECRET or
+/// PASSWORD (names only) and reads Thoth through the CLI.
+#[test]
+fn sr4_a_recorded_review_lists_no_refused_edits() {
+    let f = common::fixture();
+    let cmd = || {
+        let mut c = f.cmd();
+        for (name, _) in std::env::vars_os() {
+            let upper = name.to_string_lossy().to_ascii_uppercase();
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+                c.env_remove(&name);
+            }
+        }
+        c
+    };
+    let json_of = |args: &[&str]| -> Value {
+        let mut c = cmd();
+        c.args(args);
+        serde_json::from_str(String::from_utf8(f.run_ok(c, &args.join(" "))).unwrap().trim()).unwrap()
+    };
+    let mut init = cmd();
+    init.arg("init");
+    f.run_ok(init, "init");
+    let spec = write_json(&f, "sr4-spec.json", HIGH).display().to_string();
+    let task = json_of(&["task", "create", "-f", &spec, "--json"])["task_id"].as_str().unwrap().to_string();
+    let mut doc: Value = serde_json::from_str(REVISE_DOC).unwrap();
+    doc["edits"] = json!([{"field": "risk", "op": "replace", "at": 0, "anchor": "", "text": "low", "criterion": "AC1", "reason": ""}]);
+    let file = write_json(&f, "sr4-record.json", &doc.to_string()).display().to_string();
+    json_of(&["spec", "review", "record", &task, "-f", &file, "--json"]);
+    let events = json_of(&["events", "--since", "0", "--task", &task, "--json"]);
+    let review: Vec<&Value> = events["events"].as_array().unwrap().iter().filter(|e| e["type"] == "spec_review").collect();
+    assert_eq!(review.len(), 1, "{events}");
+    assert_eq!(review[0]["detail"]["mode"], "external");
+    assert_eq!(review[0]["detail"]["refused_edits"], json!([]));
+    assert_eq!(review[0]["detail"]["edits"], json!([]));
+    let shown = json_of(&["spec", "review", "show", &task, "--json"]);
+    assert_eq!(shown["newest"]["refused_edits"], json!([]));
+    assert_eq!(shown["newest"]["verdict"], "REVISE");
+    let mut c = cmd();
+    c.args(["spec", "review", "show", &task]);
+    let human = String::from_utf8(f.run_ok(c, "spec review show")).unwrap();
+    assert!(!human.contains("refused edit"), "{human}");
 }

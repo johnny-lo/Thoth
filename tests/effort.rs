@@ -803,3 +803,538 @@ fn agy_resume_reuses_the_runs_effort_for_both_kinds_of_model_name() {
         assert_eq!(run["effort"], expected, "{model}: {run}");
     }
 }
+
+// SMALL-9b: a launch without `--timeout` gets the default for the effort
+// sent; a given `--timeout` wins; a timed-out run's next step follows the
+// run. Read through the CLI only: `--json`, `status`, `events`, the help and
+// the fakes' argument logs. ---------------------------------------------------
+
+mod timeout_by_effort {
+    use super::common::{self, Fixture};
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::path::PathBuf;
+
+    const REASON: &str = "SMALL-9b test: the fake worker stands in for a real one";
+    /// Two acceptance criteria, for the review flows.
+    const SPEC: &str = r#"{"goal":"keep the greeting right","acceptance_criteria":["AC1: greets the user","AC2: exits zero"],"constraints":[],"non_goals":[],"excluded_alternatives":[],"risk":"normal"}"#;
+    /// The spec fake-claude's `spec_review_edit` proposes edits to.
+    const EDITABLE: &str = r#"{"goal":"guard the ledger","acceptance_criteria":["AC1: rejects a double spend","AC2: logs the rejection"],"constraints":["no new crate"],"non_goals":["rewriting the transport","changing the log format"],"excluded_alternatives":[],"risk":"important"}"#;
+    const HOUR: u64 = 3600;
+
+    /// `f.cmd()` without any inherited variable whose name holds KEY, TOKEN,
+    /// SECRET or PASSWORD (names are read, never values), nor the two
+    /// benchmark keys.
+    fn cmd(f: &Fixture) -> assert_cmd::Command {
+        let mut c = f.cmd();
+        for (name, _) in std::env::vars_os() {
+            let upper = name.to_string_lossy().to_uppercase();
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+                c.env_remove(&name);
+            }
+        }
+        c.env_remove("AISTUPIDLEVEL_API_KEY").env_remove("ARTIFICIALANALYSIS_API_KEY");
+        c
+    }
+
+    /// Runs `c`; panics with its exit code, stdout and stderr unless it
+    /// exits 0; its stdout.
+    fn run_ok(mut c: assert_cmd::Command, what: &str) -> Vec<u8> {
+        let out = c.output().expect("spawn thoth");
+        if !out.status.success() {
+            panic!(
+                "thoth {what} exited {:?}\nstdout: {}\nstderr: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        out.stdout
+    }
+
+    fn ok_json(c: assert_cmd::Command, what: &str) -> Value {
+        let out = run_ok(c, what);
+        serde_json::from_slice(&out)
+            .unwrap_or_else(|e| panic!("{what}: not JSON ({e}): {}", String::from_utf8_lossy(&out)))
+    }
+
+    /// `thoth ARGS` (the caller gives `--json`), exit 0, as JSON.
+    fn cli(f: &Fixture, args: &[&str]) -> Value {
+        let mut c = cmd(f);
+        c.args(args);
+        ok_json(c, &args.join(" "))
+    }
+
+    fn s(v: &Value) -> String {
+        v.as_str().unwrap_or_else(|| panic!("not a string: {v}")).to_string()
+    }
+
+    /// `profile add ID --provider P --harness H` for a fresh folder; the folder.
+    fn add_profile(f: &Fixture, provider: &str, harness: &str, id: &str) -> PathBuf {
+        let dir = f.home_path().join("profiles").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let shown = dir.display().to_string();
+        cli(f, &["profile", "add", id, "--provider", provider, "--harness", harness, "--config-dir", &shown, "--json"]);
+        dir
+    }
+
+    fn create_task(f: &Fixture, spec: &str) -> String {
+        let file = f.home_path().join("spec.json");
+        fs::write(&file, spec).unwrap();
+        let shown = file.display().to_string();
+        s(&cli(f, &["task", "create", "-f", &shown, "--json"])["task_id"])
+    }
+
+    /// A fresh THOTH_HOME and repository, initialised, with claude-a and
+    /// claude-b registered.
+    fn init() -> Fixture {
+        let f = common::fixture();
+        run_ok({
+            let mut c = cmd(&f);
+            c.arg("init");
+            c
+        }, "init");
+        add_profile(&f, "anthropic", "claude-code", "claude-a");
+        add_profile(&f, "anthropic", "claude-code", "claude-b");
+        f
+    }
+
+    /// `wait --run RUN` until the run is terminal; its `--json`.
+    fn wait_run(f: &Fixture, run: &str) -> Value {
+        cli(f, &["wait", "--run", run, "--timeout", "180s", "--json"])
+    }
+
+    /// The run's entry in `status TASK --json`, found by its id.
+    fn run_of(f: &Fixture, task: &str, run: &str) -> Value {
+        let v = cli(f, &["status", task, "--json"]);
+        v["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["run_id"] == run)
+            .cloned()
+            .unwrap_or_else(|| panic!("no run {run}: {v}"))
+    }
+
+    /// The `ty` event of `run`, through `events --task TASK --json`.
+    fn event_of(f: &Fixture, task: &str, run: &str, ty: &str) -> Value {
+        let v = cli(f, &["events", "--since", "0", "--task", task, "--json"]);
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|e| e["run_id"] == run && e["type"] == ty)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {ty} for {run}: {v}"))
+    }
+
+    /// A launch command with the fake's scenario and the task it works on.
+    fn launch(f: &Fixture, task: &str, scenario: &str, args: &[&str]) -> assert_cmd::Command {
+        let mut c = cmd(f);
+        c.env("FAKE_SCENARIO", scenario).env("FAKE_TASK_ID", task).args(args);
+        c
+    }
+
+    /// `dispatch TASK --profile claude-a --reason R --json` plus `extra`.
+    fn dispatch(f: &Fixture, task: &str, scenario: &str, extra: &[&str]) -> Value {
+        let mut c = launch(f, task, scenario, &["dispatch", task, "--profile", "claude-a", "--reason", REASON, "--json"]);
+        c.args(extra);
+        ok_json(c, "dispatch")
+    }
+
+    // AC1: dispatch ------------------------------------------------------------
+
+    #[test]
+    fn a_dispatch_without_timeout_gets_the_default_for_the_effort_sent() {
+        for (model, effort, want) in [
+            ("sonnet", Some("low"), HOUR),
+            ("sonnet", Some("high"), 3 * HOUR),
+            ("sonnet", Some("max"), 4 * HOUR),
+            ("haiku", None, HOUR),
+        ] {
+            let f = init();
+            let task = create_task(&f, Fixture::SPEC);
+            let mut extra = vec!["--model", model];
+            if let Some(e) = effort {
+                extra.extend(["--effort", e]);
+            }
+            let d = dispatch(&f, &task, "ok", &extra);
+            let run = s(&d["run_id"]);
+            assert_eq!(d["effort"], json!(effort), "{d}");
+            assert_eq!(d["timeout_seconds"], want, "{model} {effort:?}: {d}");
+            wait_run(&f, &run);
+            let r = run_of(&f, &task, &run);
+            assert_eq!(r["effort"], json!(effort), "{r}");
+            assert_eq!(r["timeout_seconds"], want, "{model} {effort:?}: {r}");
+        }
+    }
+
+    #[test]
+    fn a_given_timeout_is_used_as_given() {
+        let f = init();
+        let task = create_task(&f, Fixture::SPEC);
+        let d = dispatch(&f, &task, "ok", &["--model", "sonnet", "--effort", "high", "--timeout", "45m"]);
+        let run = s(&d["run_id"]);
+        assert_eq!(d["timeout_seconds"], 2700, "{d}");
+        wait_run(&f, &run);
+        assert_eq!(run_of(&f, &task, &run)["timeout_seconds"], 2700);
+    }
+
+    /// A reroute in the same attempt keeps the previous run's effort, and the
+    /// default follows that effort; the previous run's own `--timeout` is not
+    /// kept.
+    #[test]
+    fn a_reroute_that_keeps_high_gets_the_high_default_not_the_previous_timeout() {
+        let f = init();
+        let task = create_task(&f, Fixture::SPEC);
+        let first = dispatch(&f, &task, "quota", &["--model", "sonnet", "--effort", "high", "--timeout", "20m"]);
+        assert_eq!(first["timeout_seconds"], 1200, "{first}");
+        let first_run = s(&first["run_id"]);
+        assert_eq!(wait_run(&f, &first_run)["status"], "interrupted");
+
+        // neither --model nor --effort nor --timeout: the reroute keeps sonnet
+        // and high from the stopped run
+        let c = launch(&f, &task, "ok", &["dispatch", &task, "--profile", "claude-b", "--reason", REASON, "--json"]);
+        let d = ok_json(c, "reroute dispatch");
+        let run = s(&d["run_id"]);
+        assert_eq!(d["attempt"], first["attempt"], "{d}");
+        assert_eq!(d["effort"], "high", "{d}");
+        assert_eq!(d["timeout_seconds"], 3 * HOUR, "{d}");
+        wait_run(&f, &run);
+        let r = run_of(&f, &task, &run);
+        assert_eq!(r["timeout_seconds"], 3 * HOUR, "{r}");
+        assert_eq!(run_of(&f, &task, &first_run)["timeout_seconds"], 1200);
+    }
+
+    /// An agy model name that carries `high` is that effort: its default, and
+    /// agy's `--print-timeout` 300 seconds past it.
+    #[test]
+    fn an_agy_dispatch_passes_print_timeout_from_the_default() {
+        let f = common::fixture();
+        run_ok({
+            let mut c = cmd(&f);
+            c.arg("init");
+            c
+        }, "init");
+        let data = add_profile(&f, "google", "antigravity", "agy-a");
+        let log = f.home_path().join("fake-agy-args.jsonl");
+        let task = create_task(&f, Fixture::SPEC);
+        let mut c = launch(&f, &task, "ok", &["dispatch", &task, "--profile", "agy-a", "--model", "gemini-3.8-flash-high", "--reason", REASON, "--json"]);
+        c.env("FAKE_AGY_DATA_DIR", &data).env("FAKE_AGY_ARGS_LOG", &log);
+        let d = ok_json(c, "agy dispatch");
+        let run = s(&d["run_id"]);
+        assert_eq!(d["effort"], "high", "{d}");
+        assert_eq!(d["timeout_seconds"], 3 * HOUR, "{d}");
+        wait_run(&f, &run);
+        let launches: Vec<Vec<String>> = fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["args"][0] == "-p")
+            .map(|v| v["args"].as_array().unwrap().iter().map(s).collect())
+            .collect();
+        assert_eq!(launches.len(), 1, "{launches:?}");
+        let want = format!("{}s", 3 * HOUR + 300);
+        let at = launches[0].iter().position(|a| a == "--print-timeout").expect("--print-timeout");
+        assert_eq!(launches[0][at + 1], want, "{:?}", launches[0]);
+    }
+
+    /// A fresh THOTH_HOME with codex-a, whose model cache offers `CODEX_MODEL`
+    /// at `levels` only, and a task.
+    fn codex_init(levels: &[&str]) -> (Fixture, String) {
+        let f = common::fixture();
+        run_ok({
+            let mut c = cmd(&f);
+            c.arg("init");
+            c
+        }, "init");
+        let cfg = add_profile(&f, "openai", "codex", "codex-a");
+        let offered: Vec<Value> = levels.iter().map(|e| json!({"effort": e})).collect();
+        let cache = json!({"models": [{"slug": super::CODEX_MODEL, "supported_reasoning_levels": offered}]});
+        fs::write(cfg.join("models_cache.json"), cache.to_string()).unwrap();
+        let task = create_task(&f, Fixture::SPEC);
+        (f, task)
+    }
+
+    /// The `model_reasoning_effort` of every `exec` fake-codex logged.
+    fn codex_efforts(log: &std::path::Path) -> Vec<String> {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["args"][0] == "exec")
+            .flat_map(|v| {
+                v["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(s)
+                    .filter_map(|a| a.strip_prefix("model_reasoning_effort=").map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// codex lowers an effort its model does not offer; the default follows
+    /// the level it lowered to, not the one asked for, in `--json` and in the
+    /// human first line alike.
+    #[test]
+    fn a_codex_dispatch_gets_the_default_for_the_lowered_effort() {
+        // --json: max is not offered, high is sent; max would have been 4h
+        let (f, task) = codex_init(&["low", "medium", "high"]);
+        let log = f.home_path().join("fake-codex-args.jsonl");
+        let mut c = launch(&f, &task, "ok", &["dispatch", &task, "--profile", "codex-a", "--model", super::CODEX_MODEL, "--effort", "max", "--reason", REASON, "--json"]);
+        c.env("FAKE_CODEX_ARGS_LOG", &log);
+        let d = ok_json(c, "codex dispatch --json");
+        let run = s(&d["run_id"]);
+        assert_eq!(d["effort_requested"], "max", "{d}");
+        assert_eq!(d["effort"], "high", "{d}");
+        assert_eq!(d["timeout_seconds"], 3 * HOUR, "{d}");
+        wait_run(&f, &run);
+        let r = run_of(&f, &task, &run);
+        assert_eq!(r["effort"], "high", "{r}");
+        assert_eq!(r["timeout_seconds"], 3 * HOUR, "{r}");
+        assert_eq!(codex_efforts(&log), ["\"high\""]);
+
+        // human: high is not offered, medium is sent; high would have been 3h
+        let (f, task) = codex_init(&["low", "medium"]);
+        let log = f.home_path().join("fake-codex-args.jsonl");
+        let mut c = launch(&f, &task, "ok", &["dispatch", &task, "--profile", "codex-a", "--model", super::CODEX_MODEL, "--effort", "high", "--reason", REASON]);
+        c.env("FAKE_CODEX_ARGS_LOG", &log);
+        let out = c.output().expect("spawn thoth");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stderr.contains("high is not supported by gpt-5.6-luna; using medium"), "{stderr}");
+        let first = stdout.lines().next().unwrap_or_default().to_string();
+        assert!(first.ends_with(", timeout 3600s)"), "{stdout}");
+        let run = first
+            .strip_prefix("dispatched ")
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("no run id in {first}"))
+            .to_string();
+        wait_run(&f, &run);
+        let r = run_of(&f, &task, &run);
+        assert_eq!(r["effort_requested"], "high", "{r}");
+        assert_eq!(r["effort"], "medium", "{r}");
+        assert_eq!(r["timeout_seconds"], HOUR, "{r}");
+        assert_eq!(codex_efforts(&log), ["\"medium\""]);
+    }
+
+    // AC2: the human first line ------------------------------------------------
+
+    #[test]
+    fn the_human_first_line_ends_with_the_timeout() {
+        let f = init();
+        let task = create_task(&f, Fixture::SPEC);
+        let out = run_ok(
+            launch(&f, &task, "ok", &["dispatch", &task, "--profile", "claude-a", "--model", "sonnet", "--effort", "medium", "--reason", REASON]),
+            "dispatch",
+        );
+        let out = String::from_utf8(out).unwrap();
+        let first = out.lines().next().unwrap_or_default().to_string();
+        assert!(first.ends_with(", timeout 3600s)"), "{out}");
+        assert!(first.contains(", runner pid "), "{out}");
+        let run = first
+            .strip_prefix("dispatched ")
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("no run id in {first}"));
+        wait_run(&f, run);
+    }
+
+    // AC1: help ----------------------------------------------------------------
+
+    #[test]
+    fn the_launch_commands_help_says_the_default_follows_the_effort() {
+        let f = common::fixture();
+        let help = |args: &[&str]| {
+            let mut c = cmd(&f);
+            c.args(args).arg("--help");
+            String::from_utf8(run_ok(c, &args.join(" "))).unwrap()
+        };
+        for args in [
+            &["dispatch"][..],
+            &["review", "start"],
+            &["review", "confirm"],
+            &["spec", "review", "start"],
+            &["spec", "review", "confirm"],
+        ] {
+            let text = help(args);
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(!text.contains("[default: 30m]"), "{args:?}: {text}");
+            assert!(flat.contains("the default follows the effort sent"), "{args:?}: {text}");
+        }
+        assert!(help(&["wait"]).contains("[default: 30m]"));
+        assert!(help(&["verify"]).contains("[default: 600s]"));
+    }
+
+    // AC1: review start, review confirm ----------------------------------------
+
+    /// `count` numbered lines, `prefix N`.
+    fn lines(prefix: &str, count: usize) -> String {
+        (1..=count).map(|i| format!("{prefix} {i}\n")).collect()
+    }
+
+    /// A task of SPEC at `in_review`, implemented by claude-a.
+    fn in_review() -> (Fixture, String) {
+        let f = common::fixture();
+        let repo = f.repo_path();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/greet.rs"), lines("line", 30)).unwrap();
+        fs::write(repo.join(".gitattributes"), "* -text\n").unwrap();
+        common::git(&repo, &["add", "-A"]);
+        common::git(&repo, &["commit", "-m", "candidate files"]);
+        run_ok({
+            let mut c = cmd(&f);
+            c.arg("init");
+            c
+        }, "init");
+        add_profile(&f, "anthropic", "claude-code", "claude-a");
+        add_profile(&f, "anthropic", "claude-code", "claude-b");
+        let task = create_task(&f, SPEC);
+        let d = dispatch(&f, &task, "ok", &["--model", "sonnet", "--effort", "medium"]);
+        wait_run(&f, &s(&d["run_id"]));
+        assert_eq!(cli(&f, &["status", &task, "--json"])["status"], "in_review");
+        (f, task)
+    }
+
+    /// The run's `timeout_seconds` in `status` and in its `started` event.
+    fn assert_timeout(f: &Fixture, task: &str, run: &str, started: &str, want: u64) {
+        assert_eq!(run_of(f, task, run)["timeout_seconds"], want, "{run}");
+        let e = event_of(f, task, run, started);
+        assert_eq!(e["detail"]["timeout_seconds"], want, "{e}");
+    }
+
+    #[test]
+    fn review_start_defaults_by_effort_and_takes_a_given_timeout() {
+        for (extra, want) in [(&["--effort", "high"][..], 3 * HOUR), (&["--effort", "medium", "--timeout", "20m"], 1200)] {
+            let (f, task) = in_review();
+            let mut c = launch(&f, &task, "review_pass", &["review", "start", &task, "--profile", "claude-b", "--model", "sonnet", "--reason", REASON, "--json"]);
+            c.args(extra);
+            let r = ok_json(c, "review start");
+            let run = s(&r["run_id"]);
+            wait_run(&f, &run);
+            assert_timeout(&f, &task, &run, "review_started", want);
+        }
+    }
+
+    /// RFIX-1, as tests/review_fix.rs does it: an applied fix of AC1 by an
+    /// edit review, verified by an approved green check.
+    fn pending_fix() -> (Fixture, String) {
+        let (f, task) = in_review();
+        cli(&f, &["checks", "add", "green", "--cmd", "git --version", "--shell", "argv", "--json"]);
+        cli(&f, &["checks", "approve", "--reason", "test approval", "--json"]);
+        let evidence = cli(&f, &["evidence", "list", &task, "--json"]);
+        let code = s(&evidence["evidence"][0]["code"]);
+        let plan = json!({"document": {
+            "verdict": "REJECT",
+            "findings": {"criteria": [
+                {"id": "AC1", "verdict": "unmet", "evidence": [code], "note": "the greeting is wrong", "category": "spec_mismatch", "fix_size": "S"},
+                {"id": "AC2", "verdict": "met", "evidence": [code]}
+            ], "extra_findings": []},
+            "edits": [{"path": "src/greet.rs", "old": "line 1\n", "new": "line one\n", "criterion": "AC1", "reason": "fixes the finding"}],
+        }});
+        let plan_file = f.home_path().join("plan.json");
+        fs::write(&plan_file, plan.to_string()).unwrap();
+        let mut c = launch(&f, &task, "review_fix", &["review", "start", &task, "--profile", "claude-b", "--model", "opus", "--effort", "medium", "--edit", "--reason", REASON, "--json"]);
+        c.env("FAKE_FIX_PLAN", &plan_file);
+        let edit = s(&ok_json(c, "review start --edit")["run_id"]);
+        let w = wait_run(&f, &edit);
+        assert_eq!(w["pending_fix"], true, "{w}");
+        let mut c = cmd(&f);
+        c.args(["verify", &edit, "--json"]);
+        run_ok(c, "verify");
+        (f, task)
+    }
+
+    #[test]
+    fn review_confirm_defaults_by_effort_and_takes_a_given_timeout() {
+        for (extra, want) in [(&["--effort", "high"][..], 3 * HOUR), (&["--effort", "high", "--timeout", "20m"], 1200)] {
+            let (f, task) = pending_fix();
+            let mut c = launch(&f, &task, "fix_confirm_approve", &["review", "confirm", &task, "--profile", "claude-a", "--model", "sonnet", "--reason", REASON, "--json"]);
+            c.args(extra);
+            let r = ok_json(c, "review confirm");
+            let run = s(&r["run_id"]);
+            wait_run(&f, &run);
+            assert_timeout(&f, &task, &run, "review_started", want);
+        }
+    }
+
+    // AC1: spec review start, spec review confirm ------------------------------
+
+    #[test]
+    fn spec_review_start_defaults_by_effort_and_takes_a_given_timeout() {
+        for (spec, scenario, extra, want) in [
+            (SPEC, "spec_review_approve", &["--effort", "high"][..], 3 * HOUR),
+            (EDITABLE, "spec_review_edit", &["--effort", "medium", "--timeout", "20m", "--edit"], 1200),
+        ] {
+            let f = init();
+            let task = create_task(&f, spec);
+            let mut c = launch(&f, &task, scenario, &["spec", "review", "start", &task, "--profile", "claude-a", "--model", "sonnet", "--reason", REASON, "--json"]);
+            c.args(extra);
+            let r = ok_json(c, "spec review start");
+            let run = s(&r["run_id"]);
+            wait_run(&f, &run);
+            assert_timeout(&f, &task, &run, "spec_review_started", want);
+        }
+    }
+
+    /// SR-3, as tests/spec_review_edit.rs does it: claude-b's edit review of
+    /// EDITABLE, its edits pending. haiku has no effort setting, so that
+    /// review gets the one-hour default.
+    fn pending_edits() -> (Fixture, String) {
+        let f = init();
+        let task = create_task(&f, EDITABLE);
+        let c = launch(&f, &task, "spec_review_edit", &["spec", "review", "start", &task, "--profile", "claude-b", "--model", "haiku", "--edit", "--reason", REASON, "--json"]);
+        let run = s(&ok_json(c, "spec review start --edit")["run_id"]);
+        assert_eq!(wait_run(&f, &run)["verdict"], "REVISE");
+        assert_timeout(&f, &task, &run, "spec_review_started", HOUR);
+        assert_eq!(cli(&f, &["spec", "review", "show", &task, "--json"])["pending_edits"], true);
+        (f, task)
+    }
+
+    #[test]
+    fn spec_review_confirm_defaults_by_effort_and_takes_a_given_timeout() {
+        for (extra, want) in [(&["--effort", "high"][..], 3 * HOUR), (&["--effort", "high", "--timeout", "20m"], 1200)] {
+            let (f, task) = pending_edits();
+            let mut c = launch(&f, &task, "spec_confirm_approve", &["spec", "review", "confirm", &task, "--profile", "claude-a", "--model", "sonnet", "--reason", REASON, "--json"]);
+            c.args(extra);
+            let r = ok_json(c, "spec review confirm");
+            let run = s(&r["run_id"]);
+            wait_run(&f, &run);
+            assert_timeout(&f, &task, &run, "spec_review_started", want);
+        }
+    }
+
+    // AC3: the timeout next step -----------------------------------------------
+
+    #[test]
+    fn a_timed_out_runs_next_step_doubles_the_larger_of_its_timeout_and_its_default() {
+        for (extra, model, want) in [
+            (&[][..], "haiku", "2h"),
+            (&["--effort", "high"], "sonnet", "6h"),
+        ] {
+            let f = init();
+            let task = create_task(&f, Fixture::SPEC);
+            let mut args = vec!["--model", model, "--timeout", "5s"];
+            args.extend(extra);
+            let d = dispatch(&f, &task, "slow", &args);
+            let run = s(&d["run_id"]);
+            let w = wait_run(&f, &run);
+            assert_eq!(w["status"], "failed", "{w}");
+            let r = run_of(&f, &task, &run);
+            assert_eq!(r["interrupted_reason"], "timeout", "{r}");
+            assert_eq!(
+                r["next_step"],
+                format!(
+                    "the run hit its wall-clock timeout; dispatch again with a larger --timeout: \
+                     thoth dispatch {task} --profile claude-a --model {model} --timeout {want}"
+                ),
+                "{r}"
+            );
+        }
+    }
+}

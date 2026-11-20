@@ -228,7 +228,7 @@ fn the_top_level_keys_and_tables_only_with_the_flag() {
     write_caches(&f);
     let (task, _) = f.create_task(Fixture::SPEC);
     let keys = [
-        "candidates", "live_quota_refresh", "model", "role", "score_refresh", "tables", "task_history", "task_id",
+        "candidates", "live_quota_refresh", "model", "quota_reserve_percent", "role", "score_refresh", "tables", "task_history", "task_id",
         "unmatched",
     ];
     for task in [None, Some(task.as_str())] {

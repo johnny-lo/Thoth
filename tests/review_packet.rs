@@ -115,10 +115,12 @@ fn json_packet_has_the_specified_keys_and_shapes() {
     assert_eq!(
         keys,
         vec![
-            "approvals", "claims", "claims_run_id", "diffs", "evidence", "protected_changes",
+            "approvals", "checks_not_run", "claims", "claims_run_id", "diffs", "evidence", "protected_changes",
             "reviews", "risk", "runs", "spec", "status", "task_id", "title"
         ]
     );
+    // REV-3 (AC4): the spec lists no checks, so nothing is required
+    assert_eq!(v["checks_not_run"], serde_json::json!([]));
     // P7-2: the hooks worker only adds files, so nothing protected changed
     assert_eq!(v["protected_changes"], serde_json::json!([]));
     assert_eq!(v["task_id"], task_id);
@@ -134,11 +136,15 @@ fn json_packet_has_the_specified_keys_and_shapes() {
     for e in evidence {
         let mut ek: Vec<&str> = e.as_object().unwrap().keys().map(|s| s.as_str()).collect();
         ek.sort();
+        // RVI-1 (AC3): `execution_error` is additive; it is set only on a
+        // verify row whose check did not complete cleanly, and this task
+        // has none
         assert_eq!(
             ek,
-            vec!["code", "exit_code", "kind", "label", "output_tail", "run_id"],
+            vec!["code", "execution_error", "exit_code", "kind", "label", "output_tail", "run_id"],
             "{e}"
         );
+        assert!(e["execution_error"].is_null(), "{e}");
         if e["kind"] == "command" {
             assert!(e["output_tail"].is_string(), "{e}");
         } else {
@@ -154,7 +160,15 @@ fn json_packet_has_the_specified_keys_and_shapes() {
     assert_eq!(diffs.len(), 1, "{diffs:?}");
     let mut dk: Vec<&str> = diffs[0].as_object().unwrap().keys().map(|s| s.as_str()).collect();
     dk.sort();
-    assert_eq!(dk, vec!["blob_verified", "code", "content", "run_id"]);
+    // SMALL-9c (AC3): `from_commit`, `to_commit`, `diff_from_rule` and
+    // `integrated_files` are additive
+    assert_eq!(
+        dk,
+        vec![
+            "blob_verified", "code", "content", "diff_from_rule", "from_commit", "integrated_files",
+            "run_id", "to_commit"
+        ]
+    );
     assert_eq!(diffs[0]["blob_verified"], true);
     assert!(diffs[0]["content"].as_str().unwrap().contains("pub fn added()"));
     assert_eq!(diffs[0]["run_id"], run_id);

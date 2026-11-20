@@ -23,7 +23,9 @@ fn review_pass_settles_the_task_pass_and_review_show_reports_the_findings() {
     let f = common::fixture();
     let (task_id, implementer_run) = candidate_ready(&f, common::Fixture::SPEC_TWO_AC);
 
-    let r = f.review_start(&task_id, "claude-a", "review_pass", &["--model", "haiku"]);
+    // RFIX-2: a plain review (a code task is in edit mode by default, in the
+    // -a1-fix worktree); this test checks the review worktree.
+    let r = f.review_start(&task_id, "claude-a", "review_pass", &["--model", "haiku", "--no-edit"]);
     let reviewer_run = r["run_id"].as_str().unwrap().to_string();
     assert_eq!(r["target_run_id"], serde_json::json!(implementer_run.clone()));
     assert_eq!(r["allowed_tools"], "Bash,Read,Glob,Grep");

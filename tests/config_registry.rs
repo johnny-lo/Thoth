@@ -94,7 +94,11 @@ fn list_shows_every_setting_with_its_source_and_what_lives_elsewhere_without_wri
     assert_eq!(out.status.code(), Some(0));
     let v = json_of(&out);
     let settings = v["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 16);
+    // AUTO-1a: no hard-coded total (verify-slots was added last); every key
+    // is listed once.
+    let keys: std::collections::BTreeSet<&str> = settings.iter().map(|s| s["key"].as_str().unwrap()).collect();
+    assert_eq!(keys.len(), settings.len());
+    assert!(keys.contains("verify-slots"));
     for (i, key) in ["live-quota", "scores-auto-refresh", "require-reason"]
         .iter()
         .enumerate()
@@ -481,7 +485,11 @@ fn mcp_lists_settings_read_only_without_secret_values_and_has_no_set_tool() {
     s.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}));
     let list = s.send(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 36);
+    // AUTO-1a: no hard-coded total (the pipeline tools were added); every
+    // tool is listed once and thoth_guide stays last.
+    let unique: std::collections::BTreeSet<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(unique.len(), tools.len());
+    assert_eq!(tools.last().unwrap()["name"], "thoth_guide");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     let at = names.iter().position(|n| *n == "thoth_config_list").unwrap();
     assert_eq!(names[at + 1], "thoth_doctor");
@@ -495,7 +503,10 @@ fn mcp_lists_settings_read_only_without_secret_values_and_has_no_set_tool() {
     let res = s.call(3, "thoth_config_list", json!({}));
     assert_eq!(res["result"]["isError"], false, "{res}");
     let sc = &res["result"]["structuredContent"];
-    assert_eq!(sc["settings"].as_array().unwrap().len(), 16);
+    // AUTO-1a: the same list the CLI gives, compared before and after
+    // rather than counted.
+    let cli = json_of(&f.cmd().env_remove("THOTH_LANG").args(["config", "list", "--json"]).output().unwrap());
+    assert_eq!(sc["settings"].as_array().unwrap().len(), cli["settings"].as_array().unwrap().len());
     assert!(sc["elsewhere"].is_object());
     let key = sc["settings"].as_array().unwrap().iter().find(|x| x["key"] == "aistupidlevel-api-key").unwrap();
     assert_eq!(key["value"], "set");

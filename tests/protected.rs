@@ -268,6 +268,8 @@ fn an_added_file_named_like_a_check_word_is_listed_and_approved() {
     let diffs_at = md.find("## Diffs").unwrap();
     assert!(at < diffs_at, "before the diffs:\n{md}");
     let section = &md[at..diffs_at];
+    // Keep the assertions scoped to protected files when later packet sections are added.
+    let section = section.split("\n## ").next().unwrap();
     assert!(section.contains("cargo.bat (added, check_word)"), "{section}");
     assert!(section.contains("- cargo.bat: a wrapper the task asked for\n"), "{section}");
     assert!(!section.contains("(none)"), "{section}");
@@ -440,7 +442,10 @@ fn a_change_a_merge_of_main_brought_in_needs_no_claim() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     files.sort();
-    assert_eq!(files, ["src/added.rs", "tests/added_test.rs", "tests/pre_test.rs"]);
+    // SMALL-9c: the test main changed is left out of the diff itself too.
+    assert_eq!(files, ["src/added.rs", "tests/added_test.rs"]);
+    assert_eq!(detail["integrated_files"], json!(["tests/pre_test.rs"]));
+    assert_eq!(detail["diff_from_rule"], "merge_base");
     assert_eq!(detail["touches_tests"], true);
     assert_eq!(detail["integration_tip"], tip.as_str());
     assert_eq!(detail["protected_base"], base.as_str());

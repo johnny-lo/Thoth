@@ -756,8 +756,12 @@ fn confirm_refuses_without_pending_edits_a_changed_spec_and_a_failed_task() {
     assert_eq!(run_count(&f, &task2), runs_before);
 }
 
-/// AC7: an edit on a field that cannot be edited, and an edit that makes the
-/// spec too large, are `spec_review_invalid` and leave no `spec_review`.
+/// AC7: an edit that makes the spec too large is `spec_review_invalid` and
+/// leaves no `spec_review`. SR-4 changed the first half: an edit on a field
+/// that cannot be edited used to refuse the whole review at stage `edits`;
+/// now it is refused alone, and the REVISE (here with no edit left) is kept
+/// with that refusal in `refused_edits`. The oversized proposal keeps its
+/// whole-review refusal at stage `lint`.
 #[test]
 fn bad_and_oversized_edits_are_refused_without_a_spec_review_event() {
     let f = standard();
@@ -767,36 +771,38 @@ fn bad_and_oversized_edits_are_refused_without_a_spec_review_event() {
     let run = s(&r["run_id"]);
     let w = wait_run(&f, &run);
     assert_eq!(w["status"], "completed", "{}", f.explain_run(&run));
-    assert_eq!(w["verdict"], Value::Null);
-    assert_eq!(count_events(&f, &task, "spec_review_invalid"), 1);
-    let (ev_run, d) = last_event(&f, &task, "spec_review_invalid");
+    assert_eq!(w["verdict"], "REVISE");
+    assert_eq!(count_events(&f, &task, "spec_review_invalid"), 0);
+    let (ev_run, d) = last_event(&f, &task, "spec_review");
     assert_eq!(ev_run.as_deref(), Some(run.as_str()));
-    assert_eq!(d["stage"], "edits");
-    assert_eq!(d["source"], "reviewer_run");
-    assert_eq!(d["reviewer_run_id"], run);
+    assert_eq!(d["mode"], "edit");
+    assert_eq!(d["edit_count"], 0);
+    assert_eq!(d["edits"], json!([]));
+    assert!(d["proposed_spec"].is_null(), "{d}");
     assert_eq!(
-        d["reason"],
-        "edit 0 (risk): field must be one of goal, acceptance_criteria, constraints, non_goals, excluded_alternatives"
+        d["refused_edits"],
+        json!([{"index": 0, "field": "risk", "reason":
+            "field must be one of goal, acceptance_criteria, constraints, non_goals, excluded_alternatives"}])
     );
-    assert_eq!(count_events(&f, &task, "spec_review"), 0);
     assert_eq!(task_status(&f, &task), "queued");
     let shown = show_json(&f, &task);
-    assert_eq!(shown["review_count"], 0);
+    assert_eq!(shown["review_count"], 1);
     assert_eq!(shown["pending_edits"], false);
+    assert_eq!(stored_spec(&f, &task), EDITABLE);
 
     let r = spec_start(&f, &task, "claude-a", "spec_review_edit_big", &["--model", "haiku", "--edit"], &[]);
     let run = s(&r["run_id"]);
     let w = wait_run(&f, &run);
     assert_eq!(w["status"], "completed", "{}", f.explain_run(&run));
     assert_eq!(w["verdict"], Value::Null);
-    assert_eq!(count_events(&f, &task, "spec_review_invalid"), 2);
+    assert_eq!(count_events(&f, &task, "spec_review_invalid"), 1);
     let (_, d) = last_event(&f, &task, "spec_review_invalid");
     assert_eq!(d["stage"], "lint");
     assert!(s(&d["reason"]).contains("too_large"), "{d}");
-    assert_eq!(count_events(&f, &task, "spec_review"), 0);
+    assert_eq!(count_events(&f, &task, "spec_review"), 1);
     assert_eq!(task_status(&f, &task), "queued");
     let refused = dispatch_err(&f, &task, &[]);
-    assert!(refused.contains("no spec review is recorded"), "{refused}");
+    assert!(refused.contains(" is REVISE)"), "{refused}");
 }
 
 /// AC6: an edit REVISE, an author's REVISE and another edit REVISE are three
@@ -870,7 +876,11 @@ fn mcp_edit_review_and_author_confirm() {
     let tools = list["result"]["tools"].as_array().unwrap();
     // thoth_review_confirm sits after thoth_review_start, one place before
     // these.
-    assert_eq!(tools.len(), 36);
+    // AUTO-1a: no hard-coded total (the pipeline tools were added); every
+    // tool is listed once and thoth_guide stays last.
+    let unique: std::collections::BTreeSet<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(unique.len(), tools.len());
+    assert_eq!(tools.last().unwrap()["name"], "thoth_guide");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names[20], "thoth_spec_review_start");
     assert_eq!(names[21], "thoth_spec_review_confirm");
@@ -1061,12 +1071,15 @@ fn an_event_without_a_mode_reads_its_mode_from_its_source() {
     let f = standard();
     let (task, _) = f.create_task(EDITABLE);
     let written_before_sr3 = |d: &Value| {
-        for k in ["mode", "edits", "edit_count", "proposed_spec", "proposed_sha256", "bytes_before", "bytes_after"] {
+        // SR-4: `refused_edits` is newer still, so such an event lacks it too
+        for k in ["mode", "edits", "edit_count", "proposed_spec", "proposed_sha256", "bytes_before", "bytes_after", "refused_edits"] {
             assert!(d.get(k).is_none(), "{k} in {d}");
         }
     };
     let no_edits = |shown: &Value| {
         assert_eq!(shown["newest"]["edit_count"], 0, "{shown}");
+        // SR-4 (AC3): an older review reads as no refused edits
+        assert_eq!(shown["newest"]["refused_edits"], json!([]), "{shown}");
         assert!(shown["newest"]["proposed_sha256"].is_null(), "{shown}");
         assert_eq!(shown["pending_edits"], false, "{shown}");
     };
@@ -1170,4 +1183,585 @@ fn help_lists_the_edit_flag_confirm_and_proposed_out() {
     }
     let show = help(&["spec", "review", "show", "--help"]);
     assert!(show.contains("--proposed-out"), "{show}");
+}
+
+// --- SR-4: short anchors and edits refused one by one ---------------------
+//
+// Every command below goes through `sr4_cmd`, which drops each inherited
+// variable whose name holds KEY, TOKEN, SECRET or PASSWORD (names only), and
+// reads Thoth through its CLI and the files the fakes consume.
+
+/// Five criteria, so a short `AC5: Docs` prefix and a criterion found by a
+/// middle substring are both there; constraints with two entries starting
+/// with `n` and one holding `zzz` (overlapping `zz`); two non_goals that both
+/// hold `the`.
+const SR4_SPEC: &str = r#"{"goal":"guard the ledger against a double spend","acceptance_criteria":["AC1: rejects a double spend","AC2: logs the rejection","AC3: exits zero","AC4: names the rejected entry","AC5: Docs describe the rejection in docs/usage.md"],"constraints":["no new crate","nothing else","keep the log format","a zzz marker stays"],"non_goals":["rewriting the transport","renaming the ledger"],"excluded_alternatives":[],"risk":"important"}"#;
+const SR4_IDS: [&str; 5] = ["AC1", "AC2", "AC3", "AC4", "AC5"];
+
+fn sr4_cmd(f: &Fixture) -> assert_cmd::Command {
+    let mut c = f.cmd();
+    for (name, _) in std::env::vars_os() {
+        let upper = name.to_string_lossy().to_ascii_uppercase();
+        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+            c.env_remove(&name);
+        }
+    }
+    c
+}
+
+fn sr4_ok(f: &Fixture, args: &[&str]) -> Vec<u8> {
+    let mut c = sr4_cmd(f);
+    c.args(args);
+    f.run_ok(c, &args.join(" "))
+}
+
+fn sr4_json(f: &Fixture, args: &[&str]) -> Value {
+    parse_stdout(sr4_ok(f, args))
+}
+
+/// init and one Claude profile, `claude-b`.
+fn sr4_fixture() -> Fixture {
+    let f = common::fixture();
+    sr4_ok(&f, &["init"]);
+    let cfg = f.home_path().join("profiles").join("claude-b");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg = cfg.display().to_string();
+    sr4_ok(
+        &f,
+        &["profile", "add", "claude-b", "--provider", "anthropic", "--harness", "claude-code", "--config-dir", &cfg, "--json"],
+    );
+    f
+}
+
+fn sr4_task(f: &Fixture, spec: &str) -> String {
+    let file = write_json(f, "sr4-spec.json", spec);
+    let file = file.display().to_string();
+    s(&sr4_json(f, &["task", "create", "-f", &file, "--json"])["task_id"])
+}
+
+/// The task's stored spec, from `thoth task show TASK`.
+fn sr4_task_spec(f: &Fixture, task: &str) -> String {
+    let text = String::from_utf8(sr4_ok(f, &["task", "show", task])).unwrap();
+    let (_, spec) = text
+        .split_once("  spec:\n")
+        .unwrap_or_else(|| panic!("task show prints no spec: {text}"));
+    spec.strip_suffix('\n').unwrap_or(spec).to_string()
+}
+
+fn sr4_show(f: &Fixture, task: &str) -> Value {
+    sr4_json(f, &["spec", "review", "show", task, "--json"])
+}
+
+fn sr4_show_human(f: &Fixture, task: &str) -> String {
+    String::from_utf8(sr4_ok(f, &["spec", "review", "show", task])).unwrap()
+}
+
+/// `thoth events --task TASK --json`, the events of run `run` only.
+fn sr4_run_events(f: &Fixture, task: &str, run: &str) -> Vec<Value> {
+    sr4_json(f, &["events", "--since", "0", "--task", task, "--json"])["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["run_id"] == run)
+        .cloned()
+        .collect()
+}
+
+fn sr4_one(events: &[Value], ty: &str) -> Value {
+    let found: Vec<&Value> = events.iter().filter(|e| e["type"] == ty).collect();
+    assert_eq!(found.len(), 1, "one {ty} expected: {events:#?}");
+    found[0]["detail"].clone()
+}
+
+fn sr4_wait(f: &Fixture, run: &str) -> Value {
+    sr4_json(f, &["wait", "--run", run, "--timeout", "180s", "--json"])
+}
+
+/// One edit; `criterion` AC1 and a reason unless the test overrides them.
+fn sr4_edit(field: &str, op: &str, at: usize, anchor: &str, text: &str) -> Value {
+    json!({"field": field, "op": op, "at": at, "anchor": anchor, "text": text,
+           "criterion": "AC1", "reason": "fixture: says what to change"})
+}
+
+/// A REVISE with every criterion of `ids` ok, and `edits`.
+fn sr4_doc(ids: &[&str], edits: Vec<Value>) -> Value {
+    let criteria: Vec<Value> = ids.iter().map(|id| json!({"id": id, "verdict": "ok", "findings": []})).collect();
+    json!({"verdict": "REVISE", "criteria": criteria, "edits": edits})
+}
+
+/// `spec review start TASK --edit` (or `confirm TASK`) with the fake handing
+/// in `doc` as it is; the prompt it was handed goes to `prompt.txt` in the
+/// fixture's home under `name`. Returns the start's `--json`.
+fn sr4_launch(f: &Fixture, verb: &str, task: &str, name: &str, doc: &Value, envs: &[(&str, &str)]) -> Value {
+    let doc_file = write_json(f, &format!("{name}-doc.json"), &serde_json::to_string_pretty(doc).unwrap());
+    let prompt_file = f.home_path().join(format!("{name}-prompt.txt"));
+    let mut c = sr4_cmd(f);
+    c.env("FAKE_SCENARIO", "spec_review_doc_file")
+        .env("FAKE_TASK_ID", task)
+        .env("FAKE_SPEC_REVIEW_DOC", &doc_file)
+        .env("FAKE_PROMPT_OUT", &prompt_file)
+        .args(["spec", "review", verb, task]);
+    if verb == "start" {
+        c.arg("--edit");
+    }
+    c.args(["--profile", "claude-b", "--model", "sonnet", "--effort", "medium", "--reason", "fixture", "--json"]);
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    parse_stdout(f.run_ok(c, &format!("spec review {verb}")))
+}
+
+/// An edit review the ingest keeps: (run id, its `spec_review` detail, the
+/// prompt the fake was handed). No `spec_review_invalid` on the run.
+fn sr4_review(f: &Fixture, task: &str, name: &str, doc: &Value) -> (String, Value, String) {
+    let r = sr4_launch(f, "start", task, name, doc, &[]);
+    assert_eq!(r["mode"], "edit", "{r}");
+    let run = s(&r["run_id"]);
+    let w = sr4_wait(f, &run);
+    assert_eq!(w["status"], "completed", "{}", f.explain_run(&run));
+    assert_eq!(w["verdict"], "REVISE", "{w}");
+    let events = sr4_run_events(f, task, &run);
+    assert!(!events.iter().any(|e| e["type"] == "spec_review_invalid"), "{events:#?}");
+    let d = sr4_one(&events, "spec_review");
+    let prompt = std::fs::read_to_string(f.home_path().join(format!("{name}-prompt.txt"))).unwrap();
+    (run, d, prompt)
+}
+
+/// A review the ingest refuses whole: the `spec_review_invalid` detail. No
+/// `spec_review` on the run, and `show --json` is as it was before.
+fn sr4_refused_whole(f: &Fixture, task: &str, name: &str, doc: &Value) -> Value {
+    let before = sr4_show(f, task);
+    let r = sr4_launch(f, "start", task, name, doc, &[]);
+    let run = s(&r["run_id"]);
+    let w = sr4_wait(f, &run);
+    assert_eq!(w["status"], "completed", "{}", f.explain_run(&run));
+    assert_eq!(w["verdict"], Value::Null, "{w}");
+    let events = sr4_run_events(f, task, &run);
+    assert!(!events.iter().any(|e| e["type"] == "spec_review"), "{events:#?}");
+    assert_eq!(sr4_show(f, task), before, "{name}: show changed");
+    sr4_one(&events, "spec_review_invalid")
+}
+
+/// (index, field, reason) of each refused edit.
+fn sr4_refused(d: &Value) -> Vec<(u64, String, String)> {
+    d["refused_edits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no refused_edits array: {d}"))
+        .iter()
+        .map(|r| (r["index"].as_u64().unwrap(), s(&r["field"]), s(&r["reason"])))
+        .collect()
+}
+
+fn sr4_indices(d: &Value) -> Vec<u64> {
+    d["edits"].as_array().unwrap().iter().map(|e| e["index"].as_u64().unwrap()).collect()
+}
+
+fn sr4_proposed(d: &Value) -> Value {
+    let text = s(&d["proposed_spec"]);
+    assert_eq!(d["proposed_sha256"], sha(&text));
+    serde_json::from_str(&text).unwrap()
+}
+
+/// SR-4 AC1 (and AC6 for the reviewer's prompt): a short prefix of the entry
+/// at `at`, a one-character prefix shared by two entries, a unique middle
+/// substring with a stale `at`, a unique substring with `at` out of range,
+/// and an insert. Each edit replaces or deletes the whole entry and records
+/// the position it resolved to.
+#[test]
+fn sr4_short_and_unique_anchors_name_whole_entries() {
+    let f = sr4_fixture();
+    let task = sr4_task(&f, SR4_SPEC);
+    let doc = sr4_doc(
+        &SR4_IDS,
+        vec![
+            sr4_edit("acceptance_criteria", "replace", 4, "AC5: Docs", "AC5: Docs describe the rejection and its exit code in docs/usage.md"),
+            sr4_edit("constraints", "delete", 1, "n", ""),
+            sr4_edit("non_goals", "replace", 0, "the ledger", "renaming the ledger file"),
+            sr4_edit("acceptance_criteria", "replace", 17, "logs the", "AC2: logs the rejection once"),
+            sr4_edit("constraints", "insert", 0, "", "no network calls"),
+        ],
+    );
+    let (_, d, prompt) = sr4_review(&f, &task, "ac1", &doc);
+    assert_eq!(d["mode"], "edit");
+    assert_eq!(d["refused_edits"], json!([]), "{d}");
+    assert_eq!(d["edit_count"], 5);
+    let summary: Vec<(u64, String, u64, Value, Value)> = d["edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["index"].as_u64().unwrap(), s(&e["op"]), e["at"].as_u64().unwrap(), e["before"].clone(), e["after"].clone()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (0, "replace".to_string(), 4, json!("AC5: Docs describe the rejection in docs/usage.md"),
+                json!("AC5: Docs describe the rejection and its exit code in docs/usage.md")),
+            (1, "delete".to_string(), 1, json!("nothing else"), Value::Null),
+            (2, "replace".to_string(), 1, json!("renaming the ledger"), json!("renaming the ledger file")),
+            (3, "replace".to_string(), 1, json!("AC2: logs the rejection"), json!("AC2: logs the rejection once")),
+            (4, "insert".to_string(), 0, Value::Null, json!("no network calls")),
+        ]
+    );
+    let mut expected: Value = serde_json::from_str(SR4_SPEC).unwrap();
+    expected["acceptance_criteria"][4] = json!("AC5: Docs describe the rejection and its exit code in docs/usage.md");
+    expected["acceptance_criteria"][1] = json!("AC2: logs the rejection once");
+    expected["constraints"] = json!(["no network calls", "no new crate", "keep the log format", "a zzz marker stays"]);
+    expected["non_goals"][1] = json!("renaming the ledger file");
+    assert_eq!(sr4_proposed(&d), expected);
+    let shown = sr4_show(&f, &task);
+    assert_eq!(shown["newest"]["edit_count"], 5);
+    assert_eq!(shown["newest"]["refused_edits"], json!([]));
+    assert_eq!(shown["pending_edits"], true);
+    assert_eq!(sr4_task_spec(&f, &task), SR4_SPEC, "an edit review never writes the spec");
+    // AC6: the reviewer was told the rule it was judged by
+    assert!(prompt.contains("A prefix of the entry at \"at\" names that entry, however short."), "{prompt}");
+    assert!(prompt.contains("but only when it occurs at exactly one place"), "{prompt}");
+    assert!(prompt.contains("no Unicode normalization"), "{prompt}");
+    assert!(prompt.contains("An edit that breaks a rule is refused on its own"), "{prompt}");
+    assert!(!prompt.contains("10 characters"), "{prompt}");
+}
+
+/// SR-4 AC2: anchors are counted in Unicode scalar values and compared as
+/// written. One-character Chinese prefixes, a Chinese prefix of 4 scalar
+/// values and 12 UTF-8 bytes, a supplementary character and an exact
+/// combining-character anchor all name their entries; the precomposed
+/// spelling and a whitespace-only anchor are refused alone.
+#[test]
+fn sr4_unicode_anchors_count_scalar_values_without_normalizing() {
+    let f = sr4_fixture();
+    let spec = serde_json::to_string(&json!({
+        "goal": "守住帳本不讓重複花費",
+        "acceptance_criteria": ["AC1: 拒絕重複花費", "AC2: 記錄拒絕原因"],
+        "constraints": ["不加新套件", "不改日誌格式", "😀 表情開頭的限制", "cafe\u{301} 帶結合重音"],
+        "non_goals": ["重寫傳輸層"],
+        "excluded_alternatives": [],
+        "risk": "important",
+    }))
+    .unwrap();
+    let task = sr4_task(&f, &spec);
+    // "守住帳本": 4 scalar values, 12 UTF-8 bytes
+    let doc = sr4_doc(
+        &["AC1", "AC2"],
+        vec![
+            sr4_edit("constraints", "delete", 1, "不", ""),
+            sr4_edit("constraints", "replace", 2, "caf\u{e9}", "café 改寫"),
+            sr4_edit("constraints", "replace", 0, "  \t ", "不加任何新套件"),
+            sr4_edit("goal", "replace", 0, "守住帳本", "守住帳本，拒絕重複花費"),
+            sr4_edit("constraints", "replace", 1, "😀", "😀 表情開頭的限制（改）"),
+            sr4_edit("constraints", "delete", 2, "cafe\u{301}", ""),
+            sr4_edit("acceptance_criteria", "replace", 1, "AC2: 記", "AC2: 記錄拒絕原因與時間"),
+            sr4_edit("non_goals", "replace", 0, "重", "重寫傳輸層與重試"),
+        ],
+    );
+    let (_, d, prompt) = sr4_review(&f, &task, "ac2", &doc);
+    assert_eq!(sr4_indices(&d), [0, 3, 4, 5, 6, 7]);
+    assert_eq!(d["edit_count"], 6);
+    let refused = sr4_refused(&d);
+    assert_eq!(refused.iter().map(|r| (r.0, r.1.as_str())).collect::<Vec<_>>(), [(1, "constraints"), (2, "constraints")]);
+    assert!(refused[0].2.contains("occurs nowhere in constraints"), "{refused:?}");
+    assert!(refused[1].2.starts_with("anchor is blank"), "{refused:?}");
+    // AC6: the reviewer was told the rules these outcomes follow: the
+    // whitespace-only anchor (edit 2) is refused, the one-character and
+    // four-character Chinese prefixes (edits 0, 3, 7) and the emoji (edit 4)
+    // are long enough, and the precomposed spelling (edit 1) matches nothing
+    assert!(prompt.contains("A blank or whitespace-only anchor names nothing."), "{prompt}");
+    assert!(prompt.contains("There is no minimum length"), "{prompt}");
+    assert!(prompt.contains("length is counted in Unicode scalar values, not bytes"), "{prompt}");
+    assert!(prompt.contains("a Chinese character, an emoji and a combining mark each count one"), "{prompt}");
+    assert!(prompt.contains("no Unicode normalization"), "{prompt}");
+    let before: Vec<Value> = d["edits"].as_array().unwrap().iter().map(|e| e["before"].clone()).collect();
+    assert_eq!(
+        before,
+        [
+            json!("不改日誌格式"),
+            json!("守住帳本不讓重複花費"),
+            json!("😀 表情開頭的限制"),
+            json!("cafe\u{301} 帶結合重音"),
+            json!("AC2: 記錄拒絕原因"),
+            json!("重寫傳輸層"),
+        ]
+    );
+    let p = sr4_proposed(&d);
+    assert_eq!(p["goal"], "守住帳本，拒絕重複花費");
+    assert_eq!(p["constraints"], json!(["不加新套件", "😀 表情開頭的限制（改）"]));
+    assert_eq!(p["acceptance_criteria"], json!(["AC1: 拒絕重複花費", "AC2: 記錄拒絕原因與時間"]));
+    assert_eq!(p["non_goals"], json!(["重寫傳輸層與重試"]));
+    let shown = sr4_show(&f, &task);
+    assert_eq!(shown["newest"]["refused_edits"], d["refused_edits"]);
+    assert_eq!(shown["newest"]["edit_count"], 6);
+}
+
+/// The AC3 document: a valid replacement, an ambiguous non-prefix anchor, a
+/// valid insertion, a deletion whose anchor is nowhere, a later valid
+/// replacement whose `at` counts only the applied edits, and an overlapping
+/// match.
+fn sr4_mixed_doc() -> Value {
+    sr4_doc(
+        &SR4_IDS,
+        vec![
+            sr4_edit("constraints", "replace", 0, "no new", "no new crate, not even a small one"),
+            sr4_edit("non_goals", "delete", 0, "the", ""),
+            sr4_edit("non_goals", "insert", 0, "", "changing the exit codes"),
+            sr4_edit("non_goals", "delete", 9, "no such words", ""),
+            sr4_edit("non_goals", "replace", 2, "renaming", "renaming the ledger file"),
+            sr4_edit("constraints", "delete", 0, "zz", ""),
+        ],
+    )
+}
+
+/// SR-4 AC3: refused edits change nothing and are listed, in input order,
+/// in the event, `show --json` and the human `show`; the applied ones keep
+/// their original indices across the gaps.
+#[test]
+fn sr4_refused_edits_are_listed_and_the_rest_keep_their_indices() {
+    let f = sr4_fixture();
+    let task = sr4_task(&f, SR4_SPEC);
+    let (_, d, prompt) = sr4_review(&f, &task, "ac3", &sr4_mixed_doc());
+    assert_eq!(sr4_indices(&d), [0, 2, 4]);
+    assert_eq!(d["edit_count"], 3);
+    assert_eq!(d["edits"][2]["at"], 2, "at counts the insert, not the refused delete");
+    let refused = sr4_refused(&d);
+    assert_eq!(
+        refused,
+        vec![
+            (1, "non_goals".to_string(),
+                "anchor 'the' does not start non_goals entry 0 and occurs 2 times in non_goals (entries 0, 1), so it does not say which entry; write the start of the entry at at, or more text".to_string()),
+            (3, "non_goals".to_string(),
+                "anchor 'no such words' at 9 is past the end of non_goals (3 entries) and occurs nowhere in non_goals".to_string()),
+            (5, "constraints".to_string(),
+                "anchor 'zz' does not start constraints entry 0 and occurs 2 times in constraints (entries 3), so it does not say which entry; write the start of the entry at at, or more text".to_string()),
+        ]
+    );
+    // AC6: the reviewer was told that overlapping occurrences count one by
+    // one ('zz' in 'a zzz marker stays', edit 5) and that a repeated or
+    // missing anchor names nothing (edits 1 and 3), and that a later at
+    // counts only applied edits (edit 4)
+    assert!(prompt.contains("overlapping occurrences count separately (\"zz\" occurs twice in \"zzz\")"), "{prompt}");
+    assert!(prompt.contains("text that occurs twice or more, or nowhere, names nothing"), "{prompt}");
+    assert!(prompt.contains("A later \"at\" counts only the edits that were applied"), "{prompt}");
+    let mut expected: Value = serde_json::from_str(SR4_SPEC).unwrap();
+    expected["constraints"][0] = json!("no new crate, not even a small one");
+    expected["non_goals"] = json!(["changing the exit codes", "rewriting the transport", "renaming the ledger file"]);
+    assert_eq!(sr4_proposed(&d), expected);
+    // the reviewer's document is kept as written, all six edits
+    assert_eq!(d["document"]["edits"].as_array().unwrap().len(), 6);
+
+    let shown = sr4_show(&f, &task);
+    assert_eq!(shown["newest"]["refused_edits"], d["refused_edits"]);
+    assert_eq!(shown["newest"]["edit_count"], 3);
+    assert_eq!(shown["pending_edits"], true);
+    let human = sr4_show_human(&f, &task);
+    for line in [
+        "  edit 0  constraints[replace 0]  AC1",
+        "  edit 2  non_goals[insert 0]  AC1",
+        "  edit 4  non_goals[replace 2]  AC1",
+        "  refused edit 1  non_goals  anchor 'the' does not start non_goals entry 0",
+        "  refused edit 3  non_goals  anchor 'no such words' at 9 is past the end",
+        "  refused edit 5  constraints  anchor 'zz' does not start constraints entry 0",
+        "  3 edit(s) await the author check",
+    ] {
+        assert!(human.lines().any(|l| l.starts_with(line)), "{line}\n{human}");
+    }
+    assert!(!human.contains("  edit 1  "), "{human}");
+}
+
+/// SR-4 AC4 (and AC6 for the author's prompt): a REVISE whose every edit is
+/// refused is kept with nothing pending; a mixed one goes to the author with
+/// only its applied indices, a confirmation naming a refused index is
+/// refused at stage `coverage`, and the author's APPROVE writes only the
+/// applied edits.
+#[test]
+fn sr4_an_all_refused_review_is_kept_and_a_mixed_one_confirms_only_its_applied_edits() {
+    let f = sr4_fixture();
+    let task = sr4_task(&f, SR4_SPEC);
+
+    // every edit refused
+    let mut all_refused = sr4_doc(
+        &SR4_IDS,
+        vec![sr4_edit("non_goals", "delete", 0, "the", ""), sr4_edit("risk", "replace", 0, "important", "low")],
+    );
+    all_refused["criteria"][0] = json!({"id": "AC1", "verdict": "revise", "findings": [
+        {"check": "steps", "location": "spec", "note": "fixture: say which command shows the rejection"}
+    ]});
+    let (run, d, _) = sr4_review(&f, &task, "all-refused", &all_refused);
+    assert_eq!(d["edit_count"], 0);
+    assert_eq!(d["edits"], json!([]));
+    assert!(d["proposed_spec"].is_null() && d["proposed_sha256"].is_null(), "{d}");
+    assert_eq!(sr4_refused(&d).iter().map(|r| r.0).collect::<Vec<_>>(), [0, 1]);
+    let shown = sr4_show(&f, &task);
+    assert_eq!(shown["pending_edits"], false);
+    assert_eq!(shown["spec_sha256"], sha(SR4_SPEC));
+    assert_eq!(shown["newest"]["reviewer_run_id"], run);
+    assert_eq!(shown["newest"]["edit_count"], 0);
+    assert!(shown["newest"]["proposed_sha256"].is_null());
+    assert_eq!(shown["newest"]["refused_edits"], d["refused_edits"]);
+    assert_eq!(
+        shown["newest"]["document"]["criteria"][0]["findings"][0]["note"],
+        "fixture: say which command shows the rejection"
+    );
+    assert_eq!(sr4_task_spec(&f, &task), SR4_SPEC);
+    let human = sr4_show_human(&f, &task);
+    assert!(human.contains("fixture: say which command shows the rejection"), "{human}");
+    assert!(!human.contains("await the author check"), "{human}");
+
+    // mixed: applied 0, 2, 4; refused 1, 3, 5
+    let (_, mixed, _) = sr4_review(&f, &task, "mixed", &sr4_mixed_doc());
+    assert_eq!(sr4_indices(&mixed), [0, 2, 4]);
+    assert_eq!(sr4_show(&f, &task)["pending_edits"], true);
+    assert_eq!(sr4_task_spec(&f, &task), SR4_SPEC);
+
+    // a confirmation that answers the refused index 1 is refused whole
+    let answers: Vec<Value> = [0, 1, 2, 4].iter().map(|i| json!({"index": i, "verdict": "ok", "note": ""})).collect();
+    let naming_refused = json!({"verdict": "APPROVE", "edits": answers});
+    let before = sr4_show(&f, &task);
+    let c = sr4_launch(&f, "confirm", &task, "confirm-refused-index", &naming_refused, &[]);
+    let run = s(&c["run_id"]);
+    let w = sr4_wait(&f, &run);
+    assert_eq!(w["verdict"], Value::Null, "{w}");
+    let events = sr4_run_events(&f, &task, &run);
+    let invalid = sr4_one(&events, "spec_review_invalid");
+    assert_eq!(invalid["stage"], "coverage");
+    assert_eq!(invalid["source"], "author_check");
+    assert!(s(&invalid["reason"]).contains("answers edit 1, which the edit review does not have"), "{invalid}");
+    assert!(!events.iter().any(|e| e["type"] == "spec_review" || e["type"] == "spec_updated"));
+    assert_eq!(sr4_show(&f, &task), before);
+
+    // the fake author answers exactly the indices in edits.json: APPROVE
+    let mut c = sr4_cmd(&f);
+    c.env("FAKE_SCENARIO", "spec_confirm_approve")
+        .env("FAKE_TASK_ID", &task)
+        .args(["spec", "review", "confirm", &task, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium"])
+        .args(["--reason", "fixture", "--json"]);
+    let c = parse_stdout(f.run_ok(c, "spec review confirm"));
+    let run = s(&c["run_id"]);
+    let w = sr4_wait(&f, &run);
+    assert_eq!(w["verdict"], "APPROVE", "{}", f.explain_run(&run));
+    let input = PathBuf::from(s(&c["worktree"])).join(".agent").join("spec-review-input");
+    let edits_file: Value = serde_json::from_str(&std::fs::read_to_string(input.join("edits.json")).unwrap()).unwrap();
+    let listed: Vec<u64> = edits_file.as_array().unwrap().iter().map(|e| e["index"].as_u64().unwrap()).collect();
+    assert_eq!(listed, [0, 2, 4]);
+    let author_prompt = std::fs::read_to_string(PathBuf::from(s(&c["run_dir"])).join("prompt.txt")).unwrap();
+    assert!(author_prompt.contains("edits.json lists only the edits thoth applied"), "{author_prompt}");
+    assert!(author_prompt.contains("the indices may have gaps"), "{author_prompt}");
+    let events = sr4_run_events(&f, &task, &run);
+    let approve = sr4_one(&events, "spec_review");
+    let updated = sr4_one(&events, "spec_updated");
+    assert_eq!(approve["applied"], true);
+    assert_eq!(approve["edit_count"], 3);
+    assert_eq!(approve["edits"], mixed["edits"]);
+    assert_eq!(approve["refused_edits"], json!([]), "the author's check judged only the applied edits");
+    assert_eq!(updated["spec_sha256"], mixed["proposed_sha256"]);
+    let answered: Vec<u64> = approve["document"]["edits"].as_array().unwrap().iter().map(|e| e["index"].as_u64().unwrap()).collect();
+    assert_eq!(answered, [0, 2, 4]);
+    let shown = sr4_show(&f, &task);
+    assert_eq!(shown["approved"], true);
+    assert_eq!(shown["newest"]["mode"], "confirm");
+    assert_eq!(shown["newest"]["refused_edits"], json!([]));
+    assert_eq!(sr4_task_spec(&f, &task), s(&mixed["proposed_spec"]));
+}
+
+/// SR-4 AC5: each individual failure beside valid edits is listed in
+/// `refused_edits` while the valid edits survive; a malformed document, an
+/// APPROVE with edits, a criteria list that misses an id, an oversized final
+/// proposal and a spec changed under the run still refuse the whole review
+/// at their old stage and leave `show` as it was.
+#[test]
+fn sr4_individual_refusals_leave_document_and_proposal_safeguards_whole() {
+    let f = sr4_fixture();
+    let task = sr4_task(&f, SR4_SPEC);
+
+    let marker = ["[redacted:", "github-token]"].concat();
+    let doc = sr4_doc(
+        &SR4_IDS,
+        vec![
+            sr4_edit("constraints", "insert", 0, "", "no network calls"),
+            sr4_edit("risk", "replace", 0, "important", "low"),
+            sr4_edit("constraints", "move", 0, "no new", "no new crate"),
+            sr4_edit("constraints", "replace", 9, "nowhere at all", "x"),
+            json!({"field": "non_goals", "op": "insert", "at": 0, "anchor": "", "text": "y", "criterion": "AC1", "reason": "  "}),
+            sr4_edit("constraints", "replace", 1, "no new", "   "),
+            sr4_edit("acceptance_criteria", "replace", 0, "AC1:", "AC9: rejects a double spend"),
+            sr4_edit("constraints", "insert", 0, "", &format!("mask {marker} here")),
+            sr4_edit("non_goals", "delete", 1, "renaming", ""),
+        ],
+    );
+    let (_, d, _) = sr4_review(&f, &task, "individual", &doc);
+    assert_eq!(sr4_indices(&d), [0, 8]);
+    let refused = sr4_refused(&d);
+    let expect: [(u64, &str, &str); 7] = [
+        (1, "risk", "field must be one of"),
+        (2, "constraints", "op 'move' must be one of"),
+        (3, "constraints", "occurs nowhere in constraints"),
+        (4, "non_goals", "reason must not be blank"),
+        (5, "constraints", "text must not be blank for op replace"),
+        (6, "acceptance_criteria", "the criterion ids changed"),
+        (7, "constraints", "carries a mask marker the stored spec does not have"),
+    ];
+    assert_eq!(refused.len(), expect.len(), "{refused:?}");
+    for ((index, field, reason), (want_index, want_field, want)) in refused.iter().zip(expect) {
+        assert_eq!((*index, field.as_str()), (want_index, want_field), "{refused:?}");
+        assert!(reason.contains(want), "{index}: {reason}");
+    }
+    let p = sr4_proposed(&d);
+    assert_eq!(p["constraints"][0], "no network calls");
+    assert_eq!(p["non_goals"], json!(["rewriting the transport"]));
+    assert_eq!(p["risk"], "important");
+    assert!(!s(&d["proposed_spec"]).contains("[redacted:"), "{d}");
+
+    // whole-review refusals: each leaves show as it was
+    let valid = sr4_edit("constraints", "insert", 0, "", "no network calls");
+    let mut missing = valid.clone();
+    missing.as_object_mut().unwrap().remove("anchor");
+    let invalid = sr4_refused_whole(&f, &task, "missing-anchor", &sr4_doc(&SR4_IDS, vec![valid.clone(), missing]));
+    assert_eq!(invalid["stage"], "schema");
+    assert!(s(&invalid["reason"]).contains("edits array is malformed"), "{invalid}");
+
+    let mut approve = sr4_doc(&SR4_IDS, vec![valid.clone()]);
+    approve["verdict"] = json!("APPROVE");
+    assert_eq!(sr4_refused_whole(&f, &task, "approve-with-edits", &approve)["stage"], "schema");
+
+    let short = sr4_doc(&SR4_IDS[..4], vec![valid.clone()]);
+    let invalid = sr4_refused_whole(&f, &task, "coverage", &short);
+    assert_eq!(invalid["stage"], "coverage");
+    assert_eq!(invalid["expected"], json!(SR4_IDS));
+
+    let big = sr4_doc(
+        &SR4_IDS,
+        vec![valid.clone(), sr4_edit("risk", "replace", 0, "important", "low"), sr4_edit("constraints", "insert", 0, "", &"x".repeat(41_000))],
+    );
+    let invalid = sr4_refused_whole(&f, &task, "too-large", &big);
+    assert_eq!(invalid["stage"], "lint");
+    assert!(s(&invalid["reason"]).contains("too_large"), "{invalid}");
+
+    // the spec changed while the fake waited at its gate
+    let before = sr4_show(&f, &task);
+    let gate = f.home_path().join("sr4-gate");
+    let gate_s = gate.display().to_string();
+    let changing = sr4_doc(&SR4_IDS, vec![valid.clone(), sr4_edit("non_goals", "delete", 0, "the", "")]);
+    let r = sr4_launch(&f, "start", &task, "spec-changed", &changing, &[("FAKE_REVIEW_GATE", &gate_s)]);
+    let run = s(&r["run_id"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let st = sr4_json(&f, &["status", &task, "--json"]);
+        let running = st["runs"].as_array().unwrap().iter().any(|x| x["run_id"] == run.as_str() && x["status"] == "running");
+        if running {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "run {run} never ran\n{}", f.explain_run(&run));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let rewritten = SR4_SPEC.replace("guard the ledger against a double spend", "guard the ledger against every double spend");
+    let file = write_json(&f, "sr4-rewritten.json", &rewritten);
+    let file = file.display().to_string();
+    sr4_json(&f, &["task", "update-spec", &task, "-f", &file, "--json"]);
+    std::fs::write(&gate, b"").unwrap();
+    let w = sr4_wait(&f, &run);
+    assert_eq!(w["verdict"], Value::Null, "{w}");
+    let events = sr4_run_events(&f, &task, &run);
+    assert!(!events.iter().any(|e| e["type"] == "spec_review"), "{events:#?}");
+    assert_eq!(sr4_one(&events, "spec_review_invalid")["stage"], "spec_changed");
+    let after = sr4_show(&f, &task);
+    assert_eq!(after["newest"]["spec_review_id"], before["newest"]["spec_review_id"]);
+    assert_eq!(after["review_count"], before["review_count"]);
+    assert_eq!(after["spec_sha256"], sha(&rewritten));
 }

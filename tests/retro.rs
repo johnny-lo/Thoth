@@ -83,10 +83,16 @@ fn retro_groups_recorded_findings_by_category_across_tasks() {
         k.sort();
         k
     };
-    assert_eq!(keys(&v), sorted(&["days", "since", "reviews", "findings", "sizes", "categories"]), "{v}");
+    // REV-2 (AC6): `blocking_findings`, `advisory_findings` and each
+    // category's `blocking` are new keys.
+    assert_eq!(
+        keys(&v),
+        sorted(&["days", "since", "reviews", "findings", "blocking_findings", "advisory_findings", "sizes", "categories"]),
+        "{v}"
+    );
     assert_eq!(
         keys(top),
-        sorted(&["category", "count", "task_count", "tasks", "sizes", "suggest_check", "findings"]),
+        sorted(&["category", "blocking", "count", "task_count", "tasks", "sizes", "suggest_check", "findings"]),
         "{v}"
     );
     assert_eq!(keys(&top["tasks"][0]), sorted(&["repo", "task_id", "title"]), "{v}");

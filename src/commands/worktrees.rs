@@ -3,12 +3,18 @@
 //!
 //! A task that is `pass`, `cancelled` or `accepted` will never be dispatched,
 //! reviewed or resumed again, so its worktree directories (several GB each once cargo has
-//! built in them) only take space. Its branch, its commits and its evidence
-//! (blobs, `runs/`, state.db) are what the commander still needs, and none of
-//! them is touched here: a directory goes only through
-//! `git worktree remove --force`, and only after this module's own checks said
-//! it is safe. Every other status keeps its worktrees, because a rework or a
-//! resume continues in them.
+//! built in them) only take space. Its commits and its evidence (blobs,
+//! `runs/`, state.db) are what the commander still needs, and none of them is
+//! touched here: a directory goes only through `git worktree remove --force`,
+//! only after this module's own checks said it is safe, and only after every
+//! directory link inside it was removed without following it. Every other
+//! status keeps its worktrees, because a rework or a resume continues in them.
+//!
+//! The sweeps of `task create` and `worktrees prune` then delete each local
+//! branch `thoth/TASK/aN` of those tasks whose work is already in the task's
+//! base branch: `git branch -d` when the tip is an ancestor of the base, or
+//! `git branch -D` when `git cherry` shows every commit already applied and
+//! there is no merge commit. Anything else keeps the branch, with a reason.
 //!
 //! One function, `sweep`, behind five fixed call sites (the runner when a task
 //! settles, `review record` after a PASS, `task close`, `task accept`,
@@ -35,6 +41,19 @@ const UNCOMMITTED_CHANGES: &str = "uncommitted_changes";
 const GIT_ERROR: &str = "git_error";
 const UNREACHABLE_HEAD: &str = "unreachable_head";
 const REMOVE_FAILED: &str = "remove_failed";
+
+/// Why a task branch was kept (`branch_kept.detail.reason`).
+const BRANCH_CHECKED_OUT: &str = "branch_checked_out";
+const NO_BASE_BRANCH: &str = "no_base_branch";
+const BRANCH_UNMERGED: &str = "branch_unmerged";
+const BRANCH_DELETE_FAILED: &str = "branch_delete_failed";
+/// The branch is another task's base branch (only reachable when that task
+/// was created from inside this task's worktree).
+const BRANCH_IS_A_BASE: &str = "branch_is_a_base";
+
+/// How a deleted branch's work was found in the base (`merged_by`).
+const MERGED_BY_ANCESTOR: &str = "ancestor";
+const MERGED_BY_CHERRY: &str = "cherry";
 
 /// How many changed lines a `worktree_kept` detail carries before it says
 /// how many more there were.
@@ -71,12 +90,35 @@ pub(crate) struct Kept {
     pub task_status: String,
 }
 
+/// A local task branch the sweep deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemovedBranch {
+    pub task_id: String,
+    pub branch: String,
+    pub tip: String,
+    /// `ancestor` or `cherry`.
+    pub merged_by: &'static str,
+}
+
+/// A local task branch the sweep kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeptBranch {
+    pub task_id: String,
+    pub branch: String,
+    pub reason: &'static str,
+    /// Only for a failure: the git error, or why a check was inconclusive.
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Sweep {
     pub removed: Vec<Removed>,
     pub kept: Vec<Kept>,
     /// Finished tasks with no live run, i.e. the ones whose worktrees were looked at.
     pub tasks_checked: usize,
+    /// Only from `worktrees prune` and `task create`; empty otherwise.
+    pub removed_branches: Vec<RemovedBranch>,
+    pub kept_branches: Vec<KeptBranch>,
 }
 
 /// `review` for a reviewer run's worktree, `spec_review` for a spec reviewer
@@ -168,9 +210,228 @@ fn check_and_remove(paths: &Paths, repo_id: &str, repo_root: &Path, raw: &str) -
     let branch = worktree::head_branch(dir).ok().flatten();
     match worktree::remove_worktree_force(repo_root, dir) {
         Ok(()) => Outcome::Removed { head, branch },
-        Err(_) if !dir.exists() => Outcome::Gone,
-        Err(e) => Outcome::Kept { reason: REMOVE_FAILED, detail: format!("{e:#}") },
+        Err(e) => match e.downcast_ref::<worktree::LinkCleanupError>() {
+            Some(link) => Outcome::Kept { reason: worktree::LINK_UNREMOVABLE, detail: link.detail() },
+            None if !dir.exists() => Outcome::Gone,
+            None => Outcome::Kept { reason: REMOVE_FAILED, detail: format!("{e:#}") },
+        },
     }
+}
+
+/// The task's `base_branch`, from its newest `task_created` event.
+fn base_branch_of(conn: &Connection, task_id: &str) -> Result<Option<String>> {
+    Ok(state::latest_event_of_type(conn, event_type::TASK_CREATED, Some(task_id))?
+        .and_then(|e| serde_json::from_str::<serde_json::Value>(&e.detail).ok())
+        .and_then(|d| d["base_branch"].as_str().map(str::to_string))
+        .filter(|b| !b.trim().is_empty()))
+}
+
+/// Whether `branch` is exactly `thoth/TASK/aN` for this task (N digits only).
+fn is_task_branch(task_id: &str, branch: &str) -> bool {
+    branch
+        .strip_prefix(&format!("thoth/{task_id}/a"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// What happened to one task branch.
+enum BranchOutcome {
+    Deleted { tip: String, merged_by: &'static str },
+    Kept { reason: &'static str, detail: Option<String> },
+    /// Disappeared between listing and checking: nothing to report.
+    Gone,
+}
+
+fn unmerged(detail: impl Into<String>) -> BranchOutcome {
+    BranchOutcome::Kept { reason: BRANCH_UNMERGED, detail: Some(detail.into()) }
+}
+
+/// The checks of AC1 for one task branch, in order, then the deletion.
+fn judge_branch(
+    repo_root: &Path,
+    branch: &str,
+    base: Option<&str>,
+    checked_out: &std::result::Result<Vec<String>, String>,
+    other_bases: &[String],
+) -> BranchOutcome {
+    if other_bases.iter().any(|b| b == branch) {
+        return BranchOutcome::Kept { reason: BRANCH_IS_A_BASE, detail: None };
+    }
+    match checked_out {
+        Ok(list) if list.iter().any(|b| b == branch) => {
+            return BranchOutcome::Kept { reason: BRANCH_CHECKED_OUT, detail: None };
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return BranchOutcome::Kept {
+                reason: BRANCH_CHECKED_OUT,
+                detail: Some(format!("could not list the worktrees: {e}")),
+            };
+        }
+    }
+    let Some(base) = base else {
+        return BranchOutcome::Kept { reason: NO_BASE_BRANCH, detail: None };
+    };
+    let base_ref = format!("refs/heads/{base}");
+    match worktree::ref_commit(repo_root, &base_ref) {
+        Ok(Some(_)) => {}
+        Ok(None) => return BranchOutcome::Kept { reason: NO_BASE_BRANCH, detail: None },
+        Err(e) => {
+            return BranchOutcome::Kept { reason: NO_BASE_BRANCH, detail: Some(format!("{e:#}")) };
+        }
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    let tip = match worktree::ref_commit(repo_root, &branch_ref) {
+        Ok(Some(t)) => t,
+        Ok(None) => return BranchOutcome::Gone,
+        Err(e) => return unmerged(format!("{e:#}")),
+    };
+    let merged_by = match worktree::is_ancestor(repo_root, &tip, &base_ref) {
+        Ok(true) => MERGED_BY_ANCESTOR,
+        Ok(false) => {
+            match worktree::merges_between(repo_root, &base_ref, &branch_ref) {
+                Ok(m) if m.is_empty() => {}
+                Ok(_) => return BranchOutcome::Kept { reason: BRANCH_UNMERGED, detail: None },
+                Err(e) => return unmerged(format!("{e:#}")),
+            }
+            let out = match worktree::cherry(repo_root, &base_ref, &branch_ref) {
+                Ok(o) => o,
+                Err(e) => return unmerged(format!("{e:#}")),
+            };
+            let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+            if lines.is_empty() {
+                return unmerged(format!(
+                    "git cherry {base_ref} {branch_ref} listed no commit although the tip is not \
+                     an ancestor of the base"
+                ));
+            }
+            if !lines.iter().all(|l| l.starts_with('-')) {
+                return BranchOutcome::Kept { reason: BRANCH_UNMERGED, detail: None };
+            }
+            MERGED_BY_CHERRY
+        }
+        Err(e) => return unmerged(format!("{e:#}")),
+    };
+    let force = merged_by == MERGED_BY_CHERRY;
+    match worktree::delete_branch(repo_root, branch, base, force) {
+        Ok(()) => BranchOutcome::Deleted { tip, merged_by },
+        Err(e) => BranchOutcome::Kept { reason: BRANCH_DELETE_FAILED, detail: Some(format!("{e:#}")) },
+    }
+}
+
+/// Whether the newest `branch_kept`/`branch_deleted` event for this task's
+/// `branch` is already a `branch_kept` with this `reason`.
+fn branch_already_kept(conn: &Connection, task_id: &str, branch: &str, reason: &str) -> Result<bool> {
+    let events = state::events_since(conn, 0, Some(task_id))?;
+    for e in events.iter().rev() {
+        if e.event_type != event_type::BRANCH_KEPT && e.event_type != event_type::BRANCH_DELETED {
+            continue;
+        }
+        let detail: serde_json::Value =
+            serde_json::from_str(&e.detail).unwrap_or(serde_json::Value::Null);
+        if detail["branch"].as_str() != Some(branch) {
+            continue;
+        }
+        return Ok(e.event_type == event_type::BRANCH_KEPT
+            && detail["reason"].as_str() == Some(reason));
+    }
+    Ok(false)
+}
+
+/// The branch half of a full sweep: every local `thoth/TASK/aN` of each
+/// swept task, after the worktrees were handled and git's registrations of
+/// gone directories were pruned.
+fn sweep_branches(
+    repo_root: &Path,
+    conn: &Connection,
+    tasks: &[state::Task],
+    source: &str,
+    out: &mut Sweep,
+) -> Result<()> {
+    let checked_out = worktree::checked_out_branches(repo_root).map_err(|e| format!("{e:#}"));
+    let mut bases: Vec<(String, Option<String>)> = Vec::new();
+    for t in state::list_tasks(conn)? {
+        let b = base_branch_of(conn, &t.task_id)?;
+        bases.push((t.task_id, b));
+    }
+    for task in tasks {
+        let own_base = bases
+            .iter()
+            .find(|(id, _)| *id == task.task_id)
+            .and_then(|(_, b)| b.clone());
+        let other_bases: Vec<String> = bases
+            .iter()
+            .filter(|(id, _)| *id != task.task_id)
+            .filter_map(|(_, b)| b.clone())
+            .collect();
+        // A branch that cannot be listed cannot be named in a report; the
+        // next sweep tries again.
+        let Ok(branches) = worktree::local_branches_under(repo_root, &format!("thoth/{}/", task.task_id))
+        else {
+            continue;
+        };
+        for branch in branches {
+            if !is_task_branch(&task.task_id, &branch) || own_base.as_deref() == Some(branch.as_str()) {
+                continue;
+            }
+            match judge_branch(repo_root, &branch, own_base.as_deref(), &checked_out, &other_bases) {
+                BranchOutcome::Gone => {}
+                BranchOutcome::Deleted { tip, merged_by } => {
+                    state::append_event(
+                        conn,
+                        &NewEvent {
+                            task_id: Some(task.task_id.clone()),
+                            run_id: None,
+                            event_type: event_type::BRANCH_DELETED.to_string(),
+                            detail: serde_json::json!({
+                                "task_id": task.task_id,
+                                "branch": branch,
+                                "tip": tip,
+                                "merged_by": merged_by,
+                                "task_status": task.status,
+                                "source": source,
+                            }),
+                        },
+                    )?;
+                    out.removed_branches.push(RemovedBranch {
+                        task_id: task.task_id.clone(),
+                        branch,
+                        tip,
+                        merged_by,
+                    });
+                }
+                BranchOutcome::Kept { reason, detail } => {
+                    if !branch_already_kept(conn, &task.task_id, &branch, reason)? {
+                        let mut d = serde_json::json!({
+                            "task_id": task.task_id,
+                            "branch": branch,
+                            "reason": reason,
+                            "task_status": task.status,
+                            "source": source,
+                        });
+                        if let Some(detail) = &detail {
+                            d["detail"] = serde_json::json!(detail);
+                        }
+                        state::append_event(
+                            conn,
+                            &NewEvent {
+                                task_id: Some(task.task_id.clone()),
+                                run_id: None,
+                                event_type: event_type::BRANCH_KEPT.to_string(),
+                                detail: d,
+                            },
+                        )?;
+                    }
+                    out.kept_branches.push(KeptBranch {
+                        task_id: task.task_id.clone(),
+                        branch,
+                        reason,
+                        detail,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether the newest `worktree_kept`/`worktree_removed` event for `path` is
@@ -219,12 +480,14 @@ pub(crate) fn sweep(
             _ => return Ok(out),
         },
     };
+    let mut swept = Vec::new();
     for task in tasks {
         // Defensive: a finished task has no live run in any supported flow.
         if !state::list_live_runs_for_task(conn, &task.task_id)?.is_empty() {
             continue;
         }
         out.tasks_checked += 1;
+        swept.push(task.clone());
         let mut candidates: Vec<(String, &'static str)> = Vec::new();
         for run in state::list_runs_for_task(conn, &task.task_id)? {
             if !candidates.iter().any(|(p, _)| *p == run.worktree) {
@@ -299,9 +562,41 @@ pub(crate) fn sweep(
             }
         }
     }
-    // Lets git forget registrations whose directory is already gone.
+    // Lets git forget registrations whose directory is already gone, so a
+    // branch whose worktree was deleted by hand no longer counts as checked out.
     worktree::prune_worktrees(repo_root);
+    // Branches only in the two sweeps that report or record them as the
+    // commander's cleanup step (`worktrees prune`, `task create`); `task
+    // close` and `task accept` keep their `worktrees` output as it was, and
+    // the next of those two sweeps handles the branch.
+    if !worker_only && (source == SOURCE_PRUNE || source == SOURCE_TASK_CREATE) {
+        sweep_branches(repo_root, conn, &swept, source, &mut out)?;
+    }
     Ok(out)
+}
+
+/// One `removed_branches[]` element of `worktrees prune --json`.
+pub(crate) fn removed_branch_json(r: &RemovedBranch) -> serde_json::Value {
+    serde_json::json!({
+        "task_id": r.task_id,
+        "branch": r.branch,
+        "tip": r.tip,
+        "merged_by": r.merged_by,
+    })
+}
+
+/// One `kept_branches[]` element of `worktrees prune --json`; `detail` only
+/// for a failure.
+pub(crate) fn kept_branch_json(k: &KeptBranch) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "task_id": k.task_id,
+        "branch": k.branch,
+        "reason": k.reason,
+    });
+    if let Some(d) = &k.detail {
+        v["detail"] = serde_json::json!(d);
+    }
+    v
 }
 
 /// One `removed[]` element of `task close --json` and `worktrees prune --json`.
@@ -378,16 +673,20 @@ pub fn prune(paths: &Paths, cwd: &Path, json: bool) -> Result<i32> {
         "removed": s.removed.iter().map(removed_json).collect::<Vec<_>>(),
         "kept": s.kept.iter().map(kept_json).collect::<Vec<_>>(),
         "tasks_checked": s.tasks_checked,
+        "removed_branches": s.removed_branches.iter().map(removed_branch_json).collect::<Vec<_>>(),
+        "kept_branches": s.kept_branches.iter().map(kept_branch_json).collect::<Vec<_>>(),
     });
     let mut human = format!(
-        "removed {} worktree(s), kept {} (checked {} finished task(s))",
+        "removed {} worktree(s), kept {} (checked {} finished task(s)); deleted {} branch(es), kept {}",
         s.removed.len(),
         s.kept.len(),
-        s.tasks_checked
+        s.tasks_checked,
+        s.removed_branches.len(),
+        s.kept_branches.len()
     );
     for r in &s.removed {
         let branch = match &r.branch {
-            Some(b) => format!("branch {b} kept"),
+            Some(b) => format!("on branch {b}"),
             None => format!("detached at {}", r.head.get(..7).unwrap_or(&r.head)),
         };
         human.push_str(&format!(
@@ -407,6 +706,25 @@ pub fn prune(paths: &Paths, cwd: &Path, json: bool) -> Result<i32> {
         human.push_str(&format!(
             "\n  kept     {}  {}  (task {}): {} - {tail}",
             k.kind, k.path, k.task_id, k.reason
+        ));
+    }
+    for r in &s.removed_branches {
+        human.push_str(&format!(
+            "\n  deleted  branch  {}  (task {}, was {}, merged by {})",
+            r.branch,
+            r.task_id,
+            r.tip.get(..7).unwrap_or(&r.tip),
+            r.merged_by
+        ));
+    }
+    for k in &s.kept_branches {
+        let tail = match &k.detail {
+            Some(d) => format!(" - {}", d.lines().next().unwrap_or("")),
+            None => String::new(),
+        };
+        human.push_str(&format!(
+            "\n  kept     branch  {}  (task {}): {}{tail}",
+            k.branch, k.task_id, k.reason
         ));
     }
     crate::output::emit(json, &v, &human);

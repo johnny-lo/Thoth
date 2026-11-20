@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 const SPEC: &str = r#"{"goal":"keep the greeting right","acceptance_criteria":["AC1: greets the user","AC2: exits zero"],"constraints":[],"non_goals":[],"excluded_alternatives":[],"risk":"normal"}"#;
-const DOCS_SPEC: &str = r#"{"goal":"write the guide","acceptance_criteria":["AC1: the guide exists"],"constraints":[],"non_goals":[],"excluded_alternatives":[],"risk":"normal","task_type":"docs"}"#;
+const RESEARCH_SPEC: &str = r#"{"goal":"research retries","task_type":"research","acceptance_criteria":["AC1: report retry behaviour"],"constraints":[],"non_goals":[],"excluded_alternatives":[]}"#;
 const CODEX_MODEL: &str = "gpt-5.6-luna";
 const AGY_MODEL: &str = "gemini-3.8-flash-low";
 
@@ -411,7 +411,8 @@ refusals! {
     size_refuses_an_unsized_finding: "size" => |st| json!({"document": doc(&st, None, &[], json!([edit("src/greet.rs", "line 1\n", "x\n", "AC1")]))});
     size_refuses_a_second_unmet_criterion_without_an_edit: "size" => |st| {
         let mut d = doc(&st, Some("S"), &[], json!([edit("src/greet.rs", "line 1\n", "x\n", "AC1")]));
-        d["findings"]["criteria"][1] = json!({"id": "AC2", "verdict": "unmet", "evidence": [st.code], "note": "n", "fix_size": "S", "category": "docs"});
+        // REV-2: an advisory (docs) AC2 needs no edit; error_path blocks.
+        d["findings"]["criteria"][1] = json!({"id": "AC2", "verdict": "unmet", "evidence": [st.code], "note": "n", "fix_size": "S", "category": "error_path"});
         json!({"document": d})
     };
     edits_refuses_binding_a_met_criterion: "edits" => |st| fix_of(&st, json!([edit("src/greet.rs", "line 1\n", "x\n", "AC2")]));
@@ -571,12 +572,13 @@ fn an_edit_report_without_edits_or_with_edits_on_a_pass_is_invalid() {
     });
 }
 
-/// AC9 (h): without `--edit`, edits are ignored: a plain REJECT.
+/// AC9 (h): a plain review (RFIX-2: `--no-edit`, since a code task gets edit
+/// mode by default) ignores edits: a plain REJECT.
 #[test]
 fn a_plain_review_ignores_edits_and_rejects() {
     let st = setup();
     let p = plan_file(&st, &small_fix(&st));
-    let c = review_cmd(&st, "start", "claude-a", "review_fix", Some(&p), &[]);
+    let c = review_cmd(&st, "start", "claude-a", "review_fix", Some(&p), &["--no-edit"]);
     let started = json_out(&st.f.run_ok(c, "review start"));
     assert_eq!(started["mode"], "review");
     assert!(s(&started["worktree"]).ends_with("-a1-review"));
@@ -588,31 +590,117 @@ fn a_plain_review_ignores_edits_and_rejects() {
     assert_eq!(show(&st)["mode"], "review");
 }
 
-/// AC1, AC9 (h): `--edit` on a document task is refused before anything is
-/// written.
-#[test]
-fn edit_on_a_document_task_is_refused_and_writes_nothing() {
+/// A research task at `in_review` whose implementer ran the fake's
+/// `research_ok` (one sourced claim, read back through `task result`).
+fn research_candidate() -> (Fixture, String) {
     let f = common::fixture();
     f.cmd().arg("init").assert().success();
     f.add_profile("claude-b");
     f.add_profile("claude-a");
-    let (task, _) = f.create_task(DOCS_SPEC);
-    f.dispatch(&task, "claude-b", "ok", &[]);
-    let (_, status) = f.wait_for(&task, "120s");
-    assert_eq!(status, "in_review");
-    let before_events = f.events_json(&task).len();
-    let before_runs = f.cmd().args(["status", &task, "--json"]).output().map(|o| json_out(&o.stdout)["runs"].as_array().unwrap().len()).unwrap();
+    // two sources: research_ok gives the first to claim 1 and the rest to
+    // claim 2
+    let sources: Vec<Value> = (1..=2)
+        .map(|i| {
+            let page = f.home_path().join(format!("page{i}.txt"));
+            std::fs::write(&page, format!("prefix\nquote {i}\nsuffix")).unwrap();
+            let p = page.display().to_string().replace('\\', "/");
+            let url = if p.starts_with('/') { format!("file://{p}") } else { format!("file:///{p}") };
+            json!({"url": url, "quote": format!("quote {i}")})
+        })
+        .collect();
+    let sources = Value::Array(sources).to_string();
+    let (task, _) = f.create_task(RESEARCH_SPEC);
+    let mut c = f.cmd();
+    c.env("FAKE_SCENARIO", "research_ok")
+        .env("FAKE_TASK_ID", &task)
+        .env("FAKE_SOURCES", &sources)
+        .args(["dispatch", &task, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium", "--json"]);
+    let d = json_out(&f.run_ok(c, "dispatch research"));
+    let mut c = f.cmd();
+    c.args(["wait", "--run", &s(&d["run_id"]), "--timeout", "120s", "--json"]);
+    let w = json_out(&f.run_ok(c, "wait --run"));
+    assert_eq!(w["timed_out"], false, "{w}");
+    assert_eq!(w["status"], "completed", "{w}");
+    assert_eq!(w["task_status"], "in_review", "{w}");
+    let mut c = f.cmd();
+    c.args(["task", "result", &task, "--json"]);
+    let r = json_out(&f.run_ok(c, "task result"));
+    assert!(r["claims"].as_array().unwrap().iter().any(|c| c["kind"] == "research"), "{r}");
+    (f, task)
+}
+
+/// `status TASK --json`'s run count and `events --task TASK --json`'s event
+/// count.
+fn counts(f: &Fixture, task: &str) -> (usize, usize) {
+    let mut c = f.cmd();
+    c.args(["status", task, "--json"]);
+    let runs = json_out(&f.run_ok(c, "status"))["runs"].as_array().unwrap().len();
+    (runs, f.events_json(task).len())
+}
+
+/// AC1, AC9 (h); RFIX-2 AC5, AC7 (c): a research task's review is a source
+/// check, so `--edit` (CLI) and `edit` true (MCP) are refused before anything
+/// is written, while a start with neither, or with `--no-edit`, launches the
+/// plain source check. (RFIX-2: docs and review tasks now take `--edit`.)
+#[test]
+fn edit_on_a_research_task_is_refused_and_writes_nothing() {
+    let (f, task) = research_candidate();
+    let before = counts(&f, &task);
     let out = f
         .cmd()
         .env("FAKE_SCENARIO", "review_fix")
-        .args(["review", "start", &task, "--profile", "claude-a", "--edit", "--model", "opus", "--effort", "medium", "--json"])
+        .args(["review", "start", &task, "--profile", "claude-a", "--edit", "--model", "opus", "--effort", "medium", "--reason", "R", "--json"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("document task"), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(f.events_json(&task).len(), before_events, "no event, evidence_added included");
-    let after_runs = f.cmd().args(["status", &task, "--json"]).output().map(|o| json_out(&o.stdout)["runs"].as_array().unwrap().len()).unwrap();
-    assert_eq!(after_runs, before_runs);
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stdout));
+    let err: Value = serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim())
+        .unwrap_or_else(|e| panic!("stderr is not JSON ({e}): {}", String::from_utf8_lossy(&out.stderr)));
+    assert_eq!(err["ok"], false, "{err}");
+    let message = s(&err["error"]);
+    assert!(message.contains("research task") && message.contains("cannot attach fixes"), "{message}");
+    assert_eq!(counts(&f, &task), before, "no run, no event (evidence_added included)");
+
+    let mut m = Mcp::start_for(&f, &task, "review_fix", &[]);
+    let listed = m.send("tools/list", json!({}));
+    assert!(listed["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "thoth_review_start"), "{listed}");
+    let r = m.call("thoth_review_start", json!({"task": task, "profile": "claude-a", "model": "opus", "effort": "medium", "reason": "R", "edit": true}));
+    assert_eq!(r["isError"], true, "{r}");
+    assert_eq!(r["structuredContent"]["ok"], false, "{r}");
+    assert_eq!(r["structuredContent"]["exit_code"], 1, "{r}");
+    let message = s(&r["structuredContent"]["error"]);
+    assert!(message.contains("research task") && message.contains("cannot attach fixes"), "{message}");
+    // the server is still there and answers the next call
+    let st = m.call("thoth_status", json!({"task": task}));
+    assert_eq!(st["isError"], false, "{st}");
+    assert_eq!(st["structuredContent"]["status"], "in_review", "{st}");
+    drop(m);
+    assert_eq!(counts(&f, &task), before, "the MCP refusal wrote nothing either");
+
+    // neither flag (this task), then --no-edit (a fresh one): the plain
+    // source check
+    source_check_starts(&f, &task, &[]);
+    let (f2, task2) = research_candidate();
+    source_check_starts(&f2, &task2, &["--no-edit"]);
+}
+
+/// `review start` of a research task with `flags` launches the plain source
+/// check: mode `review`, no fix branch, the review worktree, and a verdict.
+fn source_check_starts(f: &Fixture, task: &str, flags: &[&str]) {
+    let mut c = f.cmd();
+    c.env("FAKE_SCENARIO", "source_check")
+        .env("FAKE_TASK_ID", task)
+        .args(["review", "start", task, "--profile", "claude-a", "--model", "opus", "--effort", "medium", "--reason", "R", "--json"])
+        .args(flags);
+    let started = json_out(&f.run_ok(c, "review start (source check)"));
+    assert_eq!(started["mode"], "review", "{flags:?}: {started}");
+    assert!(started.get("fix_branch").is_none(), "{started}");
+    assert!(s(&started["worktree"]).ends_with("-a1-review"), "{started}");
+    let mut c = f.cmd();
+    c.args(["wait", "--run", &s(&started["run_id"]), "--timeout", "120s", "--json"]);
+    let w = json_out(&f.run_ok(c, "wait --run"));
+    assert_eq!(w["timed_out"], false, "{w}");
+    assert_eq!(w["pending_fix"], Value::Null, "a source check is not a code review: {w}");
+    assert!(["pass", "reject"].contains(&w["task_status"].as_str().unwrap_or("")), "{flags:?}: {w}\n{}", f.explain_task(task));
 }
 
 /// Waits until `path` exists (a runner writes it before launching).
@@ -644,7 +732,8 @@ fn each_harness_gets_the_edit_section_and_schema_only_in_edit_mode() {
                 let mut tools = Vec::new();
                 for edit_mode in [false, true] {
                     let p = plan_file(&st, &small_fix(&st));
-                    let flags: &[&str] = if edit_mode { &["--edit"] } else { &[] };
+                    // RFIX-2: a plain review of a code task needs --no-edit.
+                    let flags: &[&str] = if edit_mode { &["--edit"] } else { &["--no-edit"] };
                     let mut c = review_cmd(&st, "start", profile, "review_fix", Some(&p), flags);
                     c.env("FAKE_REVIEW_GATE", &gate);
                     let started = json_out(&st.f.run_ok(c, "review start"));
@@ -1059,21 +1148,29 @@ struct Mcp {
 
 impl Mcp {
     fn start(st: &Setup, scenario: &str, plan: &Path) -> Self {
+        Self::start_for(&st.f, &st.task, scenario, &[("FAKE_FIX_PLAN", plan.to_str().unwrap())])
+    }
+
+    /// `thoth mcp` in `f`'s repo, initialized, its workers given `scenario`
+    /// and `envs`.
+    fn start_for(f: &Fixture, task: &str, scenario: &str, envs: &[(&str, &str)]) -> Self {
         let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_thoth"));
         c.arg("mcp")
-            .current_dir(st.f.repo.path())
-            .env("THOTH_HOME", st.f.home.path())
+            .current_dir(f.repo.path())
+            .env("THOTH_HOME", f.home.path())
             .env("THOTH_CLAUDE_BIN", env!("CARGO_BIN_EXE_fake-claude"))
             .env("THOTH_CODEX_BIN", env!("CARGO_BIN_EXE_fake-codex"))
             .env("FAKE_SCENARIO", scenario)
-            .env("FAKE_TASK_ID", &st.task)
-            .env("FAKE_FIX_PLAN", plan)
-            .env_remove("THOTH_RUN_ID")
+            .env("FAKE_TASK_ID", task);
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        c.env_remove("THOTH_RUN_ID")
             .env_remove("THOTH_INBOX_DIR")
             .env_remove("THOTH_EXE")
             .env_remove("AISTUPIDLEVEL_API_KEY")
             .env_remove("ARTIFICIALANALYSIS_API_KEY")
-            .env("THOTH_ARENA_URL", common::offline_arena_url(st.f.home.path()))
+            .env("THOTH_ARENA_URL", common::offline_arena_url(f.home.path()))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
@@ -1228,4 +1325,223 @@ fn claude_fix_verified_and_confirmed_by_codex_passes_on_the_fix_branch() {
     let verdict = last_event(&st, "verdict");
     assert_eq!(verdict["source"], "author_check");
     assert_eq!(verdict["author_verdict"], "APPROVE");
+}
+
+// --- RFIX-2: edit mode is the default for code tasks, docs and review take --edit ---
+
+/// `SPEC` (two criteria) with `task_type` set, or as it is without one.
+fn typed_spec(task_type: Option<&str>) -> String {
+    match task_type {
+        None => SPEC.to_string(),
+        Some(t) => SPEC.replacen("\"risk\":\"normal\"", &format!("\"risk\":\"normal\",\"task_type\":\"{t}\""), 1),
+    }
+}
+
+/// The newest event seq of the task (0 without one), from `events --json`.
+fn last_seq(st: &Setup) -> i64 {
+    st.f.events_json(&st.task).last().map(|e| e["seq"].as_i64().unwrap()).unwrap_or(0)
+}
+
+/// The task's events after `seq` that name `run`.
+fn run_events(st: &Setup, seq: i64, run: &str) -> Vec<Value> {
+    st.f.events_json(&st.task)
+        .into_iter()
+        .filter(|e| e["seq"].as_i64().unwrap() > seq && e["run_id"] == run)
+        .collect()
+}
+
+/// `review start` with `flags` (and a reason) whose fake reviewer hands in a
+/// REJECT with an S-sized one-line fix; the start document, and `wait --run`
+/// once it finished.
+fn start_small_fix(st: &Setup, flags: &[&str]) -> (Value, Value) {
+    let p = plan_file(st, &small_fix(st));
+    let mut extra = vec!["--reason", "rfix2 fixture"];
+    extra.extend_from_slice(flags);
+    let c = review_cmd(st, "start", "claude-a", "review_fix", Some(&p), &extra);
+    let started = json_out(&st.f.run_ok(c, "review start"));
+    let w = wait_run(st, &s(&started["run_id"]));
+    assert_eq!(w["timed_out"], false, "{w}");
+    assert_eq!(w["status"], "completed", "{}", st.f.explain_task(&st.task));
+    (started, w)
+}
+
+/// What an edit-mode start and its applied fix look like, with the task id
+/// taken out so two tasks compare.
+fn edit_mode_outcome(st: &Setup, flags: &[&str]) -> Value {
+    let seq = last_seq(st);
+    let (started, w) = start_small_fix(st, flags);
+    let run = s(&started["run_id"]);
+    assert_eq!(started["mode"], "edit", "{flags:?}: {started}");
+    assert_eq!(started["fix_branch"], fix_branch(st), "{started}");
+    assert!(s(&started["worktree"]).ends_with("-a1-fix"), "{started}");
+    let ev = run_events(st, seq, &run);
+    let rs: Vec<&Value> = ev.iter().filter(|e| e["type"] == "review_started").collect();
+    assert_eq!(rs.len(), 1, "{ev:#?}");
+    assert_eq!(rs[0]["detail"]["mode"], "edit", "{:#}", rs[0]);
+    assert!(ev.iter().any(|e| e["type"] == "review_fix_applied"), "{ev:#?}");
+    assert_eq!(w["verdict"], "REJECT", "{w}");
+    assert_eq!(w["task_status"], "in_review", "{w}");
+    assert_eq!(w["pending_fix"], true, "{w}");
+    let shown = show(st);
+    assert_eq!(shown["mode"], "edit", "{shown}");
+    assert_eq!(shown["fix"]["applied"], true, "{shown}");
+    assert_eq!(shown["pending_fix"], true, "{shown}");
+    json!({
+        "mode": started["mode"],
+        "fix_branch": s(&started["fix_branch"]).replace(&st.task, "TASK"),
+        "worktree_suffix": s(&started["worktree"]).ends_with("-a1-fix"),
+        "pending_fix": w["pending_fix"],
+        "show_mode": shown["mode"],
+    })
+}
+
+/// What a plain-review start looks like: mode `review`, no fix branch, the
+/// review worktree, and the plan's edits ignored (a plain REJECT).
+fn plain_outcome(st: &Setup, flags: &[&str]) {
+    let seq = last_seq(st);
+    let (started, w) = start_small_fix(st, flags);
+    let run = s(&started["run_id"]);
+    assert_eq!(started["mode"], "review", "{flags:?}: {started}");
+    assert!(started.get("fix_branch").is_none(), "{started}");
+    assert!(s(&started["worktree"]).ends_with("-a1-review"), "{started}");
+    assert_eq!(w["task_status"], "reject", "{w}\n{}", st.f.explain_task(&st.task));
+    assert_eq!(w["pending_fix"], false, "{w}");
+    let ev = run_events(st, seq, &run);
+    let rs: Vec<&Value> = ev.iter().filter(|e| e["type"] == "review_started").collect();
+    assert_eq!(rs.len(), 1, "{ev:#?}");
+    assert_eq!(rs[0]["detail"]["mode"], "review", "{:#}", rs[0]);
+    let all = st.f.events_json(&st.task);
+    assert!(!all.iter().any(|e| e["type"] == "review_fix_applied" || e["type"] == "review_fix_refused"), "{all:#?}");
+    assert_eq!(show(st)["mode"], "review");
+}
+
+/// RFIX-2 AC1: a code task (no task_type, or one that is not docs, research
+/// or review) is reviewed in edit mode when neither flag is given, exactly as
+/// with `--edit`.
+#[test]
+fn rfix2_a_code_task_review_defaults_to_edit_mode_like_edit() {
+    let cases: Vec<(Option<&str>, &[&str])> = vec![(None, &[]), (Some("mechanical"), &[]), (Some("code"), &[]), (None, &["--edit"])];
+    let outcomes: Vec<Value> = std::thread::scope(|scope| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|(task_type, flags)| {
+                scope.spawn(move || {
+                    let st = setup_with(&typed_spec(*task_type), &[]);
+                    edit_mode_outcome(&st, flags)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (o, case) in outcomes.iter().zip(&cases) {
+        assert_eq!(o, &outcomes[3], "{case:?} differs from --edit");
+    }
+    assert_eq!(outcomes[0]["fix_branch"], "thoth/TASK/a1-fix");
+}
+
+/// RFIX-2 AC2: `--no-edit` is a plain review of a code task; with `--edit`
+/// too it is refused before anything is written.
+#[test]
+fn rfix2_no_edit_is_a_plain_review_and_cannot_be_combined_with_edit() {
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let st = setup();
+            plain_outcome(&st, &["--no-edit"]);
+        });
+        scope.spawn(|| {
+            let st = setup();
+            let before = (run_count(&st), st.f.events_json(&st.task).len());
+            let p = plan_file(&st, &small_fix(&st));
+            let out = review_cmd(&st, "start", "claude-a", "review_fix", Some(&p), &["--edit", "--no-edit"]).output().unwrap();
+            assert_ne!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(err.contains("--edit") && err.contains("--no-edit"), "{err}");
+            assert_eq!((run_count(&st), st.f.events_json(&st.task).len()), before, "nothing was started or recorded");
+            assert_eq!(st.f.task_status(&st.task), "in_review");
+        });
+    });
+}
+
+/// RFIX-2 AC2: `review start --help` says what each flag does for each kind
+/// of task.
+#[test]
+fn rfix2_review_start_help_names_the_default_and_the_task_types() {
+    let f = common::fixture();
+    let mut c = f.cmd();
+    c.args(["review", "start", "--help"]);
+    let text = String::from_utf8(f.run_ok(c, "review start --help")).unwrap();
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let edit_at = flat.find("--edit ").expect("an --edit entry");
+    let no_edit_at = flat.find("--no-edit").expect("a --no-edit entry");
+    let edit_help = &flat[edit_at..no_edit_at];
+    let no_edit_help = &flat[no_edit_at..];
+    assert!(edit_help.contains("Code tasks get edit mode by default"), "{edit_help}");
+    assert!(edit_help.contains("docs and review tasks only with --edit"), "{edit_help}");
+    assert!(edit_help.contains("a research task cannot attach a fix"), "{edit_help}");
+    assert!(no_edit_help.contains("no fix is attached, even on a code task"), "{no_edit_help}");
+    assert!(no_edit_help.contains("unless --edit is given (refused for research)"), "{no_edit_help}");
+}
+
+/// RFIX-2 AC5: docs and review tasks: a plain review unless `--edit`, which
+/// is no longer refused and attaches the fix; `--no-edit` is plain too.
+#[test]
+fn rfix2_docs_and_review_tasks_take_edit_only_when_asked() {
+    std::thread::scope(|scope| {
+        for task_type in ["docs", "review"] {
+            for flags in [&[][..], &["--edit"][..], &["--no-edit"][..]] {
+                scope.spawn(move || {
+                    let st = setup_with(&typed_spec(Some(task_type)), &[]);
+                    if flags == ["--edit"] {
+                        let o = edit_mode_outcome(&st, flags);
+                        assert_eq!(o["fix_branch"], "thoth/TASK/a1-fix", "{task_type}");
+                    } else {
+                        plain_outcome(&st, flags);
+                    }
+                });
+            }
+        }
+    });
+}
+
+/// RFIX-2 AC3: `thoth_review_start`'s `edit`: left out on a code task is
+/// edit mode, true is `--edit`, false is `--no-edit`; tools/list keeps it an
+/// optional boolean, describes the default and stays within 20,000 bytes.
+#[test]
+fn rfix2_mcp_review_start_edit_left_out_true_and_false() {
+    std::thread::scope(|scope| {
+        for edit in [None, Some(true), Some(false)] {
+            scope.spawn(move || {
+                let st = setup();
+                let plan = plan_file(&st, &small_fix(&st));
+                let mut m = Mcp::start(&st, "review_fix", &plan);
+                let listed = m.send("tools/list", json!({}));
+                assert!(serde_json::to_vec(&listed["result"]).unwrap().len() <= 20_000, "tools/list is over 20,000 bytes");
+                let tool = listed["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "thoth_review_start").cloned().unwrap();
+                assert_eq!(tool["inputSchema"]["properties"]["edit"]["type"], "boolean", "{tool}");
+                assert!(!tool["inputSchema"]["required"].as_array().unwrap().contains(&json!("edit")), "{tool}");
+                let description = s(&tool["description"]);
+                assert!(description.contains("edit left out: edit mode for a code task, a plain review for a docs, review or research task"), "{description}");
+                assert!(description.contains("true: edit mode (refused for research); false: a plain review"), "{description}");
+
+                let mut args = json!({"task": st.task, "profile": "claude-a", "model": "opus", "effort": "medium", "reason": "R"});
+                if let Some(e) = edit {
+                    args["edit"] = json!(e);
+                }
+                let r = m.call("thoth_review_start", args);
+                assert_eq!(r["isError"], false, "{r}");
+                let doc = &r["structuredContent"];
+                let want = if edit == Some(false) { "review" } else { "edit" };
+                assert_eq!(doc["mode"], want, "{edit:?}: {doc}");
+                let w = m.wait(&s(&doc["run_id"]));
+                if want == "edit" {
+                    assert_eq!(doc["fix_branch"], fix_branch(&st), "{doc}");
+                    assert_eq!(w["pending_fix"], true, "{w}");
+                } else {
+                    assert!(doc.get("fix_branch").is_none(), "{doc}");
+                    assert_eq!(w["task_status"], "reject", "{w}");
+                    assert_eq!(w["pending_fix"], false, "{w}");
+                }
+            });
+        }
+    });
 }

@@ -846,7 +846,11 @@ fn mcp_starts_a_spec_review_and_waits_for_it() {
     let tools = list["result"]["tools"].as_array().unwrap();
     // thoth_review_confirm sits after thoth_review_start, one place before
     // these.
-    assert_eq!(tools.len(), 36);
+    // AUTO-1a: no hard-coded total (the pipeline tools were added); every
+    // tool is listed once and thoth_guide stays last.
+    let unique: std::collections::BTreeSet<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(unique.len(), tools.len());
+    assert_eq!(tools.last().unwrap()["name"], "thoth_guide");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names[20], "thoth_spec_review_start");
     assert_eq!(names[21], "thoth_spec_review_confirm");
@@ -902,4 +906,66 @@ fn help_lists_spec_review_start() {
     assert!(start.contains("--reason"), "{start}");
     assert!(start.contains("--timeout"), "{start}");
     assert!(start.contains("did not write the spec"), "{start}");
+}
+
+/// SR-4 (AC3): a review-mode run (no `--edit`) keeps its old behavior: its
+/// `spec_review` event and `show --json`'s `newest` carry `refused_edits`
+/// `[]`, and the human `show` has no refused line. Every command drops the
+/// inherited variables whose names hold KEY, TOKEN, SECRET or PASSWORD
+/// (names only) and reads Thoth through the CLI.
+#[test]
+fn sr4_a_review_mode_run_lists_no_refused_edits() {
+    let f = common::fixture();
+    let cmd = || {
+        let mut c = f.cmd();
+        for (name, _) in std::env::vars_os() {
+            let upper = name.to_string_lossy().to_ascii_uppercase();
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+                c.env_remove(&name);
+            }
+        }
+        c
+    };
+    let ok = |args: &[&str], envs: &[(&str, &str)]| -> Vec<u8> {
+        let mut c = cmd();
+        c.args(args);
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        f.run_ok(c, &args.join(" "))
+    };
+    let json_of = |args: &[&str], envs: &[(&str, &str)]| -> Value {
+        serde_json::from_str(String::from_utf8(ok(args, envs)).unwrap().trim()).unwrap()
+    };
+    ok(&["init"], &[]);
+    let cfg = f.home_path().join("profiles").join("claude-b");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg = cfg.display().to_string();
+    ok(&["profile", "add", "claude-b", "--provider", "anthropic", "--harness", "claude-code", "--config-dir", &cfg], &[]);
+    let spec = f.home_path().join("sr4-spec.json");
+    std::fs::write(&spec, IMPORTANT).unwrap();
+    let spec = spec.display().to_string();
+    let task = s(&json_of(&["task", "create", "-f", &spec, "--json"], &[])["task_id"]);
+    let r = json_of(
+        &["spec", "review", "start", &task, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium", "--reason", "fixture", "--json"],
+        &[("FAKE_SCENARIO", "spec_review_revise"), ("FAKE_TASK_ID", &task)],
+    );
+    assert_eq!(r["mode"], "review");
+    let run = s(&r["run_id"]);
+    let w = json_of(&["wait", "--run", &run, "--timeout", "180s", "--json"], &[]);
+    assert_eq!(w["verdict"], "REVISE", "{}", f.explain_run(&run));
+    let events = json_of(&["events", "--since", "0", "--task", &task, "--json"], &[]);
+    let review: Vec<&Value> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "spec_review" && e["run_id"] == run.as_str())
+        .collect();
+    assert_eq!(review.len(), 1, "{events}");
+    assert_eq!(review[0]["detail"]["mode"], "review");
+    assert_eq!(review[0]["detail"]["refused_edits"], json!([]));
+    let shown = json_of(&["spec", "review", "show", &task, "--json"], &[]);
+    assert_eq!(shown["newest"]["refused_edits"], json!([]));
+    let human = String::from_utf8(ok(&["spec", "review", "show", &task], &[])).unwrap();
+    assert!(!human.contains("refused edit"), "{human}");
 }

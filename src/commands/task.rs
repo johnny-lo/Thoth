@@ -569,6 +569,20 @@ pub fn accept(paths: &Paths, cwd: &Path, needle: &str, reason: &str, json: bool)
             crate::commands::live_run_refusal("task accept", &task_id, &live)
         );
     }
+    // RFIX-2: a docs or review task can carry a reviewer's pending fix;
+    // accepting the delivery would take the original candidate past it.
+    let fix_state = crate::commands::review_fix::state(&tx, &task)?;
+    if let Some((review, applied)) = fix_state.applied.as_ref().filter(|_| fix_state.pending_fix) {
+        drop(tx); // explicit: rolls back, though nothing has been written yet
+        let edit_run = review.reviewer_run_id.as_deref().unwrap_or("EDIT_RUN");
+        bail!(
+            "task {task_id} has a pending fix (review {}, edit review run {edit_run}, on {}); task accept \
+             would take the original delivery past it. Run, in order: `thoth verify {edit_run}`, then \
+             `thoth review confirm {task_id} --profile P --model M --effort E --reason TEXT`",
+            review.review_id,
+            applied["fix_branch"].as_str().unwrap_or("the fix branch")
+        );
+    }
     let ingested = state::latest_event_of_type(&tx, event_type::RESULT_INGESTED, Some(&task_id))?;
     let run_id = ingested.as_ref().and_then(|e| e.run_id.clone());
     let result_status = ingested

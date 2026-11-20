@@ -140,14 +140,19 @@ Kinds Phase 2 produces, all `collected_by = control_plane`:
 |---|---|---|
 | `command` | a worker's Bash call, captured by the hook | the command's stdout (complete, even when the inline payload was truncated; `detail.truncated_inline: true` when the payload was cut, including when Claude Code itself shortened the output and left one of its truncation markers such as `... [N characters truncated] ...`, `... [N lines truncated] ...` or `[output truncated]`, in which case the cut part is not recoverable). For a command that failed, Claude Code sends no stdout: the blob is the text of its `error` after the `Exit code N` line (the command's output as Claude Code reported it, compiler stderr and test-harness stdout together), so `evidence show` prints that as `content`; `detail.error` still holds the full `error` text |
 | `command` with a `verify: ` label | `thoth verify` re-running a declared command | the same |
-| `diff` | `git diff <base>..<candidate>` when the run ends cleanly | the full patch, test files included |
+| `diff` | `git diff <start>..<candidate>` when the run ends cleanly; the start is the run's base, or the merge base with the main worktree's HEAD after the worker merged the main line, and files the main line brought in are left out (below) | the full patch, test files included |
 | `commit` | the candidate commit | `git show --stat` |
 
 `commit` evidence's `detail` carries exactly three keys — `sha`, `subject`,
 `author_date` — the `git show --stat` text lives in the blob, not in `detail`.
-`diff` evidence's `detail` carries `from_commit`, `to_commit`, `files_changed`,
-`touches_tests`, `protected_changes`, `inline_test_errors` (LEAN-1), `stat`,
-`protected_base` and `integration_tip`; `touches_tests` is a filename
+`diff` evidence's `detail` carries `from_commit` (where the diff starts; see
+"Where a diff starts" below), `to_commit`, `run_base_commit` (the run's base;
+SMALL-9c), `diff_from_rule` (`merge_base` or `run_base`; SMALL-9c),
+`integrated_files` (SMALL-9c), `files_changed`, `touches_tests`,
+`protected_changes`, `inline_test_errors` (LEAN-1), `stat`, `protected_base`
+and `integration_tip`. A row recorded before SMALL-9c has no
+`run_base_commit`, `diff_from_rule` or `integrated_files`, and its
+`from_commit` is the run's base. `touches_tests` is a filename
 heuristic (paths under a `tests/`, `test/`, `__tests__/` or `*.Tests/`
 directory, `conftest.py`, `test_*`, `*_test.{rs,py,go,ts}`,
 `*.test.{ts,tsx,js}`, `*.spec.{ts,tsx,js}`, `*Tests.cs`, `*Test.cs`; case is
@@ -214,10 +219,47 @@ when it was not used), sorted by path, `[]` when there is none:
   the task's change). A diff recorded without an
   attribution (`review start` after `thoth submit`) uses the run's base and no
   tip; `protected_base` says which base was used. `files_changed`,
-  `touches_tests`, `stat` and the patch still run from the run's own base to
-  the candidate.
+  `touches_tests`, `stat` and the patch follow "Where a diff starts" below.
 - A rework compares against the task's base, so changes an earlier attempt
   made to an existing test or check input are listed again.
+
+**Where a diff starts and what it leaves out (SMALL-9c).** When
+`integration_tip` is not null and the candidate and that tip have a merge
+base that is not the run's base but contains it (a first-round worker merged
+or fast-forwarded to the main line), the diff starts at that merge base:
+`diff_from_rule` is `merge_base` and `from_commit` is the merge base.
+Otherwise it starts at the run's base: `diff_from_rule` is `run_base` and
+`from_commit` equals `run_base_commit`. In both cases, when `integration_tip`
+is not null, `integrated_files` (sorted, `[]` when none) lists each path
+changed from the run's base to the candidate whose Git tree entry at the
+candidate equals the tip's (same object, type and mode; both absent counts as
+equal) and that the main line changed between the task's base and the tip;
+those paths are left out of `files_changed`, `stat` and the patch, matched
+literally (a `*`, `[`, a space or a leading `:` is part of the name), and
+`touches_tests` follows the filtered `files_changed`. A file the worker put
+back to its base content is never left out, and a mode-only or type-only
+difference from the tip stays. A path that is a directory at the tip or at
+the candidate is compared as that directory's own tree entry, never by the
+paths that changed below it: when the main line turns file `assets/item` into
+a directory holding `main.txt` and the worker adds `own.txt` there, only
+`assets/item/main.txt` is left out and `assets/item/own.txt` shows. Paths
+are compared as Git's raw bytes; a path whose name is not valid UTF-8 cannot
+be named back to Git exactly and is never left out (a valid name holding
+U+FFFD is treated like any other). When nothing is left, `files_changed` is
+`[]` and `stat` and the patch are empty. With `integrated_files` `[]` the
+patch is byte for byte what `git diff --patch --stat
+<from_commit>..<to_commit>` prints. With `integration_tip` null (and for a
+diff recorded without an attribution, such as a `review fix: ` diff) the
+start is the run's base and `integrated_files` is `[]`. If any Git step of
+this fails, the row is today's whole diff from the run's base, with
+`integrated_files` `[]` (listing more, never fewer). The same happens when a
+path to leave out has, below it, a changed path that is not left out (a
+rework that deleted its own `assets/kind/` directory and merged a main line
+that added a file `assets/kind`): Git cannot leave out a path without
+everything below it. The label is `git diff <start>..<candidate>` in short
+shas.
+`protected_changes`, `protected_base`, `integration_tip` and
+`inline_test_errors` are worked out as before.
 
 The worker does not have to declare any of it (LEAN-1; ingest rule 6, which
 refused a delivery that did not, is retired). The review packet, the
@@ -389,10 +431,17 @@ The criteria-review instructions below apply to tasks other than research;
 research uses the source-check prompt and document above.
 
 ```
-thoth review start <task> --profile <id> --model <m> --effort <level> [--timeout 30m] [--json]
+thoth review start <task> --profile <id> --model <m> --effort <level> [--timeout <duration>] [--edit | --no-edit] [--json]
 thoth review show <task> [--full] [--json]
 thoth review record <task> -f review.json [--json]
 ```
+
+RFIX-2: on a code task (no `task_type`, or one that is not `docs`, `research`
+or `review`) `review start` runs in edit mode unless you give `--no-edit`; the
+reviewer then works in `worktrees\<task_id>-a<n>-fix` instead of the review
+worktree below and may attach a fix (see "Reviewer fixes, author confirms").
+What follows describes the plain review: `--no-edit`, or a docs, review or
+research task without `--edit`.
 
 `review start` needs the task in `in_review` with a completed implementer run
 behind it, and refuses while **any** run of the task is still `queued` or
@@ -461,8 +510,73 @@ may be bound to the finding (see "Reviewer fixes, author confirms" below):
   lines in one file), `M` (at most about 50 changed lines, or more than one
   file, no design change), `L` (larger, or it needs a design or spec change).
 - `category`: one of `spec_mismatch`, `spec_error`, `test_missing`,
-  `test_interface`, `error_path`, `concurrency`, `platform`, `docs`,
-  `evidence`, `files`, `security`, `other`.
+  `test_incomplete`, `test_interface`, `error_path`, `concurrency`,
+  `platform`, `docs`, `evidence`, `check_not_run` (REV-3), `files`,
+  `security`, `other`.
+
+**Blocking and advisory findings (REV-1).** Each category is either
+blocking (the behaviour would be wrong; the merge waits for it) or advisory
+(a note to fix later):
+
+- blocking: `spec_mismatch`, `spec_error` (the spec itself needs changing,
+  not the implementation redoing), `test_missing` (a new or changed behaviour
+  has no test at all that would fail on the old code), `error_path`,
+  `concurrency`, `platform`, `security`, `files`, and (REV-3)
+  `check_not_run` (a check the spec's `checks` lists did not run on the run
+  under review; see "Required checks" below);
+- advisory: `test_incomplete` (the behaviour has a test that would fail on
+  the old code, but it misses some cases or branches), `test_interface`,
+  `docs`, `evidence` (any other missing evidence, including a command an
+  acceptance criterion or constraint names, but not a check the spec's
+  `checks` lists), `other`.
+
+A finding with no category counts as blocking, so a missed label never lets
+one through. The reviewer prompt (the same rule for Claude, codex and agy
+reviewers, from one list in the code) says: REJECT only when at least one
+unmet criterion or extra finding is blocking; PASS when every criterion is
+met and no extra finding is blocking, advisory extra findings going with the
+PASS; when a criterion's only gap is advisory, judge it met and record the
+gap as an extra finding of that category; UNVERIFIED as before. The verdict
+stays the reviewer's: Thoth does not change it for its categories. Every
+`verdict` event records `has_blocking_findings` (see `thoth events`): `true`
+when an unmet criterion or an extra finding is blocking, `false` otherwise,
+`null` for a research source check; a verdict recorded before REV-1 has no
+such key (not recorded, not `false`). Advisory findings need no fix before
+the merge: after merging, the commander collects them into the small-fixes
+list of `docs/post-phase2/backlog.md` and fixes a batch at a time; the
+reviewer is not asked to attach a fix for them.
+
+**Required checks (REV-3).** A check the task's current spec lists under
+`checks` is required (a spec without `checks`, or with `[]`, requires none,
+even though `verify` then runs every approved check). It ran when a `verify`
+of the run under review (not `verify --at-base`) recorded it with an exit
+code and no error, at least once; a check that ran and failed (non-zero
+exit) ran, and is judged as any failure is. Otherwise it did not run:
+`no_verify_row` when no such verify names it (never verified, only
+`--at-base`, or only another run), `did_not_complete` when every row for it
+was refused (for example not approved), failed to run, timed out, had no
+exit code or left incomplete output. What the worker ran itself does not
+count. The reviewer writes one extra finding with category `check_not_run`
+per such check (check id and reason in the note) and gives REJECT; the
+prompt's `## Rules` says so and the prompt ends with `## Required checks not
+run`, the list Thoth worked out when the reviewer started (or a line saying
+there is none). Unlike REV-1's categories, Thoth enforces this one when the
+report arrives, working the list out again: a report is refused (stage
+`required_checks`) when it has a `check_not_run` finding without a REJECT,
+or when checks did not run and it is not a REJECT or has no `check_not_run`
+finding. A reviewer run's refused report lands the task `unverified`, not
+`pass`; for `review record` see below. This holds for every way `review
+start` runs: without an edit option (edit mode for a code task), with
+`--edit`, with `--no-edit`, and so for the pipeline's review step. An edit
+review's REJECT whose fix is applied records no verdict while the fix is
+pending, so the rule moves to the fix's verify at confirm (below); a REJECT
+whose fix is refused is held to the rule like any other. A taken review's `verdict` event
+records the list as `checks_not_run` (`[]` when none, `null` for a research
+source check). A confirm is worked out against the edit review run, where
+the fix's verify is recorded: with a required check that did not run there,
+its verdict is REJECT whatever the confirmer said, with one `check_not_run`
+finding per check, and its `verdict` event records the list too. A research
+source check is not covered by this rule.
 
 Both are read case-insensitively and stored as `S`/`M`/`L` and lower-case
 names; a blank value or `none` counts as absent (the codex and agy reviewers'
@@ -543,15 +657,28 @@ claims. The human output prints `brief: ...` under its first line and the
 `claim` lines only with `--full`. The MCP tool `thoth_review_show` takes the
 same switch as the boolean `full`.
 
+It also splits the newest record's findings (REV-2): `blocking` and
+`advisory` list its unmet criteria (by AC id, such as `AC2`) and extra
+findings (as `extra_findings[0]`, from 0, the way a reviewer's fix binds them),
+criteria first, by the classes above, and `has_blocking_findings` is true when
+`blocking` is not empty. They are worked out from the stored findings, so a
+record from before REV-1 has them too (no category counts as blocking); all
+three are null without a review and for a research source check. The human
+output adds `  blocking: AC1` and `  advisory (not required):
+extra_findings[0]` after the extra finding lines (`-` when a list is empty).
+Advisory findings need no fix before the merge: after merging, the commander
+collects them from `advisory` into the backlog's small-fixes list.
+
 ### Reviewer fixes, author confirms
 
 A REJECT whose findings are small does not have to cost a whole new attempt.
-With `--edit` the reviewer may attach the fix itself; Thoth applies it where
+In edit mode the reviewer may attach the fix itself; Thoth applies it where
 nothing else lives, the commander re-runs the checks on it, and a model the
 commander picks confirms only that fix:
 
 ```
-thoth review start TASK --edit --profile P --model M --effort E --reason "why this reviewer"
+thoth review start TASK --profile P --model M --effort E --reason "why this reviewer"
+                                         # a code task: edit mode by default
 thoth wait --run EDIT_RUN                # REJECT, pending_fix true
 thoth verify EDIT_RUN                    # the approved checks, in the fix worktree
 thoth checks approve --run EDIT_RUN --reason "why"   # only if the fix changed a protected file
@@ -559,7 +686,31 @@ thoth review confirm TASK --profile P2 --model M2 --effort E2 --reason "why this
 thoth wait --run CONFIRM_RUN             # PASS or REJECT
 ```
 
-`--edit` is for code tasks; a `docs`, `research` or `review` task is refused.
+Which tasks get edit mode (RFIX-2):
+
+- A code task (no `task_type`, or one that is not `docs`, `research` or
+  `review`) is reviewed in edit mode by default; `--edit` says the same.
+  `--no-edit` turns it off: a plain review, whose reviewer's `edits` are
+  ignored (MCP `thoth_review_start`: `edit` left out or true is edit mode,
+  false is `--no-edit`). Giving both flags is an error.
+- A `docs` or `review` task is a plain review unless you give `--edit`; with
+  it, the fix goes through exactly the steps below (the bounds, `thoth verify
+  EDIT_RUN`, the protected-change approval on the edit run and `thoth review
+  confirm`). While its fix is pending, `thoth task accept` refuses the task
+  (see "Taking a document task's delivery").
+- A `research` task's review is a source check and cannot attach a fix:
+  `--edit` is refused, writing nothing; without it (or with `--no-edit`) it is
+  the source check.
+
+`thoth verify EDIT_RUN` on a fix does not look at the task type. A spec whose
+`checks` list is not empty runs only those ids (`source` `approved checks
+(spec)`); a spec without `checks`, or with an empty list, runs the whole
+catalogue (`approved checks (all)`). A selected check that is not approved
+is still a row of the result (`exit_code` null, an `error` saying it is not
+approved), so that verify is not green and the fix is not adopted. To have a
+docs or review task's fix checked by its document checks only, list those
+ids in its spec's `checks`.
+
 The reviewer stays read-only. It answers with the usual review document plus
 `edits`, each `{"path","old","new","criterion","reason"}`: `old` is text that
 occurs exactly once in the file as the earlier edits left it (`""` creates a
@@ -568,12 +719,19 @@ applies the edits in order in `worktrees/TASK-aN-fix`, a detached checkout of
 the candidate that a new `review start --edit` resets, and holds the result to
 fixed bounds, measured with git against the candidate:
 
-- every edit is bound to a finding whose `fix_size` is S or M, and every unmet
-  criterion has an edit (an L finding, or one without a size, is redone);
+- every edit is bound to a finding whose `fix_size` is S or M (an advisory
+  finding included), and every blocking unmet criterion has an edit (an L
+  finding, or one without a size, is redone);
 - every extra finding whose `severity` is not `minor` (trimmed, any case; an
-  empty or unknown severity counts) has an edit too: a fix that leaves a
-  blocking finding open is refused at stage `size`, and the task is redone. A
-  `minor` finding may stay, and a confirmed PASS keeps it;
+  empty or unknown severity counts) and whose `category` is blocking or not
+  given has an edit too: a fix that leaves a blocking finding open is refused
+  at stage `size`, naming the finding, and the task is redone. (REV-2) A
+  `minor` finding, or an unmet criterion or extra finding whose category is
+  advisory (`test_incomplete`, `test_interface`, `docs`, `evidence`,
+  `other`), may stay without an edit, and a confirmed PASS keeps it: an
+  advisory unmet criterion stays `unmet` with its note, evidence, size and
+  category, as the edit review judged it, and an advisory extra finding keeps
+  its size and category, so `review show` lists both under `advisory`;
 - at most 40 changed lines (added plus deleted, a replaced line counts 2) in at
   most 3 files, plain text only;
 - no file that parses as a Thoth spec, before or after;
@@ -614,12 +772,15 @@ completed edits, the patch) and answers ok or revise for each edit; it does
 not review again and adds no finding.
 
 APPROVE with a green verify is PASS: `review show` then gives `merge_branch`
-and `merge_commit`, the fix branch and its commit. PASS means the fix may be
+and `merge_commit`, the fix branch and its commit. The PASS record marks each
+criterion an edit was bound to met by the fix; an advisory finding no edit
+was bound to stays as it was (see the size rule above). PASS means the fix may be
 merged, not that it was; the commander reads the difference and merges it
 themselves. A REVISE or a red verify (or one whose output was not collected in
 full) is not adopted: REJECT, with the original findings plus one line per
-revise, one for the red verify and one saying to redo the work from the
-original candidate; `dispatch` then starts the next attempt from the
+revise, one for the red verify, (REV-3) one `check_not_run` finding per
+required check that did not run on the fix (see "Required checks") and one
+saying to redo the work from the original candidate; `dispatch` then starts the next attempt from the
 implementer's candidate, without the fix. One edit-then-confirm chain writes
 one `verdict`. A confirm that fails, is invalid or is cancelled writes no
 review and can be run again. That includes a confirmer that changed a file or
@@ -662,6 +823,22 @@ fixed order:
 
 A valid document settles the task the same way a Thoth reviewer run's verdict
 does: `PASS` → `pass`, `REJECT` → `reject`, `UNVERIFIED` → `unverified`.
+The categories and their two classes are the ones under "Starting and
+reading a review" (`test_incomplete` included; no category counts as
+blocking). The verdict is taken as written (REV-1): a REJECT whose findings
+are all advisory still settles the task `reject`, and a PASS with a blocking
+extra finding still settles it `pass`; the `verdict` event's
+`has_blocking_findings` says which (`false` and `true` there). A PASS with an
+unmet criterion is still invalid, whatever its category.
+
+(REV-3) After the preconditions, the report is also held to "Required checks"
+(under "Starting and reading a review") against the run it settles: with a
+required check that did not run, only a REJECT carrying a `check_not_run`
+finding is taken, and a `check_not_run` finding always needs a REJECT. A
+report that breaks this is refused like an invalid document: non-zero exit,
+`review.json invalid at stage required_checks: …`, one `review_invalid`
+event (stage `required_checks`, with `checks_not_run`), the task left
+`in_review`. Before REV-3 such a PASS settled the task `pass`.
 
 **Invalid is refused, not settled `unverified`.** This is the one place an
 external review's handling differs from a Thoth reviewer run's: `review
@@ -723,7 +900,11 @@ Sections, in order:
 2. the spec's goal, acceptance criteria, constraints, non-goals and excluded
    alternatives, verbatim;
 3. the evidence index: code, kind, exit code, run id, label, and for `command`
-   rows the last 15 lines of the stored output;
+   rows the last 15 lines of the stored output; (RVI-1) a `verify` row whose
+   check did not complete cleanly (refused, failed to run, timed out, output
+   left incomplete, no exit code) has an `execution error: TEXT` line right
+   under its index line, even when it exited 0 or printed output (`--json`:
+   the evidence entry's `execution_error`, null otherwise);
    then `## Protected files changed`: for every `diff` row, each entry of its
    `protected_changes` as `path (status, kind)` with the diff's code and run
    (`kind` may be `inline_test`, LEAN-1; no claim is needed for an entry),
@@ -733,8 +914,25 @@ Sections, in order:
    instruction to decide, file by file, whether the change weakened a check
    and to say so in its findings; codex and Antigravity reviewers read it in
    the packet;
+   then (REV-3) `## Required checks not run`: the checks the spec's `checks`
+   lists that did not run on the run the claims came from (see "Required
+   checks" under "Starting and reading a review"), one line `CHECK_ID
+   (REASON)` each, `REASON` being `no_verify_row` or `did_not_complete`, or
+   `(none)`; `--json` has the top-level `checks_not_run`
+   (`[{"check_id","reason"}]`, `[]` when there is no claims run);
 4. every `diff` row in full (all attempts, not cut at `evidence show`'s
    4000-byte default), each headed by its code, run id and `blob_verified`;
+   (SMALL-9c) under each heading one line gives the start and end commits as
+   short shas, the rule that chose the start (`merge base with the main
+   worktree` or `the run's base`; a row recorded before SMALL-9c reads `the
+   run's base`) and either `N file(s) brought in by merging the main line are
+   left out: A, B` or `left out: none`, for example
+   `From 1a2b3c4d to 5e6f7a8b (start: merge base with the main worktree); 1 file(s) brought in by merging the main line are left out: tests/x.rs`
+   (see "Where a diff starts and what it leaves out" under "Evidence"). Each
+   `--json` `diffs[]` entry has `from_commit`, `to_commit`, `diff_from_rule`
+   (null for an older row) and `integrated_files` (`[]` for an older row). The
+   `.agent/review-input/packet.md` a codex or Antigravity reviewer reads
+   carries the same line;
 5. the `claims` of the newest `result_ingested` event, with the run they came
    from;
    then `## Approvals during this task`: every `check_approved` event since
@@ -751,7 +949,11 @@ Sections, in order:
    external (no reviewer run), and its findings.
 
 The worker's own `summary` from result.json is left out on purpose: the
-reviewer judges from evidence, not from prose. Section 5 says so.
+reviewer judges from evidence, not from prose. Section 5 says so. (RVI-1) A
+codex or Antigravity code reviewer still gets the whole delivery beside the
+packet, as `.agent/review-input/result.json` (see "Codex reviewers"), for
+criteria about what the delivery itself contains; that file is delivered
+prose, not execution evidence.
 
 A task with no evidence, no result and no review still gets a packet, with each
 empty section saying so. An unknown task id exits `1` with an error naming it.
@@ -795,6 +997,14 @@ and `unclassified`, is marked `suggest_check`; findings are counted, not
 tasks, so the same category found again in one task's rework counts. The human
 output then adds `seen N times in M tasks: consider turning it into a lint rule
 or a check` (N findings, M tasks).
+(REV-2) Each group also says whether its category is blocking or advisory, by
+the classes in "The reviewer" (`unclassified` counts as blocking, as a finding
+with no category does), and the totals are split: `--json` has `blocking` on
+each category and `blocking_findings` and `advisory_findings` at the top, the
+two adding up to `findings`. Advisory findings a PASS carries count too; an
+older record is classed by the same rule (its `test_missing` is blocking). The
+human output's first line adds `N blocking, M advisory` after the findings
+count, and each group line ends with `(blocking)` or `(advisory)`.
 Groups are listed with the most findings first, ties by name. With no finding
 it prints `retro: no review findings in the last N days`. `--json` keys are in
 `docs/adapter-usage.md`.
@@ -1032,7 +1242,7 @@ has `task_id`, `spec_review_id`, `verdict`, `spec_sha256`, `risk`,
 ```
 thoth spec review start TASK --profile PROFILE --model MODEL [--effort EFFORT] --edit [--json]
 thoth spec review show TASK [--proposed-out FILE] [--json]
-thoth spec review confirm TASK --profile PROFILE --model MODEL [--effort EFFORT] [--reason TEXT] [--timeout 30m] [--json]
+thoth spec review confirm TASK --profile PROFILE --model MODEL [--effort EFFORT] [--reason TEXT] [--timeout DURATION] [--json]
 ```
 
 A full review that comes back REVISE over small, obvious things (a wrong
@@ -1045,33 +1255,72 @@ confirm the fixes, instead of re-reviewing everything:
    `edits`, each one `field` (goal, acceptance_criteria, constraints,
    non_goals or excluded_alternatives), `op` (replace, insert or delete; the
    goal and a criterion can only be replaced, and a replaced criterion keeps
-   its id), `at` (the entry's position after the earlier edits), `anchor`
-   (the first 10 characters of the entry it changes, counted without the
-   whitespace at either end, so a wrong `at` is caught), `text`, `criterion`
-   (the AC it serves) and `reason`; every edit carries all seven, `""` or
-   `0` when one does not apply, and nothing else. A change the
-   reviewer is sure of goes in `edits`; a question only the author can answer
-   stays a finding. The reviewer writes no file: Thoth applies the edits to
-   the stored spec, lints the result like `update-spec` would, and keeps it
-   as the *proposed spec* inside the REVISE event (`mode` `edit`), together
-   with the list of what changed (`edits`, `edit_count`, `bytes_before`,
-   `bytes_after`, `proposed_sha256`). An edit that breaks a rule (a field
-   that cannot be edited, an anchor that does not match, a criterion id that
-   changed, a blank reason, a text that carries a mask marker the stored
-   spec does not have, copied from the masked spec the reviewer read) or a
-   proposed spec the lint refuses is a
-   `spec_review_invalid` (stage `edits` or `lint`) and no verdict. With edits,
-   REVISE is the verdict even when every criterion is `ok`; an APPROVE
-   proposes no edits. The task's spec is untouched at this point.
+   its id), `at` (the entry's position after the earlier applied edits),
+   `anchor` (for replace and delete: text that names the entry it changes,
+   see below), `text`, `criterion` (the AC it serves) and `reason`; every
+   edit carries all seven, `""` or `0` when one does not apply, and nothing
+   else. A change the reviewer is sure of goes in `edits`; a question only
+   the author can answer stays a finding. The reviewer writes no file: Thoth
+   applies the edits to the stored spec, lints the result like `update-spec`
+   would, and keeps it as the *proposed spec* inside the REVISE event (`mode`
+   `edit`), together with the list of what changed (`edits`, `edit_count`,
+   `refused_edits`, `bytes_before`, `bytes_after`, `proposed_sha256`). With
+   edits, REVISE is the verdict even when every criterion is `ok`; an
+   APPROVE proposes no edits. The task's spec is untouched at this point.
+
+   **Anchors** (SR-4; before it an anchor had to be the first 10 characters
+   of the entry at `at`). The anchor and the entries are trimmed at both
+   ends and compared literally: case matters, there is no Unicode
+   normalization (`cafe` plus a combining accent is not `café` written as
+   one character) and runs of spaces are not folded. A blank or
+   whitespace-only anchor names nothing. Any nonempty prefix of
+   the entry at `at` names that entry, however short (`AC5: Docs`, or one
+   Chinese character) and even when it occurs elsewhere in the field.
+   Otherwise Thoth looks for the anchor in every entry of the same field (the
+   goal is its one string; never another field) and takes the entry it
+   occurs in when it occurs at exactly one starting position, a middle
+   substring included, even when `at` is stale or past the end; overlapping
+   occurrences count separately (`zz` is twice in `zzz`), and text that
+   occurs twice or more, or nowhere, names nothing. There is no minimum
+   length; length is in Unicode scalar values (a Chinese character, an emoji
+   and a combining mark each count one, whatever their UTF-8 or UTF-16
+   size). The whole selected entry is replaced or deleted, never only the
+   matched text, and the event's `at` is the position the anchor resolved
+   to.
+
+   **Refused edits** (SR-4). Thoth processes the edits in document order. An
+   edit that breaks a rule (a field or op that cannot be used, an anchor that
+   names no entry, an insert past the end, a blank reason or text, a
+   criterion id that changed, a text that carries a mask marker the stored
+   spec does not have, copied from the masked spec the reviewer read) is
+   refused on its own: it changes nothing, the later edits still apply
+   against what the applied ones left (a later `at` counts only those), and
+   it is listed in the REVISE event's `refused_edits` (`index`, `field`,
+   `reason`, input order). The applied edits keep their original indices,
+   so `edits` may read 0, 2, 4. When every edit is refused, the REVISE is
+   still kept with its findings, `edit_count` 0, no proposed spec and nothing
+   pending. Before SR-4 a single such edit threw the whole review away as
+   `spec_review_invalid` stage `edits`. What still refuses the whole review
+   (`spec_review_invalid`, no verdict): a malformed document (a missing or
+   extra edit property, an APPROVE with edits: stage `schema`), criteria that
+   do not cover the task's ids (stage `coverage`), a spec changed while the
+   reviewer ran (stage `spec_changed`), and a final proposed spec the lint
+   refuses, for example over 40960 bytes (stage `lint`).
 2. `spec review show` says `pending_edits: true` when the newest spec review
-   is such an edit REVISE of the current spec, and lists the edits one per
-   line. `--proposed-out FILE` writes the proposed spec to a file, so the
+   is such an edit REVISE of the current spec with at least one applied
+   edit, and lists the edits one per line, then one `refused edit INDEX
+   FIELD REASON` line per refused edit (`--json`: `newest.refused_edits`,
+   `[]` for older reviews and other modes). `--proposed-out FILE` writes the proposed spec to a file, so the
    commander can read it, or edit it by hand and `task update-spec` it.
    `dispatch` of a gated task says the edits await the author check.
 3. `spec review confirm` launches the author (use the profile and model that
    wrote the spec) as another read-only run of the same role, in the same
    worktree, with `spec.json`, `proposed.json` and `edits.json` in
-   `.agent/spec-review-input/`. It judges only the edits, against the code
+   `.agent/spec-review-input/`; `edits.json` holds only the applied edits,
+   under their original indices, and the author answers exactly those (a
+   confirmation that answers a refused index is `spec_review_invalid` at
+   stage `coverage`); an APPROVE applies only the proposal built from them.
+   It judges only the edits, against the code
    they name, the rest of the spec and the original intent, `ok` or `revise`
    with a note each; it does not review the whole spec again and adds no
    findings. The author's APPROVE makes Thoth replace the task's spec with
@@ -1089,8 +1338,10 @@ confirm the fixes, instead of re-reviewing everything:
 any APPROVE (the author's included) resets it; the limit of 3 and
 `--skip-spec-review` are unchanged.
 
-**Time.** Both commands take `--timeout` (default 30m). A spec over 20 KB
-reviewed with a max-class effort can take longer: give `--timeout 2h`.
+**Time.** Both commands take `--timeout`. Without it the limit follows the
+effort sent, as for every launch command (SMALL-9b): none, `low` or `medium`
+1 hour; `high` 3 hours; `xhigh`, `max` or `ultra` 4 hours. A given
+`--timeout` wins.
 
 **Whether to send the edits to the author at all** is the commander's call,
 not Thoth's: the event records `edit_count`, `bytes_before` and
@@ -1104,6 +1355,160 @@ proposed`), and an author's check counts its answers (`REVISE: 1 of 3 edits
 revise`). The human `spec review show` prints `brief: ...` under its first
 line and keeps every criterion, finding, edit line and author answer below it
 whole.
+
+## Running a task to the end
+
+New (AUTO-1a). `thoth pipeline start` walks one task through the loop above
+in the background and comes back with a short conclusion: mergeable, out of
+attempts, or in need of your judgement. It runs ordinary thoth commands, so
+everything it does is in the usual events, evidence and run folders; it
+only saves you the waiting. You still make every choice:
+
+```
+thoth pipeline start 01J... \
+  --implementer claude-b:sonnet:medium \
+  --reviewer codex-a:gpt-5.6-luna:medium --reviewer claude-a:opus:high \
+  --verify-timeout 120m \
+  --reason "sonnet medium fits this normal-risk change; codex reviews across providers first" --json
+thoth pipeline show 01J... --wait 30m
+```
+
+- The lists are ordered and kept as given, and (AUTO-1b) walked forward in
+  that order: see "Rework and rotation" below. Thoth does not pick, rank or
+  reorder an entry. Encode your own order in the lists: another provider at
+  a middle model and effort first; when a same-provider stand-in is needed,
+  claude-a or claude-c, never claude-b (decision 2026-10-27). Repeat an
+  entry to allow it to be used again.
+- `--reason` is required even with `require-reason` off. Each launch says
+  `pipeline ID step N: REASON` (a rework, hand-over or retry also names its
+  cause and the entry position), so `launch_choice` shows both.
+- The task may be `queued` or `in_review`, and (AUTO-1b) also `reject`,
+  `unverified`, `interrupted` or `failed`; see the table below.
+- Leave `--timeout` and `--review-timeout` out to keep the launch commands'
+  effort-based default. `--verify-timeout` (default `120m`, per check) must
+  be long enough for a full low-parallel suite, which takes 35 to 45
+  minutes here; `--verify-wait` (default `2h`) is how long it may queue for
+  a verify slot.
+- Verify runs with the environment the pipeline was started with: set
+  `CARGO_BUILD_JOBS=2` and `RUST_TEST_THREADS=2` in the shell that starts it
+  (Thoth does not look at the machine). On Windows verify runs at
+  below-normal priority.
+
+The steps: dispatch (from `queued`), wait for the run, the protected-change
+gate, verify (queued behind other pipelines' verify by the `verify-slots`
+setting, default 1), review start, the verdict. An `unverified` delivery is
+dispatched once more in the same attempt; a red verify is tried once more.
+`thoth pipeline show TASK` reports the step it is at, its heartbeat, every
+command it ran (`steps[]`, with the output files in its folder, `dir`) and,
+once it stops, `stop`: a reason, a summary that leads with the review or
+worker brief, the next commands and the evidence ids.
+
+What comes back to you:
+
+- `pass`: merge `stop.evidence.merge_branch` at `merge_commit` (read the
+  change first). `merge_target_unavailable` when review show names none;
+  nothing is guessed.
+- `spec_rewrite_needed`, `repeated_reject`, `stuck`, `attempts_exhausted`,
+  `implementers_exhausted`, `reviewers_exhausted`: the rework or rotation
+  below came to an end that needs you.
+- `needs_approval`: the candidate changed protected tests, inline tests or
+  check-word files. Read `thoth review packet TASK`, approve with
+  `thoth checks approve --run RUN --reason TEXT`, then run the same
+  `pipeline start` again: from `in_review` it continues that candidate
+  without dispatching again. The pipeline never approves for you.
+- `needs_fix_confirmation`: an edit review left a pending fix. The
+  pipeline's own review starts with neither `--edit` nor `--no-edit`, so a
+  code task's review is in edit mode (RFIX-2) and its reviewer may leave one;
+  so may a review you started by hand (on a code task without `--no-edit`).
+  `pipeline show --json`'s `review_start` step reports it as `result.mode`
+  `edit`. Run `thoth verify EDIT_RUN`,
+  then `thoth review confirm TASK --profile P --model M --effort E --reason
+  TEXT`. Nothing is confirmed, discarded or adopted automatically.
+- `run_interrupted` (for example a quota stop), `run_failed`, `runner_lost`,
+  `dispatch_refused`, `review_start_refused`, `verify_blocked`,
+  `verify_failed`, `verify_wait_timeout`, `unverified_twice`,
+  `review_unverified`, `review_interrupted`, `protected_unreadable`,
+  `task_cancelled`: read `stop.summary` and `stop.next`.
+
+### Rework and rotation
+
+New (AUTO-1b). The pipeline no longer stops at the first REJECT or the
+first quota stop. It moves through your two lists, using each entry at most
+once unless you repeated it, and comes back when the task is mergeable,
+when the attempts or the list run out, or when judgement is needed.
+
+Before every dispatch, resume and review start it reads two facts about the
+entry the list names (never about another one): `thoth recommend --role
+ROLE --task TASK --model M --json`, and with `--quota-threshold N` also
+`thoth profile usage P --json`. An entry `recommend` calls not eligible
+(used up, logged out, parked, or held back by `quota-reserve-percent`, the
+one reserve rule SMALL-9a added) is skipped with recommend's own reasons;
+with a threshold, an entry whose deciding window (the model's agy group, or
+all windows; windows that have reset and codex extra buckets left out) is
+at least N percent used is skipped too. Facts that cannot be read never hold
+an entry back: the step says what was unknown, and the launch command's own
+checks decide. In particular, when `recommend` cannot be read the model's
+agy group is unknown (not "all windows"), so the threshold decides nothing
+for that entry; and an account `recommend` has no current reading for
+(`quota_state` unknown) gets a warning on the `recommend` step even without
+a threshold. The pipeline never refreshes quota itself and never waits for
+a reset.
+
+| what happened | what the pipeline does |
+|---|---|
+| REJECT, low/normal risk | the next implementer entry reworks it as a new attempt; dispatch folds the findings as always |
+| REJECT, important/high, spec rewritten after it | the next entry reworks it; dispatch takes your rewrite (`task update-spec`, or an author's APPROVE through `spec review confirm`) |
+| REJECT, important/high, spec unchanged, no `--fold-on-reject` | stops `spec_rewrite_needed`: rewrite the spec, then start the pipeline again (from `reject` it starts at the first entry) |
+| REJECT, important/high, `--fold-on-reject` | appends the findings unchanged to the spec's constraints after a marker line, replaces the spec with `task update-spec` (step `update_spec`), then reworks; a refused update stops `spec_rewrite_needed` |
+| the next attempt would pass `--max-attempts` | stops `attempts_exhausted` with the unmet criteria and the review brief |
+| three REJECTs in a row share an unmet criterion (important/high with `--fold-on-reject`) | stops `repeated_reject` with that criterion and the three review ids |
+| dispatch refuses as stuck | stops `stuck` with dispatch's own diagnostic |
+| implementer stopped by quota or auth | the next entry continues the same attempt with a handoff (`.agent/handoff.md`) |
+| implementer crashed or hit a transient failure | the first time in an attempt, `thoth resume RUN` once if its entry is still usable; otherwise, or the second time, the next entry |
+| implementer timed out | one more dispatch in that attempt at twice its timeout (at most 7 days), this entry if usable or the next; a second timeout stops `run_failed` |
+| dispatch refused by the login check or the quota reserve | that entry is used up; the next one is tried |
+| reviewer has the implementer run's model and effort (requested or lowered) | skipped |
+| reviewer stopped by quota or auth, or refused by the login check or the reserve | the next reviewer entry |
+| reviewer crashed / timed out | that entry once more (a timeout at twice its limit), then the next |
+| a reviewer left a pending fix | stops `needs_fix_confirmation`; never folded or reworked, even with `--fold-on-reject` |
+| invalid review verdict | stops `review_unverified` (an UNVERIFIED review is yours to judge) |
+| no usable entry left | stops `implementers_exhausted` / `reviewers_exhausted`, listing every entry tried or skipped and why, and keeping what sent it there: the REJECT's brief, review and reviewer run, or the stopped run's reason, error, `next_step` and its next command |
+
+`--max-attempts` is the ceiling you authorise: when the next attempt is
+above the task's own cap but within it, the rework dispatch gets
+`--allow-attempt`; it is never raised beyond what you gave. The findings
+appended by `--fold-on-reject` are exactly the lines ordinary rework gives
+the worker (`ID: NOTE (evidence CODES)`, `SEVERITY: NOTE (evidence
+CODES)`), under `REJECT REVIEW_ID (attempt A), folded as-is by pipeline
+PIPELINE_ID:`; nothing else in the spec changes, spec lint's usual limits
+apply, and a REJECT is never appended twice. Resume has no `--reason`: the
+`resume` step records the reason (yours and the cause) instead.
+
+`thoth pipeline show TASK --json` shows where it is: `implementer_index`
+and `reviewer_index` (zero-based positions in your lists), `attempts_used`,
+and per step `entry_index` (one-based), `skipped` (each passed-over entry
+and why), `attempt` and, for a preflight, `warning`. `status TASK --json`'s
+`pipeline` has the same three positions.
+
+Stopping: `thoth pipeline stop TASK` stops before the next launch and ends
+an active verify; **it cancels no worker**. A run the pipeline started keeps
+going and settles on its own; `thoth cancel RUN` is still the only way to
+end one (and cancellation is final for the task).
+
+If the pipeline's process dies (a reboot, a kill), its heartbeat stops and
+`show` reports `stale` after 15 seconds. Start it again with the same
+command: the old one is recorded as stopped (`stale`) and the new one
+attaches to the live run or continues from `in_review`. `pipeline stop` on a
+stale pipeline settles it at once.
+
+While a pipeline runs, it owns its task: `dispatch`, `review start`,
+`review confirm`, `review record`, `resume`, `task update-spec`,
+`task close`, `spec review confirm` and `submit` for that task are refused
+with the pipeline's id and `thoth pipeline stop TASK`. `cancel`,
+`checks approve`, `verify` and reading stay available.
+
+Document tasks (docs, research, review) are refused: take their delivery
+with `thoth task accept`.
 
 ## Rework after a REJECT
 
@@ -1126,6 +1531,20 @@ thoth task update-spec <task> -f new-spec.json [--json]
   a test that fails first, run it on its own so the failing run is captured,
   then fix and run it again (findings that change no behaviour are exempt).
   The task's own spec is untouched;
+- (REV-2) only blocking findings are required. A finding whose `category` is
+  advisory (`test_incomplete`, `test_interface`, `docs`, `evidence`,
+  `other`) goes into `rework.advisory` instead of `unmet` or
+  `extra_findings`, in the same line formats; a finding with no category
+  counts as blocking. The prompt lists them after the required lists and
+  after "Fix exactly these", in a `### Advisory findings (not required)`
+  subsection that says they need no fix, are collected into the backlog's
+  small-fixes list after the merge, and may be fixed in passing; with no
+  advisory finding the subsection is left out. A research source check is
+  not split: all of its findings stay required. `dispatch --json`'s
+  `folded_findings` counts every line folded in, advisory ones included;
+  `folded_advisory` counts the advisory ones (`0` outside a rework). A
+  REJECT that carries only advisory findings still folds them and does not
+  warn;
 - `attempt` may not exceed `tasks.attempt_cap` (default 2). Past that, `dispatch`
   refuses and tells you to raise the implementer tier or hand the task back.
   `--allow-attempt N` overrides that for **one dispatch** and writes nothing, so
@@ -1175,6 +1594,12 @@ thoth task update-spec <task> -f new-spec.json [--json]
 Automatic rework stops after the same reason appears in three consecutive
 post-`spec_updated` REJECT reviews: an acceptance criterion judged `unmet`, an
 identical extra finding, or the same non-zero `result.json` refusal rule.
+(REV-2) Only blocking findings count: the criterion has to be unmet and
+blocking in each of the three, and the extra finding blocking in each of the
+three. The classes come from the review record each REJECT's `verdict` event
+names; when that record cannot be read, its unmet criteria count as
+blocking. An advisory finding (for example a `docs` one) that keeps coming
+back does not stop the rework.
 Finding notes are compared exactly after trimming, Unicode lowercasing,
 collapsing whitespace, removing evidence-code tokens such as `E004`, and
 removing a trailing `.`, `。`, or `;`; this is not fuzzy matching. Rule `0` is
@@ -1205,7 +1630,8 @@ guards), and when `--reason` is empty. `--json` prints
 `{"ok": true, "task_id", "previous_status", "status": "cancelled", "reason"}`.
 
 `task close` then removes the clean worktrees of this task and of every other
-`pass` or `cancelled` task (see "Worktree cleanup"); the branches stay. A
+`pass` or `cancelled` task (see "Worktree cleanup"); the branches stay until
+the next `task create` or `worktrees prune` deletes the merged ones. A
 worktree with uncommitted changes is kept, listed in the output (`--json`:
 `worktrees.kept`) and recorded in a `worktree_kept` event. `cancel` stays a
 run-level command.
@@ -1264,6 +1690,13 @@ nothing written) inside a run (`THOTH_RUN_ID` set: a worker does not take its
 own delivery), with an empty `--reason`, from any status but `in_review`, for
 a task of another `task_type` or none (review it with `review start` /
 `review record`), and while a run of the task is `queued` or `running`.
+It also refuses (RFIX-2) a docs or review task with a pending fix, left by a
+`review start --edit` whose fix was applied (`review show`'s `pending_fix`
+true): accepting would take the original delivery past the fix. The error
+lists what to run, in order: `thoth verify EDIT_RUN`, then `thoth review
+confirm TASK ...`; the task stays `in_review`. To drop the fix instead,
+review the delivery again with `review start --no-edit` (a plain review,
+whose verdict then settles the task).
 `--json` prints `{"ok", "task_id", "previous_status", "status": "accepted",
 "reason", "run_id", "result_status", "candidate_commit", "worktrees"}`.
 
@@ -1291,8 +1724,10 @@ interchangeable.
 
 A worker worktree holds a full checkout plus whatever the worker built in it
 (a cargo `target/` makes it several GB), and a finished task never uses it
-again. Thoth removes those directories itself; the branch, its commits and
-every piece of evidence (`blobs/`, `runs/`, `state.db`) stay.
+again. Thoth removes those directories itself; the commits and every piece
+of evidence (`blobs/`, `runs/`, `state.db`) stay. The branch stays until its
+work is in the task's base branch; then `worktrees prune` or the next `task
+create` deletes it (see "Branch cleanup").
 
 **What qualifies.** Only tasks whose status is `pass`, `cancelled` or
 `accepted` and that have no `queued` / `running` run. The worktrees of
@@ -1310,10 +1745,49 @@ or `accepted` task). Each candidate is a
   commit only that directory reaches would be lost with it).
 
 A git command that fails on the directory keeps it as `git_error`. When all
-three hold, Thoth runs `git worktree remove --force` and nothing else: it
-never deletes a directory itself, never deletes a branch or a commit, and
-never runs `git gc`. A directory that no longer exists is skipped without an
-event; every sweep ends with `git worktree prune`, so git forgets it.
+three hold, Thoth first removes every directory symlink or junction inside it
+(a `node_modules` junction, for example), as a link entry and without
+following it, so what the link points to is never touched: on 2026-10-14 a
+plain `git worktree remove --force` on Windows followed such a junction and
+emptied the main tree's `node_modules`. The walk skips `.git` and never
+descends into a link. On Linux a symlink counts as a directory link when its
+target is a directory or does not exist (a dangling link is removed too);
+when its target cannot be read for any other reason (permission denied, for
+example) Thoth cannot tell, which counts as an entry it cannot inspect. If an
+entry cannot be read, inspected or removed, the directory is kept as
+`link_unremovable` (the detail names the entry and the error), that entry
+stays, and nothing else is done to the directory - no git, no recursive
+delete. Then
+Thoth runs `git worktree remove --force`: it never deletes a directory
+itself, never deletes a commit, and never runs `git gc`. Removing a
+directory never deletes its branch (merged branches go separately, see
+"Branch cleanup" below). A directory that no longer exists is skipped without
+an event; every sweep runs `git worktree prune`, so git forgets it.
+
+**Branch cleanup.** `thoth worktrees prune` and `task create` then look at
+every local branch named exactly `thoth/TASK/aN` of each finished task they
+swept, including branches whose worktrees are already gone, and delete the
+ones whose work is already in the task's base branch (the `base_branch` of
+`task show --json`):
+
+- the branch tip is an ancestor of the base (a fast-forward or `--no-ff`
+  merge): deleted with `git branch -d`, which git checks against the base,
+  not against whatever the main tree has checked out (`merged_by`
+  `ancestor`);
+- or `BASE..BRANCH` holds no merge commit and `git cherry BASE BRANCH` marks
+  every commit `-`, already applied (a cherry-pick or a rebase onto the base):
+  deleted with `git branch -D` (`merged_by` `cherry`).
+
+Everything else is kept and listed: `branch_checked_out` (a worktree still
+has it, such as a kept dirty one), `no_base_branch` (the task was started on
+a detached HEAD, or the base branch is gone), `branch_unmerged` (work the
+base does not have, a merge commit on the branch, or a check that failed or
+was inconclusive - then with a detail), `branch_is_a_base` (another task was
+created from it) and `branch_delete_failed` (git refused; the detail has its
+message). Remote branches and base branches are never deleted, and a kept
+branch is yours to merge or delete. `task close`, `task accept`,
+`review record` and the runner leave branches alone; the next `task create`
+or `worktrees prune` handles them.
 
 A spec reviewer's worktree (`kind` `spec_review`) is removed with the worker
 worktrees when the task is `pass`, `cancelled` or `accepted`; until then each
@@ -1332,9 +1806,12 @@ worktrees when the task is `pass`, `cancelled` or `accepted`; until then each
 - `task close`, `task accept` and `task create`: every finished task of the
   repo, worker and review worktrees alike. `task create` is the catch-up: it removes the
   review worktrees and anything an earlier sweep had to keep.
-- `thoth worktrees prune [--json]`, whenever you like, from the main working
-  tree: the same full sweep, listing what it removed and kept. It exits `1`
-  when something was kept for `remove_failed` or `git_error`.
+- `thoth worktrees prune [--json]`, whenever you like and after every merge,
+  from the main working tree: the same full sweep plus branch cleanup,
+  listing what it removed and kept (`--json`: `removed`, `kept`,
+  `removed_branches`, `kept_branches`). It exits `1` when a worktree was kept
+  for `remove_failed` or `git_error`; kept branches never change the exit
+  code.
 
 None of these sweeps runs when `THOTH_RUN_ID` is set (a worker or reviewer
 must not remove other tasks' worktrees; `worktrees prune` refuses), or when
@@ -1344,8 +1821,10 @@ close --json` then reports `worktrees.error`; `worktrees prune` refuses).
 **Events.** Each removal writes `worktree_removed`; each kept directory writes
 `worktree_kept` with its `reason`, but only once per path and reason - a
 directory kept for the same reason again (every `task create` looks at it)
-adds no new event. `thoth events --task TASK` or `thoth worktrees prune
---json`'s `kept` shows what is waiting for you.
+adds no new event. Branches work the same way: each deletion writes
+`branch_deleted`, each kept branch `branch_kept`, once per branch and reason.
+`thoth events --task TASK` or `thoth worktrees prune --json`'s `kept` and
+`kept_branches` show what is waiting for you.
 
 **Windows file locks.** A file still held open (an editor, a dying process)
 makes `git worktree remove --force` fail: the directory is kept as
@@ -1828,7 +2307,10 @@ thoth checks remove py
   run that cannot finish within one command's time limit, and when the spec
   asks for the whole suite runs it in parts that each finish, keeping each
   part's output. The same two sentences are in the Claude, agy and codex
-  prompts; they name no tool, since Thoth serves any language's repo.
+  prompts; they name no tool, since Thoth serves any language's repo. Right
+  after them the implementer prompt carries the reviewers' interface test rule
+  (`INTERFACE_TEST_RULE`), so the worker knows how its new or changed tests
+  are judged.
 
 ### The tests-no-db check
 
@@ -2055,17 +2537,25 @@ transient failure; detail: `attempt` (1 or 2), `error` (the failure's text),
 `session_id` (the session continued, or a new Claude session started; else
 null), `worker_pid` and `worker_image` (the new launch's); see
 docs/phase1/usage.md "Quota interruptions"),
-`worktree_removed` (WT-1: a finished task's worktree directory was removed,
-its branch kept; detail: `task_id`, `path`, `kind` (`worker`, `review` or
+`worktree_removed` (WT-1: a finished task's worktree directory was removed;
+removing it does not delete its branch; detail: `task_id`, `path`, `kind` (`worker`, `review` or
 `spec_review`),
 `head`, `branch` (null for a detached review worktree), `task_status`,
 `source` (`runner`, `review_record`, `task_close`, `task_accept`,
 `task_create` or `worktrees_prune`); see "Worktree cleanup"),
 `worktree_kept` (WT-1: a finished task's worktree directory was kept; detail:
 `task_id`, `path`, `kind`, `reason` (`outside_worktrees_dir`,
-`uncommitted_changes`, `unreachable_head`, `git_error` or `remove_failed`),
-`detail`, `task_status`, `source`; written once per path and reason, not on
-every sweep),
+`uncommitted_changes`, `unreachable_head`, `git_error`, `remove_failed` or
+`link_unremovable`), `detail`, `task_status`, `source`; written once per path
+and reason, not on every sweep),
+`branch_deleted` (a finished task's merged local branch was deleted by
+`worktrees prune` or `task create`; detail: `task_id`, `branch`, `tip`,
+`merged_by` (`ancestor` or `cherry`), `task_status`, `source`; see "Branch
+cleanup"),
+`branch_kept` (such a branch was kept; detail: `task_id`, `branch`, `reason`
+(`branch_checked_out`, `no_base_branch`, `branch_unmerged`,
+`branch_is_a_base` or `branch_delete_failed`), `detail` only for a failure,
+`task_status`, `source`; written once per branch and reason),
 `spec_review` (SR-1: one APPROVE or REVISE of the task's spec, written by
 `spec review record` (`source` `external`) or by the runner for a spec
 reviewer run (`source` `reviewer_run`, `reviewer_run_id` and the event's
@@ -2074,14 +2564,17 @@ detail: `spec_review_id`, `verdict`, `spec_sha256`,
 `risk`, `task_status`, `criteria`, `findings`, `revise_streak`, `stalled`,
 `source`, `reviewer_run_id`, `document`, and SR-3's `mode` (`external`,
 `review`, `edit` or `confirm`), `edits`, `edit_count`, `proposed_spec`,
-`proposed_sha256`, `bytes_before`, `bytes_after`, plus on an author's check
+`proposed_sha256`, `bytes_before`, `bytes_after`, SR-4's `refused_edits`
+(the edits of an edit review refused one by one, `index`, `field` and
+`reason`; `[]` otherwise), plus on an author's check
 `confirms_spec_review_id`, `spec_sha256_before` and `applied`; see "Spec
 review before the first dispatch" and "Reviewer edits, author confirms"),
 `spec_review_invalid` (SR-1: a refused spec-review document; detail: `stage`,
 `reason`, `source`, and `expected` at the coverage stage; SR-2: for a spec
 reviewer run also `reviewer_run_id`, on the run, with the stages `read`,
 `schema`, `spec`, `coverage`, `started`, `spec_changed` or `write`; SR-3:
-`edits` and `lint` for an edit review, and for an author's check (`source`
+`edits` and `lint` for an edit review (SR-4: an edit that breaks a rule is
+no longer a reason for this event; it is listed in `refused_edits`), and for an author's check (`source`
 `author_check`) also `superseded` and `status`),
 `spec_review_started` (SR-2: on the spec reviewer run; detail: `spec_sha256`,
 `reviewed_commit`, `task_base_commit`, `risk`, `task_status`, `worktree`,
@@ -2116,6 +2609,22 @@ can produce it, a reviewer's verdict arriving after the task left `in_review`
 wrote, so it is `null` both when the settle deliberately wrote none and when a
 conditional write did not apply; `task_status_not_applied` tells the two
 apart.
+
+New (AUTO-1a), all on the pipeline's task: `pipeline_started` (detail:
+`pipeline_id`, `settings`, `entry_status`, `reason`, `require_reason`),
+`pipeline_step` (one per command the pipeline recorded; detail:
+`pipeline_id`, `index`, `kind` (`dispatch`, `verify`, `review_start`),
+`argv`, `exit_code`, `duration_ms`, `ok`, `run_id`, `error`,
+`stdout_bytes`, `waited_for_slot_ms` (verify only), `result`),
+`pipeline_stop_requested` (detail: `pipeline_id`) and `pipeline_stopped`
+(one per pipeline; detail: `pipeline_id`, `status`, `stop_reason`,
+`stop_summary`, `stop_next`, `stop_evidence`, `ended_at`, `task_status`,
+`steps`). See "Running a task to the end". Additive (AUTO-1b):
+`pipeline_started` also has `quota_threshold` and `fold_on_reject`;
+`pipeline_step` also has the kinds `recommend`, `profile_usage`, `resume`
+and `update_spec` and the fields `entry_index`, `skipped`, `attempt`,
+`reason`, `warning`, `implementer_index`, `reviewer_index` and
+`attempts_used`; `pipeline_stopped` also has the last three.
 
 ## `thoth hook` (internal)
 
@@ -2204,11 +2713,18 @@ The sandbox lands in a later phase; until then, dispatch work you would be willi
 to run yourself (the same rule `docs/phase1/usage.md` already states for
 filesystem access).
 
-Eight smaller ones worth knowing:
+Nine smaller ones worth knowing:
 
 - **An attempt 2 (or later)'s `diff` evidence is incremental, not
   cumulative.** It is a diff against the previous attempt's candidate, not
   against the task's original base — see "Rework after a REJECT" above.
+- **A rework round that merges the main line still shows the main line's
+  hunks in a file both sides changed** (SMALL-9c). The rework's diff starts at
+  the previous candidate, which the main line does not contain, so the merge
+  base with the main worktree's HEAD cannot be the start (`diff_from_rule`
+  stays `run_base`). Files only the main line changed are still left out
+  (`integrated_files`); a file the worker also edited is shown whole from the
+  previous candidate, the main line's changes to it included.
 - **A test file that exists on the main branch but not at the task's base,
   and that the task then edits, counts as added** (not in
   `protected_changes`).
@@ -2543,12 +3059,56 @@ writes its input into the review worktree:
   TASK` prints;
 - `.agent/review-input/evidence/<CODE>.txt`: the whole stored blob of every
   evidence row the packet lists (non-UTF-8 bytes shown as U+FFFD; masked when
-  it holds a secret, see "Secret masking"), and nothing else. The directory is emptied first, so a reused review worktree never shows
-  the previous review's files.
+  it holds a secret, see "Secret masking"). (RVI-1) The file of a `verify`
+  check that did not complete cleanly (refused, failed to run, timed out,
+  output left incomplete by a descendant still holding the pipe, no exit
+  code) begins with one line, `[thoth: this check recorded an execution
+  error, … Error: TEXT]`, the error `verify` recorded, masked, and the whole
+  blob follows it; `packet.md` shows the same error as an
+  `execution error: TEXT` line under that row's index entry. Both appear even
+  when the check exited 0 or printed output: an incomplete-output check exits
+  0;
+- (RVI-1) `.agent/review-input/result.json`: the whole result the run under
+  review delivered, as Thoth recorded it (the `detail.result_json` of that
+  run's newest `result_ingested` event; the run is the `target_run_id` that
+  `review start --json` and the `review_started` event name), every field and
+  nested value kept and every key and string masked. Never the implementer
+  worktree's own `.agent/result.json`, which can be edited after the
+  delivery, and never another run's delivery; absent when the run has no
+  recorded delivery. It has no evidence code.
+
+Nothing else is written. The directory is emptied first, so a reused review
+worktree never shows the previous review's files or a previous delivery.
 
 The prompt tells it to read those files and the worktree's own files, not to
 run thoth, to judge every criterion exactly once, and to cite a code from
-the packet's index for every `met` criterion.
+the packet's index for every `met` criterion. (RVI-1) It also says:
+
+- read `result.json` when a criterion asks for something the delivery has to
+  contain, such as a mapping from acceptance criteria to tests, wherever in
+  the file it is, and judge its content, never a field's name or length; a
+  criterion whose required content is missing is unmet;
+- the delivered prose proves only what the worker delivered, not that it is
+  true: behaviour is checked against the candidate and the execution
+  evidence, and a met criterion still cites a code from the index;
+- a check that completed with a recorded exit code 0 and no execution error
+  passed even when both its output streams are empty: an empty evidence file
+  or `(no stored output)` is not missing evidence, for silent `clippy` and
+  `public-tree` checks as for any other. Only a candidate `verify:` row of the
+  same run and check counts; a `verify@base:` row, a check that only started,
+  a failed, refused, timed-out or incomplete check, an unknown exit status
+  (`exit -`) or output that was not captured proves no pass, and a criterion
+  asking for particular output still needs that output. A check with a
+  recorded execution error (the `execution error:` line, the first line of
+  its evidence file) did not complete cleanly even when its exit code is 0
+  or it printed output. Silence is success only for a check that completed:
+  exit code 0 and no execution error;
+- when the spec's `checks` list `linux-container`: in this repository that
+  check runs Linux clippy and the installation-script tests
+  (`tests/install_scripts.rs`), not the whole Linux test suite, so its success
+  supports that scope only; a log without a whole-suite count is no reason to
+  reject, and the name is no evidence that the whole Linux suite passed. The
+  sentence is absent when the spec does not list the check.
 
 **Its verdict is its final message.** The launch is:
 
@@ -2616,7 +3176,9 @@ below uses agy's own workspace hooks instead.
 
 **The print timeout.** Every agy launch (fresh, resume, reviewer) carries
 `--print-timeout <N>s`, where N is the run's `--timeout` in seconds plus 300
-(a 1800 s run gets `2100s`). The extra 300 s lets thoth's own limit fire first:
+(a 1800 s run gets `2100s`; without `--timeout` the run's limit follows its
+effort, so a `gemini-3.8-flash-low` run gets 3600 s and `3900s`, a `high` one
+10800 s and `11100s`). The extra 300 s lets thoth's own limit fire first:
 thoth's timeout keeps the full record and kills the whole process tree, while
 agy's own expiry quietly hands back partial output. agy below 1.2.6 defaults
 to a 5-minute limit; from 1.2.6 on the default is no limit. If agy's limit
@@ -2916,10 +3478,19 @@ reviewer (`spec review start`) gets the same list, never the research tools.
 Its input is the codex reviewer's: before launching, the runner writes
 `.agent/review-input/packet.md` (the `review packet` Markdown) and
 `.agent/review-input/evidence/<CODE>.txt` (the whole stored blob of every row,
-masked when it holds a secret: see "Secret masking"),
-emptying the directory first. The prompt tells it to read those files and the
-worktree's own files, that it has no shell and cannot write files, not to run
-thoth, and gives the same five rules as the codex prompt.
+masked when it holds a secret: see "Secret masking") and (RVI-1)
+`.agent/review-input/result.json` (the whole recorded delivery of the run
+under review, `target_run_id`, masked; see "Codex reviewers"), emptying the
+directory first. The prompt tells it to read those files with its file tools
+and the worktree's own files, that it has no shell and cannot write files, not
+to run thoth, and gives the same rules as the codex prompt, including RVI-1's
+section on the delivered result (content is what the worker delivered, not
+proof of behaviour), on a check that completed with exit code 0 and no output
+(it passed; only a candidate `verify:` row of the same run and check counts;
+a check with a recorded execution error, shown in `packet.md` and at the top
+of its evidence file as for the codex reviewer, did not complete even at exit
+code 0 or with output) and, when the spec lists `linux-container`, on that check covering Linux
+clippy and `tests/install_scripts.rs` only. It gets no new tool.
 
 **Its verdict is the result line's `structured_output`.** The launch is:
 
@@ -2958,6 +3529,29 @@ and effort is the commander's; the decision table is still in `thoth models`.
 It does not dispatch a run. CROSS-1 brings back a `models` key on each
 candidate, but it is not the list RJ-1 removed: it is the models this account
 can run and the score facts that match them (below), and it picks nothing.
+
+Quota reserve (SMALL-9a). `thoth config set quota-reserve-percent N` (a
+human, in a terminal; 0 to 99, default 0 = off) holds every account back once
+one of its deciding quota windows (an agy account's selected group, every
+window otherwise; codex's extra buckets never count) has used at least 100
+minus N percent and has not reset, however old the reading is. `recommend`
+then shows the account ineligible with `reserve_blocked` true and the reason
+`held back by quota-reserve-percent N: WINDOW is P% used (observed at T), at
+least 100-N% and not reset`, and gives `quota_reserve_percent` at the top
+level; `status TASK`'s `profiles_with_quota` leaves the account out. Every
+launch on it (`dispatch`, `review start` with or without `--edit`, `review
+confirm`, `spec review start` with or without `--edit`, `spec review confirm`,
+`resume`) exits 1 before anything is written and before the account's CLI is
+started, naming the window, its percent, when it was read, when it resets
+(`unknown` when not known) and the ways out: another account (`thoth recommend
+--role ROLE --task TASK`), waiting for the reset, `thoth profile usage
+--refresh` when the reading may be old, or asking the human to lower the
+number. A launch never refreshes quota. An account with no current reading
+(none yet, or every window already reset), or whose quota cannot be read, is
+not held back: the launch goes ahead with the warning `quota-reserve-percent
+N: profile ID was not held back because …; run thoth profile usage --refresh`.
+Thoth still chooses no account: the human sets the number and the commander
+picks another profile.
 
 Breaking change (RJ-2, reshaped by CROSS-1): `recommend` now also sends what
 the commander needs to choose, filtered by fact only and never judged by
@@ -3584,7 +4178,14 @@ The exits that mask, so far:
 - `thoth review packet` (stdout, `--out` and `--json`; a command's last 15
   lines are taken after its whole output was masked);
 - the `.agent/review-input/` files of a codex or antigravity reviewer
-  (`packet.md` and `evidence/<CODE>.txt`);
+  (`packet.md`, `evidence/<CODE>.txt` and, RVI-1, `result.json`: the whole
+  recorded delivery, every object key and string value at any depth masked
+  before the file is written, so it stays valid JSON and two keys that mask
+  alike get `#2`; what it masked counts in the run's `review_input`
+  `secret_redacted` event, which names no evidence code for it, so a delivery
+  that alone held a secret gives `evidence: []`; a check's execution error,
+  in `packet.md` and at the top of its evidence file, is masked whole and
+  counts under that row's code);
 - `.agent/evidence-index.json` (each `label`);
 - the prompt the runner hands every worker and reviewer (the run directory's
   `prompt.txt` is the same text); each value the prompt embeds is masked on
@@ -3685,7 +4286,7 @@ Known limits:
 
 ## Settings
 
-`thoth config list [--json]`, `thoth config get KEY [--json]`, `thoth config set KEY VALUE [--json]` and `thoth config unset KEY [--json]` manage 16 settings: the three switches `live-quota`, `scores-auto-refresh` and `require-reason` (default off; Breaking change (RJ-1): `same-provider-rotation` is gone: a `same_provider_rotation` left in config.json has no effect and is not reported as unknown, and `config get`, `set` or `unset` of it exits 1 saying it was removed), the screen `language`, the three CLI paths `claude-bin`, `codex-bin` and `agy-bin`, `live-quota-timeout-ms`, the three score addresses `scores-url`, `aa-url` and (RJ-2) `arena-url` (`THOTH_ARENA_URL`, default `https://huggingface.co`: the Hugging Face Hub the Agent Arena dataset is fetched from), the two shared-records settings `machine-name` (default: this computer's host name, sanitised to `A-Z a-z 0-9 . _ -`) and `records-dir` (an absolute path; default `unset`), one that can only be read, `home` (`THOTH_HOME`), and the two API keys, stored with `thoth config set-secret KEY` (the value is typed at a hidden prompt or piped on stdin, never given on the command line) into `$THOTH_HOME/secrets.json`, removed with `thoth config unset-secret KEY`, and shown everywhere only as set or unset. The environment variables of the shared-records settings are `THOTH_MACHINE_NAME` and `THOTH_RECORDS_DIR`. Stored values live in `$THOTH_HOME/config.json`; an environment variable beats config.json, which beats the default, and `config list` shows each value's source and, at the end, what is kept elsewhere (profiles, checks). Setting a switch on prints its behavior and the relevant terms reminder. `config list` and `config get` are read-only. Agents must not change these settings themselves; ask the human operator to run `thoth config set` or `thoth config unset` (`thoth config set-secret` or `thoth config unset-secret` for the API keys).
+`thoth config list [--json]`, `thoth config get KEY [--json]`, `thoth config set KEY VALUE [--json]` and `thoth config unset KEY [--json]` manage 18 settings (additive, AUTO-1a: `verify-slots`, last in the list): the three switches `live-quota`, `scores-auto-refresh` and `require-reason` (default off; Breaking change (RJ-1): `same-provider-rotation` is gone: a `same_provider_rotation` left in config.json has no effect and is not reported as unknown, and `config get`, `set` or `unset` of it exits 1 saying it was removed), the screen `language`, the three CLI paths `claude-bin`, `codex-bin` and `agy-bin`, `live-quota-timeout-ms`, (SMALL-9a) `quota-reserve-percent` (a whole number 0 to 99, default `0`, off; no environment variable), the three score addresses `scores-url`, `aa-url` and (RJ-2) `arena-url` (`THOTH_ARENA_URL`, default `https://huggingface.co`: the Hugging Face Hub the Agent Arena dataset is fetched from), the two shared-records settings `machine-name` (default: this computer's host name, sanitised to `A-Z a-z 0-9 . _ -`) and `records-dir` (an absolute path; default `unset`), one that can only be read, `home` (`THOTH_HOME`), and the two API keys, stored with `thoth config set-secret KEY` (the value is typed at a hidden prompt or piped on stdin, never given on the command line) into `$THOTH_HOME/secrets.json`, removed with `thoth config unset-secret KEY`, and shown everywhere only as set or unset. The environment variables of the shared-records settings are `THOTH_MACHINE_NAME` and `THOTH_RECORDS_DIR`. Stored values live in `$THOTH_HOME/config.json`; an environment variable beats config.json, which beats the default, and `config list` shows each value's source and, at the end, what is kept elsewhere (profiles, checks). Setting a switch on prints its behavior and the relevant terms reminder. `config list` and `config get` are read-only. Agents must not change these settings themselves; ask the human operator to run `thoth config set` or `thoth config unset` (`thoth config set-secret` or `thoth config unset-secret` for the API keys).
 `live-quota` permits Thoth to query official Antigravity agy and the official
 codex CLI's app-server at two times: `profile usage --refresh` calls, which
 also ask Claude Code's own `/usage` command, and the automatic refresh that
@@ -3703,6 +4304,23 @@ same schedule; a failed refresh keeps the old cache and prints a warning.
 start` need `--reason` (Breaking change (RJ-1): not only a launch that differs
 from a recommendation; see "Automatic dispatch"). Agents must not turn it off
 themselves.
+`quota-reserve-percent` (SMALL-9a) keeps the last N percent of every quota
+window for you: with N above 0, every launch (`dispatch`, `review start`,
+`review confirm`, `spec review start`, `spec review confirm`, `resume`) is
+refused on an account whose deciding window has used at least 100 minus N
+percent and has not reset, and `recommend` marks that account (see "Quota
+reserve" under "Quota, recommendations and the status page"). Only whole
+numbers 0 to 99 are accepted; `0` turns it off; a config.json edited to
+anything else reads as `0`. For the 5% asked for on 2026-10-16, run
+`thoth config set quota-reserve-percent 5` in your own terminal.
+`verify-slots` (AUTO-1a) is how many pipeline verify runs may run at once on
+this computer, across repositories: a whole number from 1 to 8, default 1
+(`thoth config unset verify-slots` restores it). A second pipeline waits at
+step `verify_wait` until a slot frees (see "Running a task to the end");
+the slots are the files `$THOTH_HOME/verify-slots/slot-K.json`. Lowering it
+applies to the next acquisition and deletes no live slot. A `thoth verify`
+you start by hand takes no slot, so on the main machine keep 1 and do not
+run a manual full suite or a worker's heavy tests while a pipeline verifies.
 
 Secrets. `thoth config set-secret aistupidlevel-api-key` and `thoth config
 set-secret artificialanalysis-api-key` keep the two score API keys in

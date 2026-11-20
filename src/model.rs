@@ -206,6 +206,13 @@ pub mod event_type {
     /// Written by `commands::worktrees::sweep` when it kept a finished task's
     /// worktree directory, with the reason; once per path and reason (WT-1).
     pub const WORKTREE_KEPT: &str = "worktree_kept";
+    /// Written by `commands::worktrees::sweep` (`worktrees prune`, `task create`) when it
+    /// deleted a finished task's local branch whose work is already in the
+    /// task's base branch.
+    pub const BRANCH_DELETED: &str = "branch_deleted";
+    /// Written by `commands::worktrees::sweep` when it kept a finished task's
+    /// local branch, with the reason; once per branch and reason.
+    pub const BRANCH_KEPT: &str = "branch_kept";
     pub const CANCEL_REQUESTED: &str = "cancel_requested";
     // Phase 2 (v6 §10.5's `type` comment lists evidence_added / evidence_opened
     // / verdict / decision_added by name). None of the remaining seven has a
@@ -272,6 +279,14 @@ pub mod event_type {
     /// once (`evidence show`, `review packet`, the runner's review input):
     /// which kinds of secret were masked, how many, in which evidence (RD-1).
     pub const SECRET_REDACTED: &str = "secret_redacted";
+    /// AUTO-1a: `pipeline start` began a background pipeline.
+    pub const PIPELINE_STARTED: &str = "pipeline_started";
+    /// AUTO-1a: one child command a pipeline ran (dispatch, verify, review start).
+    pub const PIPELINE_STEP: &str = "pipeline_step";
+    /// AUTO-1a: `pipeline stop` asked a running pipeline to stop.
+    pub const PIPELINE_STOP_REQUESTED: &str = "pipeline_stop_requested";
+    /// AUTO-1a: a pipeline settled; exactly one per pipeline.
+    pub const PIPELINE_STOPPED: &str = "pipeline_stopped";
 }
 
 #[cfg(test)]

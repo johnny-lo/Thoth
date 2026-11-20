@@ -513,7 +513,7 @@ fn recommend_lists_account_facts_only() {
             // and `tables` is null without --tables.
             assert_eq!(
                 keys,
-                ["candidates", "live_quota_refresh", "model", "role", "score_refresh", "tables", "task_history", "task_id", "unmatched"],
+                ["candidates", "live_quota_refresh", "model", "quota_reserve_percent", "role", "score_refresh", "tables", "task_history", "task_id", "unmatched"],
                 "{v}"
             );
             assert!(v["tables"].is_null(), "{v}");
@@ -702,7 +702,10 @@ fn j_the_switch_is_listed_read_and_set_like_the_others() {
     let f = common::fixture();
     let list = json_out(f.cmd().args(["config", "list", "--json"]));
     let settings = list["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 16, "{list}");
+    // AUTO-1a: no hard-coded total (verify-slots was added last); every key
+    // is listed once.
+    let keys: std::collections::BTreeSet<&str> = settings.iter().map(|s| s["key"].as_str().unwrap()).collect();
+    assert_eq!(keys.len(), settings.len(), "{list}");
     assert_eq!(settings[2]["key"], "require-reason", "{list}");
     assert_eq!(settings[2]["value"], "off", "{list}");
     assert_eq!(settings[2]["default"], "off", "{list}");

@@ -50,6 +50,17 @@ pub const RULE_SUITE: &str = "A spec that tells the worker to run the whole test
 /// SR-3: the edit-mode paragraph's first sentence, pinned by tests.
 pub const EDIT_INTRO: &str = "Besides judging, you may change the spec directly: list every change in \"edits\" and thoth applies them in order; you write no file yourself.";
 
+/// SR-4: how thoth finds the entry a replace or delete names; the CLI tests
+/// read it in the prompt the fake reviewer was handed.
+pub const ANCHOR_RULE: &str = "thoth trims the anchor and the entries at both ends and compares them literally: case matters, there is no Unicode normalization and runs of spaces are not folded, so copy the text exactly as it is in the spec. A blank or whitespace-only anchor names nothing. There is no minimum length, and length is counted in Unicode scalar values, not bytes: a Chinese character, an emoji and a combining mark each count one. A prefix of the entry at \"at\" names that entry, however short. When the anchor does not start that entry, thoth looks for it in every entry of the same field (the goal is one entry) and takes the entry it occurs in, but only when it occurs at exactly one place; overlapping occurrences count separately (\"zz\" occurs twice in \"zzz\"), and text that occurs twice or more, or nowhere, names nothing. The whole entry is replaced or deleted, never just the matched text.";
+
+/// SR-4: what happens to an edit that breaks a rule; the CLI tests read it
+/// in the prompt the fake reviewer was handed.
+pub const EDIT_REFUSAL: &str = "An edit that breaks a rule is refused on its own and listed with its index and the reason; it changes nothing, and the other edits still apply in order. A later \"at\" counts only the edits that were applied, so do not count on an edit that may be refused. When every edit is refused your findings are still kept.";
+
+/// SR-4: the author's edit list keeps the reviewer's indices.
+pub const CONFIRM_INDICES: &str = "edits.json lists only the edits thoth applied, each with the index it had in the reviewer's list; an edit thoth refused is not there and is not yours to judge, so the indices may have gaps (for example 0, 2, 3).";
+
 fn opening(how: How) -> String {
     let mut s = String::new();
     match how {
@@ -117,7 +128,8 @@ pub fn build(task_id: &str, spec: &TaskSpec, criterion_ids: &[String], how: How,
     if mode == ReviewMode::Edit {
         s.push_str("\n## You may edit the spec\n");
         s.push_str(EDIT_INTRO);
-        s.push_str(" A change you are sure of (a wrong name, a missing step, a sentence that contradicts another, a scope line that was forgotten) goes in \"edits\"; a question only the author can settle stays a finding. Each edit has these keys, all present: \"field\" (one of goal, acceptance_criteria, constraints, non_goals, excluded_alternatives; nothing else can be edited), \"op\" (replace, insert or delete; goal and acceptance_criteria allow only replace, and a replaced acceptance criterion keeps the id before its colon), \"at\" (the entry's position from 0 in that list, counted after the earlier edits were applied; for insert it may equal the list's length to append; 0 for goal), \"anchor\" (for replace and delete: the first 10 characters of the entry as it is now, trimmed, or the whole entry when it is shorter; \"\" for insert), \"text\" (the whole new entry for replace and insert; \"\" for delete), \"criterion\" (the acceptance criterion this edit serves, one of the ids below) and \"reason\" (why, one sentence). With edits the verdict is REVISE, even when every criterion is ok; APPROVE proposes no edits. The author checks each edit before it lands, so keep each one small and explain it.\n");
+        s.push_str(&format!(" A change you are sure of (a wrong name, a missing step, a sentence that contradicts another, a scope line that was forgotten) goes in \"edits\"; a question only the author can settle stays a finding. Each edit has these keys, all present: \"field\" (one of goal, acceptance_criteria, constraints, non_goals, excluded_alternatives; nothing else can be edited), \"op\" (replace, insert or delete; goal and acceptance_criteria allow only replace, and a replaced acceptance criterion keeps the id before its colon), \"at\" (the entry's position from 0 in that list, counted after the earlier applied edits; for insert it may equal the list's length to append; 0 for goal), \"anchor\" (for replace and delete: the start of the entry at \"at\" as it is now, of any length, a few words are enough; \"\" for insert), \"text\" (the whole new entry for replace and insert; \"\" for delete), \"criterion\" (the acceptance criterion this edit serves, one of the ids below) and \"reason\" (why, one sentence). {ANCHOR_RULE} With edits the verdict is REVISE, even when every criterion is ok; APPROVE proposes no edits. The author checks each edit before it lands, so keep each one small and explain it.\n"));
+        s.push_str(&format!("{EDIT_REFUSAL}\n"));
     }
 
     s.push_str("\n## Output\n");
@@ -155,7 +167,7 @@ fn build_confirm(task_id: &str, how: How) -> String {
 
     s.push_str("\n## Your input\n");
     s.push_str(&format!(
-        "{INPUT_DIR}/{INPUT_FILE} is the spec as it is now, {INPUT_DIR}/{PROPOSED_FILE} is the spec with every edit applied, and {INPUT_DIR}/{EDITS_FILE} lists the edits: index, field, op, at, criterion, anchor, before, after, reason. {}; read all three whole.\n",
+        "{INPUT_DIR}/{INPUT_FILE} is the spec as it is now, {INPUT_DIR}/{PROPOSED_FILE} is the spec with every edit applied, and {INPUT_DIR}/{EDITS_FILE} lists the edits: index, field, op, at, criterion, anchor, before, after, reason. {}; read all three whole. {CONFIRM_INDICES}\n",
         read_verb(how)
     ));
 
@@ -170,7 +182,7 @@ fn build_confirm(task_id: &str, how: How) -> String {
     s.push_str(&output_paragraph(how));
     s.push_str("{\"verdict\":\"REVISE\",\"edits\":[{\"index\":0,\"verdict\":\"ok\",\"note\":\"\"},{\"index\":1,\"verdict\":\"revise\",\"note\":\"...\"}]}\n");
     s.push_str(&format!(
-        "Every index listed in {INPUT_DIR}/{EDITS_FILE} appears in \"edits\" exactly once, and no other.\n"
+        "Every index listed in {INPUT_DIR}/{EDITS_FILE} appears in \"edits\" exactly once, and no other: answer the indices as they are written there, gaps included.\n"
     ));
     s.push_str(&format!("This author check is for task {task_id}.\n"));
     s

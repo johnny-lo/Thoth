@@ -535,10 +535,14 @@ pub fn check_bounds(diff: &Diff) -> std::result::Result<(), Refusal> {
     Ok(())
 }
 
-/// (a) `size`: every bound finding is `S` or `M`, every unmet criterion has
-/// an edit, and (GATE-1) so does every extra finding whose severity is not
-/// `minor` (trimmed, any case; an empty or unknown one blocks).
+/// (a) `size`: every bound finding is `S` or `M` (advisory or not), every
+/// blocking unmet criterion has an edit, and (GATE-1) so does every extra
+/// finding whose severity is not `minor` (trimmed, any case; an empty or
+/// unknown one blocks). REV-2: an advisory finding
+/// (`review_json::category_blocks` is false; no category blocks) needs no
+/// edit, like a minor extra finding.
 pub fn check_size(bound: &[Bound], findings: &Findings) -> std::result::Result<(), Refusal> {
+    use crate::review_json::category_blocks;
     for (i, b) in bound.iter().enumerate() {
         match b.fix_size.as_deref() {
             Some("S") | Some("M") => {}
@@ -555,26 +559,44 @@ pub fn check_size(bound: &[Bound], findings: &Findings) -> std::result::Result<(
         }
     }
     for c in findings.criteria.iter().filter(|c| c.verdict.trim() == "unmet") {
+        if !category_blocks(c.category.as_deref()) {
+            continue;
+        }
         if !bound.iter().any(|b| b.binding == Binding::Criterion(c.id.trim().to_string())) {
             return Err(Refusal::new(
                 stage::SIZE,
-                format!("unmet criterion {} has no edit; a fix covers every unmet criterion or the task is redone", c.id),
+                format!(
+                    "unmet criterion {} (category {}) has no edit; {SIZE_COVERAGE}",
+                    c.id,
+                    label(c.category.as_deref())
+                ),
             ));
         }
     }
     for (i, e) in findings.extra_findings.iter().enumerate() {
-        if e.severity.trim().eq_ignore_ascii_case("minor") || bound.iter().any(|b| b.binding == Binding::Extra(i)) {
+        if e.severity.trim().eq_ignore_ascii_case("minor")
+            || !category_blocks(e.category.as_deref())
+            || bound.iter().any(|b| b.binding == Binding::Extra(i))
+        {
             continue;
         }
         return Err(Refusal::new(
             stage::SIZE,
             format!(
-                "extra_findings[{i}] (severity {}) has no edit; a fix covers every unmet criterion and every extra finding that is not minor, or the task is redone",
-                e.severity.trim()
+                "extra_findings[{i}] (severity {}, category {}) has no edit; {SIZE_COVERAGE}",
+                e.severity.trim(),
+                label(e.category.as_deref())
             ),
         ));
     }
     Ok(())
+}
+
+/// REV-2 (AC3): the rule a `size` refusal for a missing edit spells out.
+const SIZE_COVERAGE: &str = "a fix covers every blocking unmet criterion and every extra finding that is neither minor nor advisory (an advisory category or a minor severity needs no edit; no category counts as blocking), or the task is redone";
+
+fn label(category: Option<&str>) -> &str {
+    category.map(str::trim).filter(|c| !c.is_empty()).unwrap_or("not given")
 }
 
 /// Whether `text` parses as a Thoth spec (what `spec lint` reports as
@@ -695,7 +717,7 @@ pub fn edit_prompt_section(claude: bool) -> String {
          - reason: not blank.\n\
          Edits apply in order and each sees the earlier ones; CRLF and LF compare alike.\n\
          Limits, checked mechanically (one broken limit refuses the whole fix, your REJECT stands, and the task is redone from the candidate):\n\
-         - every edit is bound to a finding whose fix_size is S or M, and every unmet criterion and every extra finding whose severity is not minor has at least one edit;\n\
+         - every edit is bound to a finding whose fix_size is S or M; every unmet criterion whose category is blocking or not given, and every extra finding whose severity is not minor and whose category is blocking or not given, has at least one edit (an advisory finding or a minor extra finding needs none);\n\
          - at most {MAX_CHANGED_LINES} changed lines (added plus deleted against the candidate, a replaced line counts 2) in at most {MAX_FILES} files, text files only;\n\
          - no file that is a Thoth spec, no check input or check-word file;\n\
          - an existing test file may only gain lines; no deleted line holds assert, #[test] or #[cfg(test)], no added line holds #[ignore].\n\
@@ -937,8 +959,12 @@ mod tests {
         let f = findings();
         let bound = validate(tmp.path(), &[item("a", "", "x", "AC1", "r")], &f).unwrap();
         assert!(check_size(&bound, &f).is_ok());
-        let extra_only = validate(tmp.path(), &[item("a", "", "x", "extra_findings[0]", "r")], &f).unwrap();
-        assert_eq!(check_size(&extra_only, &f).unwrap_err().stage, stage::SIZE);
+        // REV-2: AC1 is labelled docs (advisory) in `findings`, so leaving it
+        // unbound is refused only once it carries a blocking category.
+        let mut blocking = f.clone();
+        blocking.criteria[0].category = Some("error_path".into());
+        let extra_only = validate(tmp.path(), &[item("a", "", "x", "extra_findings[0]", "r")], &blocking).unwrap();
+        assert_eq!(check_size(&extra_only, &blocking).unwrap_err().stage, stage::SIZE);
         let mut large = f.clone();
         large.criteria[0].fix_size = Some("L".into());
         let bound = validate(tmp.path(), &[item("a", "", "x", "AC1", "r")], &large).unwrap();
@@ -947,6 +973,51 @@ mod tests {
         unsized_.criteria[0].fix_size = None;
         let bound = validate(tmp.path(), &[item("a", "", "x", "AC1", "r")], &unsized_).unwrap();
         assert_eq!(check_size(&bound, &unsized_).unwrap_err().stage, stage::SIZE);
+    }
+
+    /// REV-2 (AC3): an advisory unmet criterion or extra finding needs no
+    /// edit; a blocking or unlabelled one still does, and the refusal names
+    /// it and says advisory and minor findings need none. A bound advisory
+    /// finding still has to be S or M.
+    #[test]
+    fn size_lets_advisory_findings_go_without_an_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut f = findings();
+        f.criteria[0].category = Some("spec_mismatch".into());
+        f.criteria.push(CriterionFinding {
+            id: "AC3".into(),
+            verdict: "unmet".into(),
+            evidence: vec![],
+            note: Some("stale help".into()),
+            fix_size: Some("S".into()),
+            category: Some("docs".into()),
+        });
+        f.extra_findings.push(ExtraFinding {
+            severity: "major".into(),
+            note: "untested branch".into(),
+            evidence: vec![],
+            fix_size: Some("M".into()),
+            category: Some("test_incomplete".into()),
+        });
+        let bound = validate(tmp.path(), &[item("a", "", "x", "AC1", "r")], &f).unwrap();
+        assert!(check_size(&bound, &f).is_ok());
+
+        let mut blocking_extra = f.clone();
+        blocking_extra.extra_findings[1].category = None;
+        let refusal = check_size(&bound, &blocking_extra).unwrap_err();
+        assert_eq!(refusal.stage, stage::SIZE);
+        assert!(refusal.reason.starts_with("extra_findings[1] (severity major, category not given) has no edit"), "{}", refusal.reason);
+        assert!(refusal.reason.contains("an advisory category or a minor severity needs no edit"), "{}", refusal.reason);
+
+        let mut blocking_ac = f.clone();
+        blocking_ac.criteria[2].category = Some("error_path".into());
+        let refusal = check_size(&bound, &blocking_ac).unwrap_err();
+        assert!(refusal.reason.starts_with("unmet criterion AC3 (category error_path) has no edit"), "{}", refusal.reason);
+
+        let mut large = f.clone();
+        large.criteria[2].fix_size = Some("L".into());
+        let bound = validate(tmp.path(), &[item("a", "", "x", "AC1", "r"), item("b", "", "y", "AC3", "r")], &large).unwrap();
+        assert_eq!(check_size(&bound, &large).unwrap_err().stage, stage::SIZE);
     }
 
     #[test]

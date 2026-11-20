@@ -155,6 +155,12 @@ pub struct ReworkAddendum {
     pub unmet: Vec<String>,
     #[serde(default)]
     pub extra_findings: Vec<String>,
+    /// REV-2: the advisory findings (an unmet criterion or extra finding
+    /// whose category `review_json::category_blocks` says does not block),
+    /// formatted like `unmet` and `extra_findings`. Not required fixes; a run
+    /// spec written before REV-2 has no such key and reads back empty.
+    #[serde(default)]
+    pub advisory: Vec<String>,
 }
 
 /// Reads the `rework` key back out of a run's spec, if there is one. Never

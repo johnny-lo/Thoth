@@ -759,7 +759,11 @@ fn mcp() {
     assert_eq!(init["result"]["serverInfo"]["name"], "thoth");
     let list = s.send(2, "tools/list", json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 36);
+    // AUTO-1a: no hard-coded total (the pipeline tools were added); every
+    // tool is listed once and thoth_guide stays last.
+    let unique: std::collections::BTreeSet<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(unique.len(), tools.len());
+    assert_eq!(tools.last().unwrap()["name"], "thoth_guide");
     let doctor = tools.iter().find(|t| t["name"] == "thoth_doctor").unwrap();
     assert_eq!(doctor["annotations"]["readOnlyHint"], true);
 

@@ -594,9 +594,12 @@ fn inline_changes_follow_the_tasks_base_across_a_reroute_and_a_merge_of_main() {
     assert_eq!(detail["protected_base"], base.as_str());
     assert_eq!(detail["integration_tip"], tip.as_str());
     assert_eq!(detail["protected_changes"], entries(&[("src/x.rs", "modified", "inline_test")]), "{detail:#}");
-    // src/tipped.rs differs from the base, so leaving it out was the tip's doing
+    // src/tipped.rs differs from the base, so leaving it out was the tip's
+    // doing; SMALL-9c: the diff itself leaves it out too and says so
     let changed: Vec<String> = detail["files_changed"].as_array().unwrap().iter().map(s).collect();
-    assert!(changed.iter().any(|c| c == "src/tipped.rs"), "{changed:?}");
+    assert!(!changed.iter().any(|c| c == "src/tipped.rs"), "{changed:?}");
+    assert_eq!(detail["integrated_files"], json!(["src/tipped.rs"]), "{detail:#}");
+    assert_eq!(detail["diff_from_rule"], "merge_base", "{detail:#}");
 }
 
 // --- AC4: the worker prompt -------------------------------------------------------

@@ -36,6 +36,11 @@
 //! synthetic 529 overloaded error; `oauth_refresh_failed` fails with the
 //! recorded OAuth refresh text.
 //!
+//! AUTO-1b switch, unset by default: `FAKE_LOGOUT_IN_CONFIG=1` makes
+//! `auth_expired` also write `fake-logout.marker` in `CLAUDE_CONFIG_DIR`, and
+//! `auth status` print `{"loggedIn":false}` once that file is in its own
+//! `CLAUDE_CONFIG_DIR`: one account logged out, the others untouched.
+//!
 //! FC-2 switches, unset by default: `FAKE_ATTEMPTS_FILE=<path>` makes every
 //! stream-json launch (not `auth status`, `--version`, `plugin *` or the
 //! interactive login) append `resume <id>` (with `--resume`) or `fresh <id>`
@@ -45,6 +50,13 @@
 //! `FAKE_FIRST_TIMES` (default 1, unparsable is 1); later ones use the usual
 //! scenario. Without `FAKE_ATTEMPTS_FILE`, k is always 1, so every launch
 //! runs `FAKE_FIRST_SCENARIO`.
+//!
+//! AUTO-1a switches, unset by default: `FAKE_SCENARIO_SEQUENCE=a,b,c` is the
+//! scenario of launch k (the `FAKE_ATTEMPTS_FILE` count above; always 1
+//! without it): entry k, or the last entry once the list is used up. When set
+//! it wins over `FAKE_FIRST_SCENARIO`, `FAKE_CLAUDE_SCENARIO` and
+//! `FAKE_SCENARIO`. `FAKE_WORKER_GATE=<path>` makes `ok` and `hooks` wait (up
+//! to 120 s) for that file before they write their result.json.
 //!
 //! SR-2 spec reviewer scenarios: `spec_review_approve`, `spec_review_revise`
 //! and `spec_review_bad` read `.agent/spec-review-input/spec.json` (missing or
@@ -63,6 +75,11 @@
 //! `.agent/spec-review-input/edits.json` (and need `proposed.json` next to
 //! it) and answer every index `ok`, or the first `revise` with a note and the
 //! rest `ok`. `FAKE_REVIEW_GATE` holds all five before the write.
+//!
+//! SR-4 scenario `spec_review_doc_file`: writes the file `FAKE_SPEC_REVIEW_DOC`
+//! names to `.agent/spec-review.json` as it is (a reviewer's or an author's
+//! document), after `FAKE_REVIEW_GATE`; with `FAKE_PROMPT_OUT` set it first
+//! writes the prompt it was handed there.
 //!
 //! MODELS-1 scenario `credits_required`: after `init`, one `is_error` result
 //! line in the recorded shape of a Pro account asked for Fable
@@ -111,6 +128,10 @@
 //! `resume`), `FAKE_RESULT_SUMMARY` replaces the summary and
 //! `FAKE_RESULT_BRIEF` adds a `brief`; `FAKE_REVIEW_NOTE` replaces the note of
 //! `review_reject`'s unmet criterion.
+//!
+//! RVI-1 switch, unset by default: in the `hooks` scenario,
+//! `FAKE_RESULT_PATCH=<file>` (a JSON object) sets each of its top-level keys
+//! on the delivered result.json.
 
 // Source-check scenarios: `source_check` checks the prompt's file:// pages;
 // `source_check_bad` writes {not json. FAKE_SOURCE_CHECK_VERDICT overrides
@@ -177,6 +198,11 @@ fn marker_exists(var: &str) -> bool {
 }
 
 /// FC-1: writes the file the env var names, if it is set.
+/// AUTO-1b: the file `auth_expired` writes in `CLAUDE_CONFIG_DIR` with
+/// `FAKE_LOGOUT_IN_CONFIG=1`, and that makes this account's `auth status`
+/// say logged out (other accounts stay logged in).
+const CONFIG_LOGOUT_MARKER: &str = "fake-logout.marker";
+
 fn write_marker(var: &str) {
     if let Some(p) = std::env::var_os(var) {
         let _ = std::fs::write(p, "1\n");
@@ -208,6 +234,25 @@ fn first_scenario(launch: usize) -> Option<String> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1);
     (launch <= times).then_some(scenario)
+}
+
+/// AUTO-1a: entry `launch` (from 1) of `FAKE_SCENARIO_SEQUENCE`, the last one
+/// past its end; `None` when it is unset or holds no entry.
+fn sequence_scenario(launch: usize) -> Option<String> {
+    let list = std::env::var("FAKE_SCENARIO_SEQUENCE").ok()?;
+    let entries: Vec<&str> = list.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+    let last = entries.last()?;
+    Some(entries.get(launch.saturating_sub(1)).unwrap_or(last).to_string())
+}
+
+/// AUTO-1a: waits for `FAKE_WORKER_GATE`'s file, at most 120 s; unset: no wait.
+fn wait_worker_gate() {
+    let Some(gate) = std::env::var_os("FAKE_WORKER_GATE") else { return };
+    let gate = std::path::PathBuf::from(gate);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !gate.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// The recorded stream-json answer of Claude Code 2.1.296 to `/usage`.
@@ -675,7 +720,7 @@ fn write_result_with_evidence(task_id: &str, summary: &str, codes: &[String]) {
     if let Ok(text) = std::env::var("FAKE_PROTECTED_CLAIM") {
         claims.push(serde_json::json!({"kind": "protected_change", "text": text, "evidence": []}));
     }
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "task_id": task_id,
         "status": "completed",
         "summary": summary,
@@ -685,6 +730,17 @@ fn write_result_with_evidence(task_id: &str, summary: &str, codes: &[String]) {
             {"cmd": "exit 3", "cwd": "."}
         ]
     });
+    // RVI-1 test switch: `FAKE_RESULT_PATCH=<file>` holds a JSON object whose
+    // top-level keys are set on the delivery as they are (added, or replacing
+    // the scenario's own), for deliveries with optional and nested fields.
+    if let Some(serde_json::Value::Object(patch)) = std::env::var_os("FAKE_RESULT_PATCH")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+    {
+        for (k, v) in patch {
+            body[k] = v;
+        }
+    }
     let _ = std::fs::write(
         dir.join("result.json"),
         serde_json::to_string_pretty(&body).unwrap(),
@@ -763,10 +819,9 @@ fn spec_list(spec: &serde_json::Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// SR-3: the anchor rule a real reviewer follows: the first 10 characters of
-/// the trimmed entry, or the whole entry when it is shorter. Thoth counts the
-/// anchor after trimming it, so when the tenth character is a space the
-/// anchor goes on to the next non-space one.
+/// SR-3: an anchor as a careful reviewer writes it: the first 10 characters
+/// of the trimmed entry, or the whole entry when it is shorter (SR-4 accepts
+/// any prefix of the entry at `at`, so this is one valid choice of many).
 fn anchor_of(entry: &str) -> String {
     let mut out = String::new();
     for c in entry.trim().chars() {
@@ -933,6 +988,13 @@ fn main() {
             emit(&serde_json::json!({"loggedIn": false}));
             std::process::exit(0);
         }
+        // AUTO-1b switch: a logout of this account only (its config dir).
+        if std::env::var("FAKE_LOGOUT_IN_CONFIG").as_deref() == Ok("1")
+            && std::path::Path::new(&cfg).join(CONFIG_LOGOUT_MARKER).is_file()
+        {
+            emit(&serde_json::json!({"loggedIn": false}));
+            std::process::exit(0);
+        }
         // FC-1 test switches: the run's own scenario writes these files.
         if marker_exists("FAKE_LOGOUT_MARKER") {
             emit(&serde_json::json!({"loggedIn": false}));
@@ -1057,7 +1119,7 @@ fn main() {
     let launch = record_attempt(resume.is_some(), &session_id);
     // `FAKE_CLAUDE_SCENARIO` wins over `FAKE_SCENARIO`, so one test can run
     // claude and codex in different scenarios.
-    let scenario = first_scenario(launch).unwrap_or_else(|| {
+    let scenario = sequence_scenario(launch).or_else(|| first_scenario(launch)).unwrap_or_else(|| {
         std::env::var("FAKE_CLAUDE_SCENARIO")
             .or_else(|_| std::env::var("FAKE_SCENARIO"))
             .unwrap_or_else(|_| "ok".to_string())
@@ -1072,6 +1134,7 @@ fn main() {
         "ok" => {
             emit(&rate_limit_event(&session_id, 0.07));
             emit(&assistant_event(&session_id, "I will do the thing."));
+            wait_worker_gate();
             write_result_json(&task_id, "fake worker completed the task", true);
             emit(&result_event(&session_id, false, "DONE", serde_json::Value::Null));
             std::process::exit(0);
@@ -1190,6 +1253,12 @@ fn main() {
         // logged out. Synthetic text, not a recording.
         "auth_expired" => {
             write_marker("FAKE_LOGOUT_MARKER");
+            if std::env::var("FAKE_LOGOUT_IN_CONFIG").as_deref() == Ok("1") {
+                if let Ok(cfg) = std::env::var("CLAUDE_CONFIG_DIR") {
+                    let _ = std::fs::write(std::path::Path::new(&cfg).join(CONFIG_LOGOUT_MARKER), "1
+");
+                }
+            }
             emit(&result_event(
                 &session_id,
                 true,
@@ -1354,6 +1423,7 @@ fn main() {
             ]);
 
             let codes = wait_for_index(3, std::time::Duration::from_secs(30));
+            wait_worker_gate();
             // brief §11: `hooks_bad_ref` cites a code the control plane never
             // allocated, which is exactly v6 §2.5 rule 3.
             let cited: Vec<String> = if scenario == "hooks_bad_ref" {
@@ -1450,7 +1520,7 @@ fn main() {
                 }
             }
 
-            let doc = serde_json::json!({
+            let doc = review_fix::with_empty_edits(serde_json::json!({
                 "verdict": if rejecting { "REJECT" } else { "PASS" },
                 "findings": {
                     "criteria": criteria,
@@ -1466,7 +1536,7 @@ fn main() {
                         serde_json::json!([])
                     }
                 }
-            });
+            }), &prompt);
             let _ = std::fs::write(
                 agent_dir.join("review.json"),
                 serde_json::to_string_pretty(&doc).unwrap(),
@@ -1565,6 +1635,33 @@ fn main() {
                 agent_dir.join("spec-review.json"),
                 serde_json::to_string_pretty(&doc).unwrap(),
             );
+            emit(&result_event(&session_id, false, "DONE", serde_json::Value::Null));
+            std::process::exit(0);
+        }
+        "spec_review_doc_file" => {
+            // SR-4: the document the test wrote at FAKE_SPEC_REVIEW_DOC, as
+            // it is, for a reviewer or an author alike; FAKE_PROMPT_OUT, when
+            // set, receives the prompt this run was handed. FAKE_REVIEW_GATE
+            // holds the write like the other spec review scenarios.
+            emit(&assistant_event(&session_id, "handing in the prepared document"));
+            if let Ok(out) = std::env::var("FAKE_PROMPT_OUT") {
+                let _ = std::fs::write(out, &prompt);
+            }
+            let Some(doc) = std::env::var("FAKE_SPEC_REVIEW_DOC").ok().and_then(|p| std::fs::read_to_string(p).ok())
+            else {
+                eprintln!("fake-claude: FAKE_SPEC_REVIEW_DOC is not set or cannot be read");
+                std::process::exit(70);
+            };
+            if let Ok(gate) = std::env::var("FAKE_REVIEW_GATE") {
+                let gate = std::path::PathBuf::from(gate);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !gate.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            let agent_dir = std::path::Path::new(".agent");
+            let _ = std::fs::create_dir_all(agent_dir);
+            let _ = std::fs::write(agent_dir.join("spec-review.json"), doc);
             emit(&result_event(&session_id, false, "DONE", serde_json::Value::Null));
             std::process::exit(0);
         }

@@ -44,7 +44,9 @@
 //! attempt, so the ordinary file write, commit and result still happen.
 //!
 //! `--json-schema FILE` is accepted as agy's reviewer launch passes it; the
-//! file must exist, else the usage line and exit 2. Reviewer scenarios
+//! file must exist, else the usage line and exit 2. RVI-1's
+//! `review_delivery` makes the same leak attempts, then reads its whole input
+//! with `read_file` (see `support/delivery_review.rs`). Reviewer scenarios
 //! (`review_pass`, `review_reject`, `review_bad`, `review_no_output`,
 //! `review_not_object`) first
 //! try `write_file` of `agy_reviewer_leak.txt` and `run_command`
@@ -127,6 +129,12 @@
 //! use `FAKE_SCENARIO`. Without `FAKE_ATTEMPTS_FILE`, k is always 1, so every
 //! launch runs `FAKE_FIRST_SCENARIO`.
 //!
+//! AUTO-1b switch, unset by default: `FAKE_SCENARIO_SEQUENCE=a,b,c` (as in
+//! fake-claude) is the scenario of launch k, the last entry once the list is
+//! used up; it wins over `FAKE_FIRST_SCENARIO` and `FAKE_SCENARIO`. Fakes
+//! sharing one `FAKE_ATTEMPTS_FILE` share the sequence; `models`, `-p
+//! /usage`, `--version` and the login take no entry.
+//!
 //! RES-1a scenarios, the same in fake-claude and fake-codex: `research_ok`
 //! runs like `ok` (same summary) but its claims are one completion and two
 //! research claims, `research claim 1` and `research claim 2`;
@@ -148,6 +156,11 @@ mod source_check;
 // answers an object without `edits`.
 #[path = "support/review_fix.rs"]
 mod review_fix;
+// RVI-1: `review_delivery` reads packet.md, the evidence files and the
+// delivered result.json with `read_file`, judges from them and records what
+// it read in `FAKE_REVIEW_CAPTURE`; the same in fake-codex.
+#[path = "support/delivery_review.rs"]
+mod delivery_review;
 
 use std::io::Write;
 use std::path::Path;
@@ -169,6 +182,16 @@ fn record_attempt(resumed: bool, id: &str) -> usize {
         .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or(1)
         .max(1)
+}
+
+/// AUTO-1b: entry `launch` (from 1) of `FAKE_SCENARIO_SEQUENCE`, the last one
+/// past its end; `None` when it is unset or holds no entry. The same rule as
+/// fake-claude's, so fakes sharing one `FAKE_ATTEMPTS_FILE` share the list.
+fn sequence_scenario(launch: usize) -> Option<String> {
+    let list = std::env::var("FAKE_SCENARIO_SEQUENCE").ok()?;
+    let entries: Vec<&str> = list.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+    let last = entries.last()?;
+    Some(entries.get(launch.saturating_sub(1)).unwrap_or(last).to_string())
 }
 
 /// FC-2: `FAKE_FIRST_SCENARIO` for launches 1 to `FAKE_FIRST_TIMES` (default
@@ -624,6 +647,24 @@ fn review(agy: &Agy<'_>, scenario: &str, prompt: &str) {
     step(id, 0, "user_input", None);
     step(id, 1, "agent_response", Some(40));
     agy.leak_attempts(2);
+    if scenario == delivery_review::SCENARIO {
+        // RVI-1: every input file read with `read_file`, through the hooks.
+        let mut index = 3;
+        let input = delivery_review::read_with(|path| {
+            index += 1;
+            read_file(agy, index, path)
+        });
+        let (doc, capture) = delivery_review::judge(prompt, &input);
+        delivery_review::record(&capture);
+        let doc = review_fix::with_empty_edits(doc, prompt);
+        let text = format!("{doc}\n");
+        response_step(id, index + 1, 120, &text);
+        emit(serde_json::json!({"event":"result","result":{"conversation_id":id,"status":"SUCCESS",
+            "response":text,"structured_output":doc,"duration_seconds":1,"num_turns":1,
+            "usage":{"input_tokens":100,"output_tokens":160,"thinking_tokens":0,"cache_read_tokens":0,
+            "total_tokens":260}}}));
+        return;
+    }
     let input = Path::new(".agent").join("review-input");
     let packet = read_file(agy, 4, &input.join("packet.md")).unwrap_or_default();
     let codes: Vec<String> = packet
@@ -671,6 +712,8 @@ fn review(agy: &Agy<'_>, scenario: &str, prompt: &str) {
     }).collect();
     let doc = serde_json::json!({"verdict": if rejecting { "REJECT" } else { "PASS" },
         "findings": {"criteria": criteria, "extra_findings": []}});
+    // RFIX-2: `review_bad` stays as malformed as it was.
+    let doc = if scenario == "review_bad" { doc } else { review_fix::with_empty_edits(doc, prompt) };
     let text = format!("{doc}\n");
     response_step(id, 6, 120, &text);
     let mut body = serde_json::json!({"conversation_id":id,"status":"SUCCESS","response":text,
@@ -944,7 +987,8 @@ fn main() {
     // FC-2: which launch this is (`FAKE_ATTEMPTS_FILE`), and the scenario
     // for it (`FAKE_FIRST_SCENARIO` for the first `FAKE_FIRST_TIMES`).
     let launch = record_attempt(value(&args, "--conversation").is_some(), &conversation);
-    let scenario = first_scenario(launch)
+    let scenario = sequence_scenario(launch)
+        .or_else(|| first_scenario(launch))
         .unwrap_or_else(|| std::env::var("FAKE_SCENARIO").unwrap_or_else(|_| "ok".into()));
     let agy = Agy { data, id: conversation.clone(), model: model_name };
     if scenario == "resume" && value(&args, "--conversation").is_none() {

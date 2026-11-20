@@ -69,7 +69,7 @@ pub fn run(paths: &Paths, cwd: &Path, task: &str, timeout_seconds: u64, json: bo
             );
             return Ok(TIMEOUT_EXIT_CODE);
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(crate::runner::poll_every());
     }
 }
 
@@ -328,7 +328,7 @@ pub fn for_run(
             );
             return Ok(TIMEOUT_EXIT_CODE);
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(crate::runner::poll_every());
     }
 }
 

@@ -379,7 +379,12 @@ fn redact_spec_review_input_keeps_json_and_original_fingerprint() {
 }
 
 /// AC6 (t5): an edit that copies a mask marker from the masked spec is
-/// refused at stage `edits`, and the stored spec stays as it was.
+/// refused, and the stored spec stays as it was. SR-4 (AC5): the refusal is
+/// that edit's alone - it is listed in the REVISE's `refused_edits` and the
+/// fake's other edit (a constraint appended) is kept - where before SR-4 the
+/// whole review was `spec_review_invalid` at stage `edits`. The refusal's
+/// reason, its `show` line and the `events` output carry no piece of the
+/// secret.
 #[test]
 fn redact_a_spec_edit_carrying_a_marker_is_refused() {
     let f = common::fixture();
@@ -417,15 +422,56 @@ fn redact_a_spec_edit_carrying_a_marker_is_refused() {
         .clone();
     let run = json_of(out)["run_id"].as_str().unwrap().to_string();
     wait_run(&f, &run);
-    let events: Vec<serde_json::Value> =
-        f.events_json(&task).into_iter().filter(|e| e["run_id"] == run.as_str()).collect();
-    let invalid: Vec<&serde_json::Value> = events.iter().filter(|e| e["type"] == "spec_review_invalid").collect();
-    assert_eq!(invalid.len(), 1, "{events:#?}");
-    assert_eq!(invalid[0]["detail"]["stage"], "edits");
-    let reason = invalid[0]["detail"]["reason"].as_str().unwrap();
-    assert!(reason.starts_with("edit 0 (acceptance_criteria): "), "{reason}");
+    let events_out = String::from_utf8(
+        clean(&f)
+            .args(["events", "--since", "0", "--task", &task, "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let all: serde_json::Value = serde_json::from_str(events_out.trim()).unwrap();
+    let events: Vec<serde_json::Value> = all["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["run_id"] == run.as_str())
+        .cloned()
+        .collect();
+    assert!(!events.iter().any(|e| e["type"] == "spec_review_invalid"), "{events:#?}");
+    let review: Vec<&serde_json::Value> = events.iter().filter(|e| e["type"] == "spec_review").collect();
+    assert_eq!(review.len(), 1, "{events:#?}");
+    let d = &review[0]["detail"];
+    assert_eq!(d["verdict"], "REVISE");
+    let refused = d["refused_edits"].as_array().unwrap();
+    assert_eq!(refused.len(), 1, "{d}");
+    assert_eq!(refused[0]["index"], 0);
+    assert_eq!(refused[0]["field"], "acceptance_criteria");
+    let reason = refused[0]["reason"].as_str().unwrap();
     assert!(reason.contains("carries a mask marker the stored spec does not have"), "{reason}");
     no_secret(reason, RD_VALUE, 0);
-    assert!(!events.iter().any(|e| e["type"] == "spec_review"));
+    // the fake's appended constraint survives, under its own index
+    assert_eq!(d["edit_count"], 1, "{d}");
+    assert_eq!(d["edits"][0]["index"], 1);
+    assert_eq!(d["edits"][0]["field"], "constraints");
+    let proposed: serde_json::Value = serde_json::from_str(d["proposed_spec"].as_str().unwrap()).unwrap();
+    assert!(!d["proposed_spec"].as_str().unwrap().contains("[redacted:"), "{d}");
+    assert_eq!(proposed["acceptance_criteria"], serde_json::from_str::<serde_json::Value>(&spec).unwrap()["acceptance_criteria"]);
+    let show = json_of(
+        clean(&f).args(["spec", "review", "show", &task, "--json"]).assert().success().get_output().stdout.clone(),
+    );
+    assert_eq!(show["newest"]["refused_edits"], d["refused_edits"]);
+    assert_eq!(show["pending_edits"], true);
+    let human = String::from_utf8(
+        clean(&f).args(["spec", "review", "show", &task]).assert().success().get_output().stdout.clone(),
+    )
+    .unwrap();
+    let line = human.lines().find(|l| l.starts_with("  refused edit 0  acceptance_criteria  ")).unwrap_or_else(|| panic!("{human}"));
+    no_secret(line, RD_VALUE, 0);
+    // the refusal itself never leaks the secret through events
+    let refused_text = serde_json::to_string(&d["refused_edits"]).unwrap();
+    no_secret(&refused_text, RD_VALUE, 0);
     assert_eq!(spec_of(), before);
 }

@@ -7,8 +7,10 @@
 //! spec") in the `spec_review` event; the reviewer itself never writes a
 //! file. `spec review confirm` then launches the author, who answers `ok` or
 //! `revise` per edit; an APPROVE makes Thoth replace the task's spec with the
-//! proposed one. Everything in this module is a pure function over strings
-//! and JSON, so the rules are testable without a database.
+//! proposed one. SR-4: an edit that breaks a rule is refused alone and the
+//! others still apply; the author answers only the applied ones. Everything
+//! in this module is a pure function over strings and JSON, so the rules are
+//! testable without a database.
 
 use crate::spec::TaskSpec;
 use serde::{Deserialize, Serialize};
@@ -25,10 +27,6 @@ pub const EDIT_FIELDS: [&str; 5] = [
 ];
 
 pub const EDIT_OPS: [&str; 3] = ["replace", "insert", "delete"];
-
-/// An anchor is the first this many characters of the entry it names, or the
-/// whole entry when that is shorter.
-pub const ANCHOR_MIN_CHARS: usize = 10;
 
 /// The fixed key order of a serialized proposed spec; every other key follows
 /// in alphabetical order.
@@ -109,71 +107,83 @@ pub struct AppliedEdit {
     pub reason: String,
 }
 
+/// SR-4: one edit Thoth did not apply, and why. The edits after it were
+/// still applied; this one changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedEdit {
+    /// The edit's position in the reviewer's `edits`, from 0.
+    pub index: usize,
+    pub field: String,
+    pub reason: String,
+}
+
 /// The outcome of applying every edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
+    /// The edits applied, in document order, each with its original index.
     pub edits: Vec<AppliedEdit>,
-    /// The proposed spec, serialized by `serialize_spec`.
-    pub proposed: String,
+    /// SR-4: the edits refused, in document order.
+    pub refused: Vec<RefusedEdit>,
+    /// The proposed spec, serialized by `serialize_spec`; `None` when every
+    /// edit was refused.
+    pub proposed: Option<String>,
 }
 
+/// What refuses the whole review rather than one edit: the stored spec is
+/// not a JSON object, or the proposed spec is not a spec.
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
-    #[error("edit {index} ({field}): {why}")]
-    Edit {
-        index: usize,
-        field: String,
-        why: String,
-    },
     #[error("the proposed spec is not a spec: {0}")]
     Proposed(String),
 }
 
-fn edit_err(index: usize, field: &str, why: impl Into<String>) -> EditError {
-    EditError::Edit {
-        index,
-        field: field.to_string(),
-        why: why.into(),
-    }
-}
-
-/// The first 40 characters of an entry, for messages.
-fn head(s: &str) -> String {
-    let t = s.trim();
-    let cut: String = t.chars().take(40).collect();
-    if cut.chars().count() < t.chars().count() {
-        format!("{cut}…")
-    } else {
-        cut
-    }
-}
-
-/// The anchor rule: trimmed, at least `ANCHOR_MIN_CHARS` characters (or the
-/// whole entry), and the start of the entry at `at`. Never searched for. The
-/// length is counted after the whitespace at both ends is dropped: when the
-/// tenth character of an entry is a space, the anchor goes on to the next
-/// non-space character.
-fn check_anchor(anchor: &str, entry: &str) -> Result<(), String> {
+/// SR-4: the entry a `replace` or `delete` names. Both the anchor and the
+/// entries are trimmed at both ends and compared literally (no
+/// normalization, no case or whitespace folding); a blank anchor names
+/// nothing. A prefix of the entry at `at`, of any length, names that entry
+/// even when it occurs elsewhere too. Otherwise the anchor has to occur at
+/// exactly one starting position across all `entries` (overlapping
+/// occurrences count separately), and names the entry it occurs in whatever
+/// `at` says. Never guesses between two places. The reason quotes the
+/// anchor whole and no entry text, so no cut of an entry can carry part of a
+/// secret past the masker.
+fn resolve_anchor(anchor: &str, entries: &[String], at: usize, field: &str) -> Result<usize, String> {
     let a = anchor.trim();
-    let e = entry.trim();
     if a.is_empty() {
-        return Err(format!(
-            "anchor is blank; write the first {ANCHOR_MIN_CHARS} characters of the entry (the whole entry when it is shorter)"
-        ));
+        return Err(
+            "anchor is blank; write the start of the entry at that position, or a piece of text that occurs once in the field".to_string(),
+        );
     }
-    if a.chars().count() < ANCHOR_MIN_CHARS && a != e {
-        return Err(format!(
-            "anchor '{a}' is shorter than {ANCHOR_MIN_CHARS} characters and is not the whole entry '{}'",
-            head(e)
-        ));
+    if entries.get(at).is_some_and(|e| e.trim().starts_with(a)) {
+        return Ok(at);
     }
-    if !e.starts_with(a) {
-        return Err(format!(
-            "anchor '{a}' does not start the entry at that position, which is '{}'",
-            head(e)
-        ));
+    let mut found: Vec<usize> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let e = e.trim();
+        for (pos, _) in e.char_indices() {
+            if e[pos..].starts_with(a) {
+                found.push(i);
+            }
+        }
     }
-    Ok(())
+    let at_says = if at < entries.len() {
+        format!("does not start {field} entry {at}")
+    } else {
+        format!("at {at} is past the end of {field} ({} entries)", entries.len())
+    };
+    match found.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(format!("anchor '{a}' {at_says} and occurs nowhere in {field}")),
+        many => {
+            let mut where_: Vec<String> = many.iter().map(|i| i.to_string()).collect();
+            where_.dedup();
+            Err(format!(
+                "anchor '{a}' {at_says} and occurs {} times in {field} (entries {}), so it does not say which entry; write the start of the entry at at, or more text",
+                many.len(),
+                where_.join(", ")
+            ))
+        }
+    }
 }
 
 /// The ids `review_json::ac_ids` gives a list of criteria.
@@ -190,9 +200,12 @@ fn ids_of(acs: &[String]) -> Vec<String> {
 }
 
 /// Applies `edits` in order to the spec `spec` (its stored bytes). Every
-/// `at` refers to the list as the earlier edits left it. `ac_ids` are the
-/// task's criterion ids (`review_json::ac_ids` of the spec), which every edit
-/// binds to and which the proposed spec must keep exactly.
+/// `at` refers to the list as the earlier applied edits left it. `ac_ids` are
+/// the task's criterion ids (`review_json::ac_ids` of the spec), which every
+/// edit binds to and which the proposed spec must keep exactly. SR-4: an
+/// edit that breaks a rule is refused alone (it changes nothing) and the
+/// later edits still apply; only a stored spec that is not an object, or a
+/// proposed spec that is not a spec, is an `Err`.
 pub fn apply_edits(spec: &str, edits: &[SpecEdit], ac_ids: &[String]) -> Result<Applied, EditError> {
     let mut root: Map<String, Value> = match serde_json::from_str::<Value>(spec) {
         Ok(Value::Object(m)) => m,
@@ -212,171 +225,22 @@ pub fn apply_edits(spec: &str, edits: &[SpecEdit], ac_ids: &[String]) -> Result<
     let mut stored_strings = Vec::new();
     root.values().for_each(|v| strings_of(v, &mut stored_strings));
     let mut applied = Vec::with_capacity(edits.len());
+    let mut refused = Vec::new();
     for (index, e) in edits.iter().enumerate() {
-        let field = e.field.as_str();
-        if !EDIT_FIELDS.contains(&field) {
-            return Err(edit_err(
+        match apply_one(&mut root, &stored_strings, ac_ids, index, e) {
+            Ok(a) => applied.push(a),
+            Err(reason) => refused.push(RefusedEdit {
                 index,
-                field,
-                format!("field must be one of {}", EDIT_FIELDS.join(", ")),
-            ));
+                field: e.field.clone(),
+                reason,
+            }),
         }
-        if !EDIT_OPS.contains(&e.op.as_str()) {
-            return Err(edit_err(
-                index,
-                field,
-                format!("op '{}' must be one of {}", e.op, EDIT_OPS.join(", ")),
-            ));
-        }
-        if !ac_ids.iter().any(|id| id == e.criterion.trim()) {
-            return Err(edit_err(
-                index,
-                field,
-                format!(
-                    "criterion '{}' is not an acceptance criterion of this task (one of: {})",
-                    e.criterion,
-                    ac_ids.join(", ")
-                ),
-            ));
-        }
-        if e.reason.trim().is_empty() {
-            return Err(edit_err(index, field, "reason must not be blank"));
-        }
-        let text_required = e.op != "delete";
-        if text_required && e.text.trim().is_empty() {
-            return Err(edit_err(
-                index,
-                field,
-                format!("text must not be blank for op {}", e.op),
-            ));
-        }
-        let new_marker = text_required
-            && crate::redact::marker_spans(&e.text)
-                .into_iter()
-                .any(|r| !stored_strings.iter().any(|s| s.contains(&e.text[r.clone()])));
-        if new_marker {
-            return Err(edit_err(
-                index,
-                field,
-                "text carries a mask marker the stored spec does not have (the reviewer read a masked spec); write the original wording instead",
-            ));
-        }
-        if (field == "goal" || field == "acceptance_criteria") && e.op != "replace" {
-            return Err(edit_err(
-                index,
-                field,
-                format!("{field} allows only op replace, not {}", e.op),
-            ));
-        }
-        let criterion = e.criterion.trim().to_string();
-        if field == "goal" {
-            let goal = root.get("goal").and_then(Value::as_str).unwrap_or("").to_string();
-            check_anchor(&e.anchor, &goal).map_err(|why| edit_err(index, field, why))?;
-            root.insert("goal".to_string(), Value::String(e.text.clone()));
-            applied.push(AppliedEdit {
-                index,
-                field: field.to_string(),
-                op: e.op.clone(),
-                at: 0,
-                criterion,
-                anchor: e.anchor.clone(),
-                before: Some(goal),
-                after: Some(e.text.clone()),
-                reason: e.reason.clone(),
-            });
-            continue;
-        }
-        // A list field; one the spec does not have is an empty list.
-        let mut list: Vec<String> = match root.get(field) {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(items)) => {
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    match item.as_str() {
-                        Some(s) => out.push(s.to_string()),
-                        None => {
-                            return Err(edit_err(
-                                index,
-                                field,
-                                format!("{field} holds an entry that is not a string, so it cannot be edited"),
-                            ))
-                        }
-                    }
-                }
-                out
-            }
-            Some(_) => {
-                return Err(edit_err(
-                    index,
-                    field,
-                    format!("{field} is not a list in the stored spec, so it cannot be edited"),
-                ))
-            }
-        };
-        let len = list.len();
-        let (before, after) = match e.op.as_str() {
-            "replace" | "delete" => {
-                if e.at >= len {
-                    return Err(edit_err(
-                        index,
-                        field,
-                        format!(
-                            "at {} is past the end: {field} has {len} entries (0 to {}) at this point",
-                            e.at,
-                            len.saturating_sub(1)
-                        ),
-                    ));
-                }
-                check_anchor(&e.anchor, &list[e.at]).map_err(|why| edit_err(index, field, why))?;
-                let before = list[e.at].clone();
-                if e.op == "replace" {
-                    list[e.at] = e.text.clone();
-                    (Some(before), Some(e.text.clone()))
-                } else {
-                    list.remove(e.at);
-                    (Some(before), None)
-                }
-            }
-            _ => {
-                if e.at > len {
-                    return Err(edit_err(
-                        index,
-                        field,
-                        format!(
-                            "at {} is past the end: {field} has {len} entries at this point, so insert allows 0 to {len}",
-                            e.at
-                        ),
-                    ));
-                }
-                list.insert(e.at, e.text.clone());
-                (None, Some(e.text.clone()))
-            }
-        };
-        if field == "acceptance_criteria" {
-            let now = ids_of(&list);
-            if now != ac_ids {
-                return Err(edit_err(
-                    index,
-                    field,
-                    format!(
-                        "the criterion ids changed from {} to {}; a replaced acceptance criterion keeps the id before its colon",
-                        ac_ids.join(", "),
-                        now.join(", ")
-                    ),
-                ));
-            }
-        }
-        root.insert(field.to_string(), Value::Array(list.into_iter().map(Value::String).collect()));
-        applied.push(AppliedEdit {
-            index,
-            field: field.to_string(),
-            op: e.op.clone(),
-            at: e.at,
-            criterion,
-            anchor: e.anchor.clone(),
-            before,
-            after,
-            reason: e.reason.clone(),
+    }
+    if applied.is_empty() {
+        return Ok(Applied {
+            edits: applied,
+            refused,
+            proposed: None,
         });
     }
     let proposed = serialize_spec(&root);
@@ -391,7 +255,131 @@ pub fn apply_edits(spec: &str, edits: &[SpecEdit], ac_ids: &[String]) -> Result<
     }
     Ok(Applied {
         edits: applied,
-        proposed,
+        refused,
+        proposed: Some(proposed),
+    })
+}
+
+/// One edit against the proposal the earlier applied edits left. `root` is
+/// changed only when the edit is applied; `Err` is why it was refused.
+fn apply_one(
+    root: &mut Map<String, Value>,
+    stored_strings: &[String],
+    ac_ids: &[String],
+    index: usize,
+    e: &SpecEdit,
+) -> Result<AppliedEdit, String> {
+    let field = e.field.as_str();
+    if !EDIT_FIELDS.contains(&field) {
+        return Err(format!("field must be one of {}", EDIT_FIELDS.join(", ")));
+    }
+    if !EDIT_OPS.contains(&e.op.as_str()) {
+        return Err(format!("op '{}' must be one of {}", e.op, EDIT_OPS.join(", ")));
+    }
+    if !ac_ids.iter().any(|id| id == e.criterion.trim()) {
+        return Err(format!(
+            "criterion '{}' is not an acceptance criterion of this task (one of: {})",
+            e.criterion,
+            ac_ids.join(", ")
+        ));
+    }
+    if e.reason.trim().is_empty() {
+        return Err("reason must not be blank".to_string());
+    }
+    let text_required = e.op != "delete";
+    if text_required && e.text.trim().is_empty() {
+        return Err(format!("text must not be blank for op {}", e.op));
+    }
+    let new_marker = text_required
+        && crate::redact::marker_spans(&e.text)
+            .into_iter()
+            .any(|r| !stored_strings.iter().any(|s| s.contains(&e.text[r.clone()])));
+    if new_marker {
+        return Err(
+            "text carries a mask marker the stored spec does not have (the reviewer read a masked spec); write the original wording instead".to_string(),
+        );
+    }
+    if (field == "goal" || field == "acceptance_criteria") && e.op != "replace" {
+        return Err(format!("{field} allows only op replace, not {}", e.op));
+    }
+    let criterion = e.criterion.trim().to_string();
+    if field == "goal" {
+        // The goal is one string: the only entry there is to name.
+        let goal = root.get("goal").and_then(Value::as_str).unwrap_or("").to_string();
+        resolve_anchor(&e.anchor, std::slice::from_ref(&goal), 0, field)?;
+        root.insert("goal".to_string(), Value::String(e.text.clone()));
+        return Ok(AppliedEdit {
+            index,
+            field: field.to_string(),
+            op: e.op.clone(),
+            at: 0,
+            criterion,
+            anchor: e.anchor.clone(),
+            before: Some(goal),
+            after: Some(e.text.clone()),
+            reason: e.reason.clone(),
+        });
+    }
+    // A list field; one the spec does not have is an empty list.
+    let mut list: Vec<String> = match root.get(field) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => return Err(format!("{field} holds an entry that is not a string, so it cannot be edited")),
+                }
+            }
+            out
+        }
+        Some(_) => return Err(format!("{field} is not a list in the stored spec, so it cannot be edited")),
+    };
+    let len = list.len();
+    let (at, before, after) = match e.op.as_str() {
+        "replace" | "delete" => {
+            let at = resolve_anchor(&e.anchor, &list, e.at, field)?;
+            let before = list[at].clone();
+            if e.op == "replace" {
+                list[at] = e.text.clone();
+                (at, Some(before), Some(e.text.clone()))
+            } else {
+                list.remove(at);
+                (at, Some(before), None)
+            }
+        }
+        _ => {
+            if e.at > len {
+                return Err(format!(
+                    "at {} is past the end: {field} has {len} entries at this point, so insert allows 0 to {len}",
+                    e.at
+                ));
+            }
+            list.insert(e.at, e.text.clone());
+            (e.at, None, Some(e.text.clone()))
+        }
+    };
+    if field == "acceptance_criteria" {
+        let now = ids_of(&list);
+        if now != ac_ids {
+            return Err(format!(
+                "the criterion ids changed from {} to {}; a replaced acceptance criterion keeps the id before its colon",
+                ac_ids.join(", "),
+                now.join(", ")
+            ));
+        }
+    }
+    root.insert(field.to_string(), Value::Array(list.into_iter().map(Value::String).collect()));
+    Ok(AppliedEdit {
+        index,
+        field: field.to_string(),
+        op: e.op.clone(),
+        at,
+        criterion,
+        anchor: e.anchor.clone(),
+        before,
+        after,
+        reason: e.reason.clone(),
     })
 }
 
@@ -561,13 +549,20 @@ pub fn parse_confirm_document(json: &str) -> Result<ConfirmDocument, ConfirmErro
 
 /// Every index `0..edit_count` exactly once, and nothing else.
 pub fn check_confirm_coverage(doc: &ConfirmDocument, edit_count: usize) -> Result<(), ConfirmError> {
-    for index in 0..edit_count {
+    check_confirm_indices(doc, &(0..edit_count).collect::<Vec<_>>())
+}
+
+/// SR-4: every index of `indices` exactly once, and nothing else. An edit
+/// review's applied edits keep the reviewer's indices, so after a refused
+/// edit the list has gaps (`[0, 2]`); a refused index is not one to answer.
+pub fn check_confirm_indices(doc: &ConfirmDocument, indices: &[usize]) -> Result<(), ConfirmError> {
+    for &index in indices {
         if !doc.edits.iter().any(|e| e.index == index) {
             return Err(ConfirmError::MissingEdit(index));
         }
     }
     for (i, e) in doc.edits.iter().enumerate() {
-        if e.index >= edit_count {
+        if !indices.contains(&e.index) {
             return Err(ConfirmError::UnknownEdit(e.index));
         }
         if doc.edits[..i].iter().any(|earlier| earlier.index == e.index) {
@@ -623,11 +618,17 @@ mod tests {
         }
     }
 
-    fn unpack(err: EditError) -> (usize, String) {
-        match err {
-            EditError::Edit { index, why, .. } => (index, why),
-            EditError::Proposed(why) => (usize::MAX, why),
-        }
+    /// SR-4: a single edit that is refused alone; (its index, why).
+    fn refused_alone(spec: &str, e: SpecEdit) -> (usize, String) {
+        let a = apply_edits(spec, &[e], &ids()).unwrap();
+        assert!(a.edits.is_empty(), "{a:?}");
+        assert_eq!(a.proposed, None, "nothing applied, nothing proposed");
+        assert_eq!(a.refused.len(), 1, "{a:?}");
+        (a.refused[0].index, a.refused[0].reason.clone())
+    }
+
+    fn proposed_of(a: &Applied) -> Value {
+        serde_json::from_str(a.proposed.as_deref().expect("a proposed spec")).unwrap()
     }
 
     #[test]
@@ -639,114 +640,164 @@ mod tests {
             "AC1: rejects",
             "AC1: rejects a double spend signed with [redacted:github-token]",
         );
-        let err = apply_edits(SPEC, &[e], &ids()).unwrap_err();
-        let text = err.to_string();
-        let (index, _) = unpack(err);
+        let (index, why) = refused_alone(SPEC, e);
         assert_eq!(index, 0);
-        assert!(text.starts_with("edit 0 (acceptance_criteria): "), "{text}");
-        assert!(text.contains("carries a mask marker the stored spec does not have"), "{text}");
+        assert!(why.contains("carries a mask marker the stored spec does not have"), "{why}");
 
         // a marker the stored spec quotes itself is not new
         let quoting = SPEC.replace(r#""constraints":["no new crate"]"#, r#""constraints":["no new crate","write [redacted:KIND] for a secret"]"#);
         assert_ne!(quoting, SPEC);
         let e = edit("constraints", "insert", 0, "", "keep the [redacted:KIND] form");
-        assert!(apply_edits(&quoting, &[e], &ids()).is_ok());
+        assert_eq!(apply_edits(&quoting, &[e], &ids()).unwrap().edits.len(), 1);
 
         // an opening without its closing is not a marker
         let e = edit("constraints", "insert", 0, "", "mention [redacted:github and stop");
-        assert!(apply_edits(SPEC, &[e], &ids()).is_ok());
+        assert_eq!(apply_edits(SPEC, &[e], &ids()).unwrap().edits.len(), 1);
     }
 
+    /// SR-4 (AC1, AC2): any prefix of the entry at `at` names it, however
+    /// short and wherever else it occurs; otherwise one occurrence in the
+    /// whole field names the entry it is in, whatever `at` says.
     #[test]
-    fn an_anchor_that_does_not_start_the_entry_is_refused() {
-        let e = edit("constraints", "replace", 0, "no old crate", "no new crate, ever");
-        let (index, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
-        assert_eq!(index, 0);
-        assert!(why.contains("does not start the entry"), "{why}");
-        // a short anchor must be the whole entry
-        let e = edit("constraints", "replace", 0, "no new", "no new crate, ever");
-        let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
-        assert!(why.contains("shorter than 10"), "{why}");
-        // the ten characters are counted after trimming: nine plus a trailing
-        // space is nine (second code review, AC2)
-        let e = edit("non_goals", "replace", 0, "rewriting ", "rewriting the transport layer");
-        let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
-        assert!(why.contains("shorter than 10"), "{why}");
+    fn a_prefix_at_at_or_a_unique_occurrence_names_the_entry() {
+        // one character: "r" starts entry 0 and occurs in entry 1 too; at
+        // picks entry 0
+        let e = edit("non_goals", "delete", 0, "r", "");
+        let a = apply_edits(SPEC, &[e], &ids()).unwrap();
+        assert_eq!(a.edits[0].at, 0);
+        assert_eq!(a.edits[0].before.as_deref(), Some("rewriting the transport"));
+        // at picks entry 1 with the same kind of short prefix
+        let e = edit("non_goals", "replace", 1, "c", "changing the log level");
+        let a = apply_edits(SPEC, &[e], &ids()).unwrap();
+        assert_eq!(a.edits[0].at, 1);
+        assert_eq!(proposed_of(&a)["non_goals"], json!(["rewriting the transport", "changing the log level"]));
+        // trimmed on both sides: a padded prefix is still a prefix
         let e = edit("non_goals", "replace", 0, "  rewriting  ", "rewriting the transport layer");
-        let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
-        assert!(why.contains("shorter than 10"), "{why}");
-        // one more character and it is an anchor
-        let e = edit("non_goals", "replace", 0, "rewriting t", "rewriting the transport layer");
-        assert!(apply_edits(SPEC, &[e], &ids()).is_ok());
-        // the whole entry, shorter than 10, is fine; so is a 10-char prefix
-        let whole = SpecEdit { criterion: "AC2".into(), ..edit("constraints", "delete", 0, "no new crate", "") };
-        assert!(apply_edits(SPEC, &[whole], &ids()).is_ok());
-        let prefix = edit("non_goals", "delete", 1, "changing t", "");
-        let a = apply_edits(SPEC, &[prefix], &ids()).unwrap();
+        assert_eq!(apply_edits(SPEC, &[e], &ids()).unwrap().edits[0].at, 0);
+        // a unique middle substring with a stale at: the entry it is in
+        let e = edit("non_goals", "delete", 0, "log format", "");
+        let a = apply_edits(SPEC, &[e], &ids()).unwrap();
+        assert_eq!(a.edits[0].at, 1);
         assert_eq!(a.edits[0].before.as_deref(), Some("changing the log format"));
-        assert_eq!(a.edits[0].after, None);
+        assert_eq!(proposed_of(&a)["non_goals"], json!(["rewriting the transport"]));
+        // a unique substring with an at past the end
+        let e = edit("acceptance_criteria", "replace", 9, "logs the", "AC2: logs the rejection once");
+        let a = apply_edits(SPEC, &[e], &ids()).unwrap();
+        assert_eq!(a.edits[0].at, 1);
+        assert_eq!(a.edits[0].before.as_deref(), Some("AC2: logs the rejection"));
+        // the goal: its one string, prefix or unique substring, at ignored
+        for anchor in ["g", "ledger"] {
+            let e = edit("goal", "replace", 3, anchor, "guard the ledger well");
+            let a = apply_edits(SPEC, &[e], &ids()).unwrap();
+            assert_eq!(a.edits[0].at, 0, "{anchor}");
+            assert_eq!(proposed_of(&a)["goal"], "guard the ledger well");
+        }
+        // case-sensitive, literal
+        let (_, why) = refused_alone(SPEC, edit("non_goals", "delete", 0, "Rewriting", ""));
+        assert!(why.contains("occurs nowhere in non_goals"), "{why}");
     }
 
     #[test]
-    fn an_insert_past_the_end_and_a_replace_at_the_end_are_refused() {
-        let e = edit("constraints", "insert", 2, "", "another");
-        let (index, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
+    fn an_ambiguous_overlapping_missing_or_blank_anchor_is_refused() {
+        // "the" starts neither entry at at=0 and occurs in both non_goals
+        let (index, why) = refused_alone(SPEC, edit("non_goals", "delete", 0, "the", ""));
+        assert_eq!(index, 0);
+        assert!(why.contains("anchor 'the' does not start non_goals entry 0"), "{why}");
+        assert!(why.contains("occurs 2 times in non_goals (entries 0, 1)"), "{why}");
+        // overlapping occurrences count one by one: "aa" is twice in "aaa"
+        let spec = SPEC.replace(r#""constraints":["no new crate"]"#, r#""constraints":["no new crate","xaaa"]"#);
+        let (_, why) = refused_alone(&spec, edit("constraints", "delete", 0, "aa", ""));
+        assert!(why.contains("occurs 2 times in constraints (entries 1)"), "{why}");
+        // ... while "aaa" occurs once and names entry 1
+        let a = apply_edits(&spec, &[edit("constraints", "delete", 0, "aaa", "")], &ids()).unwrap();
+        assert_eq!(a.edits[0].at, 1);
+        // past the end and nowhere
+        let (_, why) = refused_alone(SPEC, edit("constraints", "replace", 4, "no old crate", "x"));
+        assert!(why.contains("at 4 is past the end of constraints (1 entries)"), "{why}");
+        assert!(why.contains("occurs nowhere"), "{why}");
+        // blank and whitespace-only
+        for blank in ["", "  \t "] {
+            let (_, why) = refused_alone(SPEC, edit("constraints", "replace", 0, blank, "x"));
+            assert!(why.starts_with("anchor is blank"), "{why}");
+        }
+        // never across fields: the goal's words do not name a constraint
+        let (_, why) = refused_alone(SPEC, edit("constraints", "delete", 0, "ledger", ""));
+        assert!(why.contains("occurs nowhere in constraints"), "{why}");
+    }
+
+    /// SR-4 (AC2): scalar values, no normalization, no whitespace folding.
+    #[test]
+    fn unicode_anchors_are_compared_as_written() {
+        let spec = r#"{"goal":"守住帳本不讓重複花費","acceptance_criteria":["AC1: 拒絕重複花費"],"constraints":["不加新套件","不改日誌格式","😀 emoji 開頭","café with a combining accent","two  spaces here"],"non_goals":[],"excluded_alternatives":[],"risk":"low"}"#;
+        let ids = vec!["AC1".to_string()];
+        let one = |e: SpecEdit| apply_edits(spec, &[e], &ids).unwrap();
+        // one Chinese character shared by two entries; at picks
+        let a = one(edit("constraints", "delete", 1, "不", ""));
+        assert_eq!(a.edits[0].before.as_deref(), Some("不改日誌格式"));
+        // under 10 scalar values, over 10 UTF-8 bytes
+        // 4 scalar values, 12 UTF-8 bytes
+        let a = one(edit("goal", "replace", 0, "守住帳本", "守住帳本，不重複"));
+        assert_eq!(proposed_of(&a)["goal"], "守住帳本，不重複");
+        // a supplementary character is one scalar value
+        let a = one(edit("constraints", "replace", 2, "😀", "😀 emoji first"));
+        assert_eq!(a.edits[0].at, 2);
+        // the combining spelling as written matches; the precomposed one does not
+        let a = one(edit("constraints", "delete", 0, "cafe\u{301}", ""));
+        assert_eq!(a.edits[0].at, 3);
+        let r = one(edit("constraints", "delete", 0, "caf\u{e9}", ""));
+        assert!(r.edits.is_empty() && r.refused[0].reason.contains("occurs nowhere"), "{r:?}");
+        // internal whitespace is not folded
+        let r = one(edit("constraints", "delete", 4, "two spaces", ""));
+        assert!(r.edits.is_empty(), "{r:?}");
+        let a = one(edit("constraints", "delete", 4, "two  spaces", ""));
+        assert_eq!(a.edits[0].at, 4);
+    }
+
+    #[test]
+    fn an_insert_past_the_end_is_refused_and_appending_is_not() {
+        let (index, why) = refused_alone(SPEC, edit("constraints", "insert", 2, "", "another"));
         assert_eq!(index, 0);
         assert!(why.contains("insert allows 0 to 1"), "{why}");
-        let e = edit("constraints", "replace", 1, "no new cra", "x");
-        let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
-        assert!(why.contains("past the end"), "{why}");
         // appending is an insert at the length; a missing list is empty
         let e = edit("excluded_alternatives", "insert", 0, "", "a crate we looked at");
         let a = apply_edits(SPEC, &[e], &ids()).unwrap();
-        let v: Value = serde_json::from_str(&a.proposed).unwrap();
-        assert_eq!(v["excluded_alternatives"], json!(["a crate we looked at"]));
+        assert_eq!(proposed_of(&a)["excluded_alternatives"], json!(["a crate we looked at"]));
         let without: String = SPEC.replace(r#""constraints":["no new crate"],"#, "");
         let e = edit("constraints", "insert", 0, "", "the first constraint");
         let a = apply_edits(&without, &[e], &ids()).unwrap();
-        let v: Value = serde_json::from_str(&a.proposed).unwrap();
-        assert_eq!(v["constraints"], json!(["the first constraint"]));
+        assert_eq!(proposed_of(&a)["constraints"], json!(["the first constraint"]));
     }
 
     #[test]
     fn a_criterion_replace_must_keep_its_id_and_cannot_insert_or_delete() {
-        let e = edit("acceptance_criteria", "replace", 2, "AC3: exits", "AC4: exits zero quietly");
-        let (index, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
+        let (index, why) = refused_alone(SPEC, edit("acceptance_criteria", "replace", 2, "AC3: exits", "AC4: exits zero quietly"));
         assert_eq!(index, 0);
         assert!(why.contains("AC1, AC2, AC4"), "{why}");
         let e = edit("acceptance_criteria", "replace", 2, "AC3: exits", "AC3: exits zero quietly");
         let a = apply_edits(SPEC, &[e], &ids()).unwrap();
-        let v: Value = serde_json::from_str(&a.proposed).unwrap();
-        assert_eq!(v["acceptance_criteria"][2], "AC3: exits zero quietly");
+        assert_eq!(proposed_of(&a)["acceptance_criteria"][2], "AC3: exits zero quietly");
         for op in ["insert", "delete"] {
-            let e = edit("acceptance_criteria", op, 0, "AC1: rejec", "AC9: x");
-            let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
+            let (_, why) = refused_alone(SPEC, edit("acceptance_criteria", op, 0, "AC1: rejec", "AC9: x"));
             assert!(why.contains("allows only op replace"), "{op}: {why}");
         }
-        let e = edit("goal", "insert", 0, "guard the ", "guard the ledger better");
-        let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
+        let (_, why) = refused_alone(SPEC, edit("goal", "insert", 0, "guard the ", "guard the ledger better"));
         assert!(why.contains("allows only op replace"), "{why}");
     }
 
     #[test]
     fn only_the_five_fields_a_known_criterion_and_a_reason_are_accepted() {
-        let e = edit("risk", "replace", 0, "important", "low");
-        let err = apply_edits(SPEC, &[e], &ids()).unwrap_err();
+        let (_, why) = refused_alone(SPEC, edit("risk", "replace", 0, "important", "low"));
         assert_eq!(
-            err.to_string(),
-            "edit 0 (risk): field must be one of goal, acceptance_criteria, constraints, non_goals, excluded_alternatives"
+            why,
+            "field must be one of goal, acceptance_criteria, constraints, non_goals, excluded_alternatives"
         );
-        let e = SpecEdit { criterion: "AC9".into(), ..edit("constraints", "insert", 0, "", "x") };
-        let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
+        let (_, why) = refused_alone(SPEC, SpecEdit { criterion: "AC9".into(), ..edit("constraints", "insert", 0, "", "x") });
         assert!(why.contains("'AC9' is not an acceptance criterion"), "{why}");
-        let e = SpecEdit { reason: "  ".into(), ..edit("constraints", "insert", 0, "", "x") };
-        let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
+        let (_, why) = refused_alone(SPEC, SpecEdit { reason: "  ".into(), ..edit("constraints", "insert", 0, "", "x") });
         assert!(why.contains("reason must not be blank"), "{why}");
-        let e = edit("constraints", "insert", 0, "", "   ");
-        let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
+        let (_, why) = refused_alone(SPEC, edit("constraints", "insert", 0, "", "   "));
         assert!(why.contains("text must not be blank"), "{why}");
-        let e = edit("constraints", "move", 0, "", "x");
-        let (_, why) = unpack(apply_edits(SPEC, &[e], &ids()).unwrap_err());
+        let (_, why) = refused_alone(SPEC, edit("constraints", "move", 0, "", "x"));
         assert!(why.contains("op 'move'"), "{why}");
     }
 
@@ -759,29 +810,56 @@ mod tests {
             edit("non_goals", "delete", 2, "changing t", ""),
         ];
         let a = apply_edits(SPEC, &edits, &ids()).unwrap();
-        let v: Value = serde_json::from_str(&a.proposed).unwrap();
-        assert_eq!(v["non_goals"], json!(["first now", "rewriting the transport layer"]));
+        assert_eq!(proposed_of(&a)["non_goals"], json!(["first now", "rewriting the transport layer"]));
         assert_eq!(a.edits.len(), 3);
+        assert!(a.refused.is_empty());
         assert_eq!(a.edits[1].index, 1);
         assert_eq!(a.edits[1].at, 1);
         assert_eq!(a.edits[1].before.as_deref(), Some("rewriting the transport"));
         assert_eq!(a.edits[1].after.as_deref(), Some("rewriting the transport layer"));
         assert_eq!(a.edits[0].before, None);
         assert_eq!(a.edits[2].after, None);
-        // the goal is replaced whole, `at` ignored
-        let g = edit("goal", "replace", 7, "guard the l", "guard the ledger against double spends");
-        let a = apply_edits(SPEC, &[g], &ids()).unwrap();
-        assert_eq!(a.edits[0].at, 0);
-        let v: Value = serde_json::from_str(&a.proposed).unwrap();
-        assert_eq!(v["goal"], "guard the ledger against double spends");
+    }
+
+    /// SR-4 (AC3): a refused edit changes nothing, the later ones still
+    /// apply against the proposal the applied ones left, and every edit keeps
+    /// its index in the reviewer's list.
+    #[test]
+    fn a_refused_edit_is_skipped_and_the_rest_keep_their_indices() {
+        let edits = vec![
+            edit("constraints", "replace", 0, "no new", "no new crate, ever"),
+            // "the" is in both non_goals and starts neither: refused
+            edit("non_goals", "delete", 0, "the", ""),
+            edit("non_goals", "insert", 0, "", "first now"),
+            // at 9 and nowhere: refused
+            edit("non_goals", "delete", 9, "no such text", ""),
+            // the refused delete above did not happen, so the transport
+            // non-goal is still at 1 after the insert
+            edit("non_goals", "replace", 1, "rewriting", "rewriting the transport layer"),
+        ];
+        let a = apply_edits(SPEC, &edits, &ids()).unwrap();
+        let indices: Vec<usize> = a.edits.iter().map(|e| e.index).collect();
+        assert_eq!(indices, [0, 2, 4]);
+        let refused: Vec<(usize, &str)> = a.refused.iter().map(|r| (r.index, r.field.as_str())).collect();
+        assert_eq!(refused, [(1, "non_goals"), (3, "non_goals")]);
+        let v = proposed_of(&a);
+        assert_eq!(v["constraints"], json!(["no new crate, ever"]));
+        assert_eq!(v["non_goals"], json!(["first now", "rewriting the transport layer", "changing the log format"]));
+        assert_eq!(a.edits[2].at, 1);
+
+        // every edit refused: nothing is proposed, which is not an error
+        let a = apply_edits(SPEC, &edits[1..2], &ids()).unwrap();
+        assert!(a.edits.is_empty());
+        assert_eq!(a.proposed, None);
+        assert_eq!(a.refused[0].index, 0);
     }
 
     #[test]
     fn the_proposed_spec_keeps_unknown_keys_in_a_fixed_order() {
         let e = edit("constraints", "insert", 1, "", "second");
         let a = apply_edits(SPEC, &[e], &ids()).unwrap();
-        let keys: Vec<&str> = a
-            .proposed
+        let proposed = a.proposed.clone().unwrap();
+        let keys: Vec<&str> = proposed
             .lines()
             .filter(|l| l.starts_with("  \""))
             .map(|l| l.trim().split('"').nth(1).unwrap())
@@ -790,12 +868,12 @@ mod tests {
             keys,
             ["goal", "acceptance_criteria", "constraints", "non_goals", "excluded_alternatives", "risk", "alpha", "rework"]
         );
-        let v: Value = serde_json::from_str(&a.proposed).unwrap();
+        let v = proposed_of(&a);
         assert_eq!(v["rework"], json!({"attempt": 2}));
         assert_eq!(v["alpha"], 1);
-        assert!(a.proposed.ends_with("}\n"));
-        assert!(!a.proposed.contains('\r'));
-        assert!(a.proposed.starts_with("{\n  \"goal\": \"guard the ledger\",\n  \"acceptance_criteria\": [\n    \"AC1"));
+        assert!(proposed.ends_with("}\n"));
+        assert!(!proposed.contains('\r'));
+        assert!(proposed.starts_with("{\n  \"goal\": \"guard the ledger\",\n  \"acceptance_criteria\": [\n    \"AC1"));
         // the same input serializes the same way twice
         let b = apply_edits(SPEC, &[edit("constraints", "insert", 1, "", "second")], &ids()).unwrap();
         assert_eq!(a.proposed, b.proposed);
@@ -868,6 +946,15 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(check_confirm_coverage(&twice, 1), Err(ConfirmError::DuplicateEdit(0))));
+        // SR-4: applied indices with a gap; the refused index 1 is unknown
+        assert!(check_confirm_indices(&ok, &[0, 1]).is_ok());
+        assert!(matches!(check_confirm_indices(&ok, &[0, 2]), Err(ConfirmError::MissingEdit(2))));
+        let gap = parse_confirm_document(
+            r#"{"verdict":"APPROVE","edits":[{"index":0,"verdict":"ok","note":""},{"index":2,"verdict":"ok","note":""}]}"#,
+        )
+        .unwrap();
+        assert!(check_confirm_indices(&gap, &[0, 2]).is_ok());
+        assert!(matches!(check_confirm_indices(&gap, &[0]), Err(ConfirmError::UnknownEdit(2))));
         assert!(matches!(
             parse_confirm_document(r#"{"verdict":"REVISE","edits":[{"index":0,"verdict":"revise","note":" "}]}"#),
             Err(ConfirmError::ReviseWithoutNote(0))

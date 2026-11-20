@@ -78,6 +78,8 @@ pub(crate) const REGISTRY: &[Setting] = &[
         "The Antigravity (agy) executable."),
     setting("live-quota-timeout-ms", Some("live_quota_timeout_ms"), Some("THOTH_LIVE_QUOTA_TIMEOUT_MS"), Kind::Integer, "30000", true,
         "How long a live quota query waits for the official CLI, in milliseconds."),
+    setting("quota-reserve-percent", Some("quota_reserve_percent"), None, Kind::Integer, "0", true,
+        "Every launch is refused on an account whose quota window has used at least 100 minus this number percent and has not reset; 0 turns it off."),
     setting("scores-url", Some("scores_url"), Some("THOTH_SCORES_URL"), Kind::Text, DEFAULT_SCORES_URL, true,
         "Address of the AI Stupid Level model scores."),
     setting("aa-url", Some("aa_url"), Some("THOTH_AA_URL"), Kind::Text, DEFAULT_AA_URL, true,
@@ -94,6 +96,9 @@ pub(crate) const REGISTRY: &[Setting] = &[
         "API key for the AI Stupid Level scores; shown only as set or unset; store it with thoth config set-secret."),
     setting("artificialanalysis-api-key", None, Some("ARTIFICIALANALYSIS_API_KEY"), Kind::Secret, "unset", false,
         "API key for the Artificial Analysis scores; shown only as set or unset; store it with thoth config set-secret."),
+    // AUTO-1a: last, so every earlier setting keeps its place in the list.
+    setting("verify-slots", Some("verify_slots"), None, Kind::Integer, "1", true,
+        "How many pipeline verify runs may run at once on this computer, across repositories (1 to 8); a manually started verify does not count."),
 ];
 
 fn find(key: &str) -> Option<&'static Setting> {
@@ -161,8 +166,23 @@ fn env_value(s: &Setting) -> Option<String> {
             (!t.is_empty()).then(|| t.to_string())
         }
         Kind::Text | Kind::Path | Kind::Secret => (!raw.trim().is_empty()).then_some(raw),
-        Kind::Integer => raw.trim().parse::<u64>().ok().filter(|n| *n >= 1).map(|n| n.to_string()),
+        Kind::Integer => raw.trim().parse::<u64>().ok().filter(|n| in_range(s, *n)).map(|n| n.to_string()),
     }
+}
+
+/// The whole numbers an integer setting takes: 0 to 99 for the quota
+/// reserve, at least 1 for the rest.
+fn integer_range(s: &Setting) -> (u64, u64) {
+    match s.key {
+        "quota-reserve-percent" => (0, 99),
+        "verify-slots" => (1, 8),
+        _ => (1, u64::MAX),
+    }
+}
+
+fn in_range(s: &Setting, n: u64) -> bool {
+    let (low, high) = integer_range(s);
+    (low..=high).contains(&n)
 }
 
 fn normalize_language(raw: &str) -> Option<&'static str> {
@@ -183,7 +203,7 @@ fn file_value(s: &Setting, map: &Map<String, Value>, secrets: &Map<String, Value
     match s.kind {
         Kind::Switch => v.as_bool().map(|b| if b { "on" } else { "off" }.to_string()),
         Kind::Text => v.as_str().filter(|t| !t.trim().is_empty()).map(str::to_string),
-        Kind::Integer => v.as_u64().filter(|n| *n >= 1).map(|n| n.to_string()),
+        Kind::Integer => v.as_u64().filter(|n| in_range(s, *n)).map(|n| n.to_string()),
         Kind::Language => v.as_str().and_then(normalize_language).map(str::to_string),
         Kind::Path | Kind::Secret => None,
     }
@@ -362,6 +382,25 @@ pub(crate) fn scores_auto_refresh(home: &Path) -> bool {
 pub(crate) fn read_flags(home: &Path) -> bool {
     warn_once(home);
     switch_on(home, "live-quota")
+}
+
+/// The quota reserve in percent, 0 when off. Forgiving like `read_flags`: a
+/// value outside 0 to 99 or an unreadable config.json means off, so a bad
+/// file never refuses every launch.
+pub(crate) fn quota_reserve_percent(home: &Path) -> u64 {
+    warn_once(home);
+    resolve(home, "quota-reserve-percent")
+        .and_then(|r| r.value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// AUTO-1a: how many pipeline verify runs may hold a slot at once, 1 when
+/// unset or unreadable (forgiving like `read_flags`).
+pub(crate) fn verify_slots(home: &Path) -> u64 {
+    resolve(home, "verify-slots")
+        .and_then(|r| r.value.parse().ok())
+        .filter(|n| (1..=8).contains(n))
+        .unwrap_or(1)
 }
 
 fn legal_keys() -> String {
@@ -643,9 +682,17 @@ fn parse_value(s: &Setting, raw: &str) -> Result<(Value, String)> {
             let n = raw
                 .parse::<u64>()
                 .ok()
-                .filter(|n| *n >= 1 && raw.bytes().all(|b| b.is_ascii_digit()));
+                .filter(|n| in_range(s, *n) && raw.bytes().all(|b| b.is_ascii_digit()));
             match n {
                 Some(n) => Ok((json!(n), n.to_string())),
+                None if s.key == "quota-reserve-percent" => bail!(
+                    "invalid setting value '{raw}' for {}: a whole number from 0 to 99 (0 turns it off)",
+                    s.key
+                ),
+                None if s.key == "verify-slots" => bail!(
+                    "invalid setting value '{raw}' for {}: a whole number from 1 to 8",
+                    s.key
+                ),
                 None => bail!(
                     "invalid setting value '{raw}' for {}: a whole number of milliseconds, at least 1",
                     s.key

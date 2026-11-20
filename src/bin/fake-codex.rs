@@ -60,6 +60,14 @@
 //!   `FAKE_FIRST_TIMES` (default 1, unparsable is 1); later ones use the
 //!   usual scenario. Without `FAKE_ATTEMPTS_FILE`, k is always 1, so every
 //!   launch runs `FAKE_FIRST_SCENARIO`
+//! - `FAKE_SCENARIO_SEQUENCE=a,b,c` (AUTO-1b, as in fake-claude): the
+//!   scenario of launch k (the `FAKE_ATTEMPTS_FILE` count; always 1 without
+//!   it), the last entry once the list is used up; it wins over
+//!   `FAKE_FIRST_SCENARIO`, `FAKE_CODEX_SCENARIO` and `FAKE_SCENARIO`. Fakes
+//!   sharing one `FAKE_ATTEMPTS_FILE` share the sequence; `login`,
+//!   `app-server` and `--version` take no entry
+//! - `FAKE_CRASH_GATE=<path>` (AUTO-1b): `crash` waits (up to 120 s) for that
+//!   file after `turn.started`, then crashes as usual; unset: no wait
 //!
 //! `--version` prints `codex-cli 0.0.0-fake` (thoth doctor); no switch.
 //!
@@ -105,7 +113,7 @@
 //! `resume`, exactly as codex-cli 0.154 does.
 //!
 //! Reviewer scenarios (`review_pass` | `review_reject` | `review_bad` |
-//! `review_uncited`) need `--output-schema <file>` and `-o <file>`, the way
+//! `review_uncited` | `review_delivery`, RVI-1, see `support/delivery_review.rs`) need `--output-schema <file>` and `-o <file>`, the way
 //! thoth launches a codex reviewer (scope §2.4, E3b). The fake reads the
 //! input thoth put in `.agent/review-input/` (with a `cat` item on the
 //! stream, as the real reviewer would), makes its final message the review
@@ -125,6 +133,11 @@ mod source_check;
 // as the final message to `-o` under a strict `--output-schema`.
 #[path = "support/review_fix.rs"]
 mod review_fix;
+// RVI-1: `review_delivery` reads packet.md, the evidence files and the
+// delivered result.json, judges from them and records what it read in
+// `FAKE_REVIEW_CAPTURE`; the same in fake-agy.
+#[path = "support/delivery_review.rs"]
+mod delivery_review;
 
 use std::io::Write;
 
@@ -146,6 +159,16 @@ fn record_attempt(resumed: bool, id: &str) -> usize {
         .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or(1)
         .max(1)
+}
+
+/// AUTO-1b: entry `launch` (from 1) of `FAKE_SCENARIO_SEQUENCE`, the last one
+/// past its end; `None` when it is unset or holds no entry. The same rule as
+/// fake-claude's, so fakes sharing one `FAKE_ATTEMPTS_FILE` share the list.
+fn sequence_scenario(launch: usize) -> Option<String> {
+    let list = std::env::var("FAKE_SCENARIO_SEQUENCE").ok()?;
+    let entries: Vec<&str> = list.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+    let last = entries.last()?;
+    Some(entries.get(launch.saturating_sub(1)).unwrap_or(last).to_string())
 }
 
 /// FC-2: `FAKE_FIRST_SCENARIO` for launches 1 to `FAKE_FIRST_TIMES` (default
@@ -643,6 +666,28 @@ fn review(scenario: &str, args: &[String], prompt: &str, thread_id: &str) -> ! {
         std::process::exit(0);
     }
 
+    if scenario == delivery_review::SCENARIO {
+        // RVI-1: every input file read with a `cat` on the stream.
+        let mut item = 0;
+        let input = delivery_review::read_with(|path| {
+            let text = std::fs::read_to_string(path).ok()?;
+            item += 1;
+            command(item, &format!("cat {}", path.display().to_string().replace('\\', "/")), &text, 0);
+            Some(text)
+        });
+        let (doc, capture) = delivery_review::judge(prompt, &input);
+        delivery_review::record(&capture);
+        let last = review_fix::with_empty_edits(doc, prompt).to_string();
+        emit(&agent_message(item + 1, &last));
+        if let Err(e) = std::fs::write(&out_path, &last) {
+            eprintln!("fake-codex: writing {out_path} failed: {e}");
+            std::process::exit(1);
+        }
+        write_rollout(thread_id);
+        emit(&turn_completed(326));
+        std::process::exit(0);
+    }
+
     let input = std::path::Path::new(".agent").join("review-input");
     let Ok(packet) = std::fs::read_to_string(input.join("packet.md")) else {
         fail_turn(&serde_json::json!({"type": "error", "status": 500, "error": {
@@ -718,6 +763,7 @@ fn review(scenario: &str, args: &[String], prompt: &str, thread_id: &str) -> ! {
             },
         },
     });
+    let doc = review_fix::with_empty_edits(doc, prompt);
     let last = if scenario == "review_bad" {
         "{not json".to_string()
     } else {
@@ -1145,7 +1191,7 @@ fn main() {
     let launch = record_attempt(resume_thread.is_some(), &thread_id);
     // `FAKE_CODEX_SCENARIO` wins over `FAKE_SCENARIO`, so one test can run
     // codex and claude in different scenarios.
-    let scenario = first_scenario(launch).unwrap_or_else(|| {
+    let scenario = sequence_scenario(launch).or_else(|| first_scenario(launch)).unwrap_or_else(|| {
         std::env::var("FAKE_CODEX_SCENARIO")
             .or_else(|_| std::env::var("FAKE_SCENARIO"))
             .unwrap_or_else(|_| "ok".to_string())
@@ -1253,7 +1299,7 @@ fn main() {
             emit(&turn_completed(99));
             std::process::exit(0);
         }
-        "review_pass" | "review_reject" | "review_bad" | "review_uncited" | "source_check" | "source_check_bad" => {
+        "review_pass" | "review_reject" | "review_bad" | "review_uncited" | "review_delivery" | "source_check" | "source_check_bad" => {
             review(&scenario, &args, &prompt, &thread_id)
         }
         "review_fix" | "fix_confirm_approve" | "fix_confirm_revise" | "fix_confirm_bad" => {
@@ -1281,6 +1327,13 @@ fn main() {
         }
         "crash" => {
             emit(&turn_started());
+            if let Some(gate) = std::env::var_os("FAKE_CRASH_GATE") {
+                let gate = std::path::PathBuf::from(gate);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !gate.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
             std::process::exit(137);
         }
         "slow" => {

@@ -93,6 +93,23 @@ pub fn confirm_document(edits: &[serde_json::Value], revise: bool) -> serde_json
     serde_json::json!({"verdict": if revise { "REVISE" } else { "APPROVE" }, "edits": answers})
 }
 
+/// The heading thoth's edit-mode prompt section starts with.
+const EDIT_SECTION: &str = "## Attaching a fix (edit mode)";
+
+/// RFIX-2: a code task's review is in edit mode by default, whose document
+/// must carry an `edits` array. The plain reviewer scenarios add an empty
+/// one when the prompt carries the edit-mode section, so they keep their
+/// verdicts; a document that already has `edits` is left as it is.
+#[allow(dead_code)]
+pub fn with_empty_edits(mut doc: serde_json::Value, prompt: &str) -> serde_json::Value {
+    if prompt.contains(EDIT_SECTION) {
+        if let Some(o) = doc.as_object_mut() {
+            o.entry("edits").or_insert_with(|| serde_json::json!([]));
+        }
+    }
+    doc
+}
+
 /// `FAKE_CONFIRM_DOC`, when set, replaces the confirmer's document (raw
 /// JSON), for the coverage and consistency cases.
 pub fn confirm_override() -> Option<serde_json::Value> {

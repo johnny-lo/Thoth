@@ -958,8 +958,10 @@ pub struct Attribution<'a> {
 }
 
 /// `record_diff`, with `protected_changes` attributed to the task (see
-/// `Attribution`). Everything else in the detail, the blob and the label is
-/// still `from..to`. Without an attribution this is `record_diff`.
+/// `Attribution`). SMALL-9c: when the integration tip is used, the file
+/// list, stat, patch and label are attributed to the worker as well (see
+/// `attributed_view`); otherwise they are `from..to`. Without an attribution
+/// this is `record_diff`.
 pub fn record_diff_attributed(
     conn: &Connection,
     ctx: &EvidenceContext<'_>,
@@ -1005,9 +1007,6 @@ fn record_diff_labelled(
     attribution: Option<&Attribution<'_>>,
     label_prefix: &str,
 ) -> Result<String> {
-    let stat = crate::worktree::diff_stat(git_dir, from, to)?;
-    let files = crate::worktree::diff_name_only(git_dir, from, to)?;
-    let patch = crate::worktree::diff_patch(git_dir, from, to)?;
     // P7-2: the existing test files and check inputs this diff modified or
     // deleted (and the added files named like a check word), worked out here
     // by the control plane so neither the worker nor the reviewer has to be
@@ -1055,22 +1054,40 @@ fn record_diff_labelled(
     let protected_changes: Vec<serde_json::Value> = listed.iter().map(|c| c.to_json()).collect();
     let inline_test_errors: Vec<serde_json::Value> =
         inline_errors.iter().map(|e| e.to_json()).collect();
-    let (sha, bytes, path) = crate::blobs::put_bytes(ctx.paths, ctx.repo_id, &patch)?;
+    // SMALL-9c: the diff itself is attributed to the worker too. Any git
+    // failure in the attributed view falls back to today's whole diff from
+    // the run's base (list more, never fewer).
+    let view = match tip_used {
+        Some(tip) => attributed_view(git_dir, from, to, tip, base).ok(),
+        None => None,
+    };
+    let view = match view {
+        Some(v) => v,
+        None => DiffView::from_run_base(git_dir, from, to)?,
+    };
+    let (sha, bytes, path) = crate::blobs::put_bytes(ctx.paths, ctx.repo_id, &view.patch)?;
     #[allow(unused_mut)]
     let mut detail = serde_json::json!({
-        "from_commit": from,
+        "from_commit": view.start,
         "to_commit": to,
-        "files_changed": files,
-        "touches_tests": touches_tests(&files),
+        "run_base_commit": from,
+        "diff_from_rule": view.rule,
+        "integrated_files": view.integrated,
+        "files_changed": view.files,
+        "touches_tests": touches_tests(&view.files),
         "protected_changes": protected_changes,
         "inline_test_errors": inline_test_errors,
-        "stat": stat,
+        "stat": view.stat,
         "protected_base": base,
         "integration_tip": tip_used,
     });
     #[cfg(debug_assertions)]
     test_pre_lean(&mut detail);
-    let label = format!("{label_prefix}git diff {}..{}", short_sha(from), short_sha(to));
+    let label = format!(
+        "{label_prefix}git diff {}..{}",
+        short_sha(&view.start),
+        short_sha(to)
+    );
     insert_row(
         conn,
         ctx,
@@ -1081,6 +1098,112 @@ fn record_diff_labelled(
         Some(path),
         detail,
     )
+}
+
+/// SMALL-9c: `diff_from_rule` when the diff starts at the merge base of the
+/// candidate and the main worktree's HEAD.
+pub const DIFF_FROM_MERGE_BASE: &str = "merge_base";
+/// SMALL-9c: `diff_from_rule` when the diff starts at the run's base.
+pub const DIFF_FROM_RUN_BASE: &str = "run_base";
+
+/// SMALL-9c: what a diff row shows: where it starts, which paths the main
+/// line brought in and are left out, and the file list, stat and patch from
+/// that start without them.
+struct DiffView {
+    start: String,
+    rule: &'static str,
+    integrated: Vec<String>,
+    files: Vec<String>,
+    stat: String,
+    patch: Vec<u8>,
+}
+
+impl DiffView {
+    /// Today's diff: the run's base to the candidate, nothing left out.
+    fn from_run_base(git_dir: &Path, from: &str, to: &str) -> Result<Self> {
+        Ok(DiffView {
+            start: from.to_string(),
+            rule: DIFF_FROM_RUN_BASE,
+            integrated: Vec::new(),
+            stat: crate::worktree::diff_stat(git_dir, from, to)?,
+            files: crate::worktree::diff_name_only(git_dir, from, to)?,
+            patch: crate::worktree::diff_patch(git_dir, from, to)?,
+        })
+    }
+}
+
+/// SMALL-9c: the diff attributed to the worker, given a usable integration
+/// tip (the main worktree's HEAD, which contains the task's base).
+///
+/// The start is the merge base of the candidate and the tip when that is not
+/// the run's base and contains it (a first-round worker merged or
+/// fast-forwarded to the main line); otherwise the run's base. Left out are
+/// the paths changed from the run's base to the candidate whose tree entry at
+/// the candidate equals the tip's (object, type and mode; both absent counts
+/// as equal) and that the main line changed after the task started (task's
+/// base to tip), so a path the worker put back to its base content is never
+/// left out. A path that is a directory at the tip or the candidate is
+/// judged by its own tree object (AC7), never by the paths changed below it.
+/// Any git error is returned, and the caller falls back to the unattributed
+/// diff; so is a left-out path that would hide, below it, a changed path
+/// that is not left out (a path filter cannot leave out a path without what
+/// is below it).
+fn attributed_view(git_dir: &Path, from: &str, to: &str, tip: &str, task_base: &str) -> Result<DiffView> {
+    use std::collections::BTreeSet;
+    let (start, rule) = match crate::worktree::merge_base(git_dir, to, tip)? {
+        Some(mb) if mb != from && crate::worktree::is_ancestor(git_dir, from, &mb)? => {
+            (mb, DIFF_FROM_MERGE_BASE)
+        }
+        _ => (from.to_string(), DIFF_FROM_RUN_BASE),
+    };
+    // Paths are compared as git's raw bytes, so a path that is not UTF-8
+    // never matches one that holds U+FFFD. Both lists hold directories whose
+    // tree differs too, so a path that is a file on one side and a directory
+    // on the other is compared as the entry it is at the tip and at the
+    // candidate.
+    let differs_from_tip: BTreeSet<Vec<u8>> =
+        crate::worktree::changed_entries(git_dir, tip, to)?.into_iter().collect();
+    let main_changed: BTreeSet<Vec<u8>> =
+        crate::worktree::changed_entries(git_dir, task_base, tip)?.into_iter().collect();
+    let integrated_bytes: BTreeSet<Vec<u8>> = crate::worktree::changed_paths(git_dir, from, to)?
+        .into_iter()
+        .filter(|p| !differs_from_tip.contains(p) && main_changed.contains(p))
+        // A path whose bytes are not UTF-8 cannot be named back to git
+        // exactly, so it stays in the diff; a valid UTF-8 path, U+FFFD in it
+        // or not, is left out like any other.
+        .filter(|p| std::str::from_utf8(p).is_ok())
+        .collect();
+    // A pathspec that leaves out a path leaves out everything below it too.
+    // When a changed path from the start that is not left out lies below a
+    // left-out one, the filter cannot be expressed: list more, never fewer.
+    if !integrated_bytes.is_empty() {
+        for p in crate::worktree::changed_paths(git_dir, &start, to)? {
+            if integrated_bytes.contains(&p) {
+                continue;
+            }
+            if let Some(hidden_by) = integrated_bytes.iter().find(|i| {
+                p.len() > i.len() && p.starts_with(i) && p[i.len()] == b'/'
+            }) {
+                anyhow::bail!(
+                    "leaving out {} would also hide {}",
+                    String::from_utf8_lossy(hidden_by),
+                    String::from_utf8_lossy(&p)
+                );
+            }
+        }
+    }
+    let integrated: Vec<String> = integrated_bytes
+        .into_iter()
+        .filter_map(|p| String::from_utf8(p).ok())
+        .collect();
+    Ok(DiffView {
+        stat: crate::worktree::diff_stat_excluding(git_dir, &start, to, &integrated)?,
+        files: crate::worktree::diff_name_only_excluding(git_dir, &start, to, &integrated)?,
+        patch: crate::worktree::diff_patch_excluding(git_dir, &start, to, &integrated)?,
+        start,
+        rule,
+        integrated,
+    })
 }
 
 /// Test seam (GATE-1), debug builds only, so a release build has no such
@@ -2488,11 +2611,14 @@ mod tests {
             Some(&Attribution { task_base: &c1, integration_tip: Some(&c2) }),
         );
         assert_eq!(detail["protected_changes"], serde_json::json!([]));
-        assert_eq!(
-            detail["files_changed"],
-            serde_json::json!(["src/own.rs", "tests/pre_test.rs"])
-        );
-        assert_eq!(detail["touches_tests"], true);
+        // SMALL-9c: the diff starts at main's tip and leaves out the test
+        // main changed, so only the task's own file is listed
+        assert_eq!(detail["files_changed"], serde_json::json!(["src/own.rs"]));
+        assert_eq!(detail["integrated_files"], serde_json::json!(["tests/pre_test.rs"]));
+        assert_eq!(detail["diff_from_rule"], DIFF_FROM_MERGE_BASE);
+        assert_eq!(detail["from_commit"], c2);
+        assert_eq!(detail["run_base_commit"], c1);
+        assert_eq!(detail["touches_tests"], false);
         assert_eq!(detail["integration_tip"], c2);
     }
 

@@ -25,7 +25,10 @@ fn config_list_and_get_have_contract_and_are_read_only() {
     let before: Vec<_> = fs::read_dir(home.path()).unwrap().collect();
     let list = json_output(command(&home).args(["config", "list", "--json"]).assert());
     let settings = list["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 16);
+    // AUTO-1a: no hard-coded total (verify-slots was added last); every key
+    // is listed once.
+    let keys: std::collections::BTreeSet<&str> = settings.iter().map(|s| s["key"].as_str().unwrap()).collect();
+    assert_eq!(keys.len(), settings.len());
     assert_eq!(settings[0]["key"], "live-quota");
     assert_eq!(settings[1]["key"], "scores-auto-refresh");
     assert_eq!(settings[2]["key"], "require-reason");

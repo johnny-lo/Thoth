@@ -73,6 +73,16 @@ pub fn run(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> {
     let known_models = crate::model_list::known_models_text(&gconn, &profile);
     crate::adapter::for_harness(&profile.harness).check_model(&profile.profile_id, &run.model, &known_models)?;
     let model_warning = crate::model_list::check_launch(&gconn, &profile, &run.model, None)?;
+    // SMALL-9a: the quota reserve, read before the write transaction below
+    // and refused inside it, after the refusals there.
+    let reserve = crate::commands::quota_reserve::launch_gate(
+        crate::commands::settings::quota_reserve_percent(&paths.home),
+        &profile.profile_id,
+        role::IMPLEMENTER,
+        &run.task_id,
+        crate::commands::usage::ranked_candidates(paths, role::IMPLEMENTER, Some(&run.task_id), Some(&run.model))
+            .as_deref(),
+    );
 
     // Sets `runs.status` back to `queued` while keeping `started_at` and
     // `harness_session_id` intact - that pair of untouched columns is exactly
@@ -140,6 +150,13 @@ pub fn run(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> {
             run.task_id
         );
     }
+    let reserve_note = match reserve {
+        Ok(note) => note,
+        Err(e) => {
+            drop(tx); // explicit: rolls back, though nothing has been written yet
+            return Err(e);
+        }
+    };
     state::prepare_resume(&tx, &run_id)?;
     tx.commit()?;
     // The detached runner inherits this process's environment, so the binary
@@ -162,6 +179,7 @@ pub fn run(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> {
     // success.
     let mut warnings: Vec<String> = Vec::new();
     warnings.extend(model_warning);
+    warnings.extend(reserve_note);
 
     if state::set_runner_pid(&conn, &run_id, runner_pid as i64).is_err() {
         std::thread::sleep(std::time::Duration::from_millis(500));

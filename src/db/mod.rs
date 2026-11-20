@@ -1,3 +1,4 @@
+pub mod checks;
 pub mod global;
 pub mod migrations;
 pub mod state;

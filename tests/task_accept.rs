@@ -417,3 +417,92 @@ fn an_accepted_run_has_no_verdict_in_records_or_models() {
     assert!(docs.get("pass").is_none(), "{docs}");
     assert!(docs.get("reject").is_none(), "{docs}");
 }
+
+/// RFIX-2: a `task_type` task delivered by the fake's `ok` scenario, read
+/// through the CLI only: (task, implementer run).
+fn delivered_cli(f: &Fixture, task_type: &str) -> (String, String) {
+    let (task_id, _) = f.create_task(&spec(task_type));
+    let d = f.dispatch(&task_id, "claude-b", "ok", &[]);
+    let run_id = d["run_id"].as_str().unwrap().to_string();
+    let w = json_ok(f, &["wait", "--run", &run_id, "--timeout", "120s", "--json"]);
+    assert_eq!(w["timed_out"], false, "{w}");
+    assert_eq!(w["status"], "completed", "{w}");
+    assert_eq!(w["task_status"], "in_review", "{w}");
+    (task_id, run_id)
+}
+
+/// RFIX-2 AC7 (b): a docs or review task whose `review start --edit` left a
+/// pending fix refuses `task accept`, naming `thoth verify EDIT_RUN` and then
+/// `thoth review confirm`; the task stays in_review with no task_accepted.
+#[test]
+fn rfix2_task_accept_refuses_a_document_task_with_a_pending_fix() {
+    std::thread::scope(|scope| {
+        for task_type in ["docs", "review"] {
+            scope.spawn(move || {
+                let f = setup();
+                f.add_profile("claude-a");
+                // a file the fix edits, kept byte for byte by git
+                let repo = f.repo_path();
+                fs::write(repo.join(".gitattributes"), "* -text\n").unwrap();
+                fs::write(repo.join("notes.txt"), "one\n").unwrap();
+                common::git(&repo, &["add", "-A"]);
+                common::git(&repo, &["commit", "-q", "-m", "notes"]);
+                let (task_id, _) = delivered_cli(&f, task_type);
+                let code = json_ok(&f, &["evidence", "list", &task_id, "--json"])["evidence"][0]["code"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let document = serde_json::json!({"document": {
+                    "verdict": "REJECT",
+                    "findings": {"criteria": [{"id": "AC1", "verdict": "unmet", "evidence": [code], "note": "the wording is off", "fix_size": "S", "category": "docs"}], "extra_findings": []},
+                    "edits": [{"path": "notes.txt", "old": "one\n", "new": "one, fixed\n", "criterion": "AC1", "reason": "fixes the wording"}],
+                }});
+                let plan = f.home_path().join("plan.json");
+                fs::write(&plan, document.to_string()).unwrap();
+                let mut c = f.cmd();
+                c.env("FAKE_SCENARIO", "review_fix")
+                    .env("FAKE_TASK_ID", &task_id)
+                    .env("FAKE_FIX_PLAN", &plan)
+                    .args(["review", "start", &task_id, "--profile", "claude-a", "--model", "opus", "--effort", "medium", "--edit", "--reason", "R", "--json"]);
+                let started: Value = serde_json::from_slice(&f.run_ok(c, "review start --edit")).unwrap();
+                assert_eq!(started["mode"], "edit", "{started}");
+                let edit_run = started["run_id"].as_str().unwrap().to_string();
+                let w = json_ok(&f, &["wait", "--run", &edit_run, "--timeout", "120s", "--json"]);
+                assert_eq!(w["timed_out"], false, "{w}");
+                let shown = json_ok(&f, &["review", "show", &task_id, "--json"]);
+                assert_eq!(shown["pending_fix"], true, "{task_type}: {shown}\n{}", f.explain_task(&task_id));
+
+                let status_before = json_ok(&f, &["status", &task_id, "--json"]);
+                let events_before = f.events_json(&task_id).len();
+                let err = refused(&f, &["task", "accept", &task_id, "--reason", "looks fine", "--json"]);
+                assert!(err.contains("pending fix"), "{err}");
+                let verify_at = err.find(&format!("thoth verify {edit_run}")).unwrap_or_else(|| panic!("{err}"));
+                let confirm_at = err.find(&format!("thoth review confirm {task_id}")).unwrap_or_else(|| panic!("{err}"));
+                assert!(verify_at < confirm_at, "verify comes first: {err}");
+                let status_after = json_ok(&f, &["status", &task_id, "--json"]);
+                assert_eq!(status_after["status"], "in_review");
+                assert_eq!(status_after["runs"].as_array().unwrap().len(), status_before["runs"].as_array().unwrap().len());
+                let events = f.events_json(&task_id);
+                assert_eq!(events.len(), events_before, "the refusal records nothing");
+                assert!(!events.iter().any(|e| e["type"] == "task_accepted"));
+            });
+        }
+    });
+}
+
+/// RFIX-2 AC7 (b): a delivered document task without a pending fix is
+/// accepted as before.
+#[test]
+fn rfix2_task_accept_still_takes_a_document_task_without_a_pending_fix() {
+    let f = setup();
+    let (task_id, run_id) = delivered_cli(&f, "review");
+    let shown = json_ok(&f, &["review", "show", &task_id, "--json"]);
+    assert_eq!(shown["pending_fix"], false, "{shown}");
+    let a = json_ok(&f, &["task", "accept", &task_id, "--reason", "read and used", "--json"]);
+    assert_eq!(a["status"], "accepted", "{a}");
+    assert_eq!(a["run_id"], run_id.as_str());
+    let events = f.events_json(&task_id);
+    let accepted: Vec<&Value> = events.iter().filter(|e| e["type"] == "task_accepted").collect();
+    assert_eq!(accepted.len(), 1, "{events:#?}");
+    assert_eq!(accepted[0]["detail"]["task_type"], "review");
+}

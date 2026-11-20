@@ -125,6 +125,10 @@ pub struct Newest {
     /// The completed edit list (`spec_edits::AppliedEdit` objects), `[]`
     /// when none.
     pub edits: serde_json::Value,
+    /// SR-4: the edits Thoth refused (`spec_edits::RefusedEdit` objects:
+    /// `index`, `field`, `reason`), `[]` when none and for an event written
+    /// before SR-4.
+    pub refused_edits: serde_json::Value,
     /// The per-criterion summary the event carries (`id`, `verdict`,
     /// `findings` count), `[]` when the event has none. On an author's check
     /// this is the only per-criterion record: the author's document has no
@@ -178,6 +182,11 @@ fn decode(e: &state::EventRow) -> Option<Newest> {
         proposed_spec: text("proposed_spec"),
         edits: d
             .get("edits")
+            .filter(|v| v.is_array())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        refused_edits: d
+            .get("refused_edits")
             .filter(|v| v.is_array())
             .cloned()
             .unwrap_or_else(|| serde_json::json!([])),
@@ -277,6 +286,8 @@ pub fn required(conn: &Connection, task: &state::Task) -> Result<bool> {
 pub struct EditsSummary {
     pub edits: serde_json::Value,
     pub edit_count: usize,
+    /// SR-4: the edits refused one by one, `[]` without.
+    pub refused_edits: serde_json::Value,
     pub proposed_spec: Option<String>,
     pub proposed_sha256: Option<String>,
     pub bytes_before: usize,
@@ -289,6 +300,7 @@ impl EditsSummary {
         Self {
             edits: serde_json::json!([]),
             edit_count: 0,
+            refused_edits: serde_json::json!([]),
             proposed_spec: None,
             proposed_sha256: None,
             bytes_before: spec.len(),
@@ -296,14 +308,17 @@ impl EditsSummary {
         }
     }
 
+    /// SR-4: with every edit refused there is no proposed spec, and the
+    /// sizes are the stored spec's, as without edits.
     fn from_applied(spec: &str, applied: &spec_edits::Applied) -> Self {
         Self {
             edits: serde_json::to_value(&applied.edits).unwrap_or_else(|_| serde_json::json!([])),
             edit_count: applied.edits.len(),
-            proposed_spec: Some(applied.proposed.clone()),
-            proposed_sha256: Some(fingerprint(&applied.proposed)),
+            refused_edits: serde_json::to_value(&applied.refused).unwrap_or_else(|_| serde_json::json!([])),
+            proposed_spec: applied.proposed.clone(),
+            proposed_sha256: applied.proposed.as_deref().map(fingerprint),
             bytes_before: spec.len(),
-            bytes_after: applied.proposed.len(),
+            bytes_after: applied.proposed.as_ref().map(String::len).unwrap_or(spec.len()),
         }
     }
 
@@ -313,6 +328,9 @@ impl EditsSummary {
         Self {
             edits: n.edits.clone(),
             edit_count: n.edit_count,
+            // The author answers the applied edits only; the refused ones
+            // stay on the edit review.
+            refused_edits: serde_json::json!([]),
             proposed_spec: n.proposed_spec.clone(),
             proposed_sha256: n.proposed_sha256.clone(),
             bytes_before,
@@ -362,6 +380,7 @@ fn review_detail(e: &ReviewEvent<'_>) -> serde_json::Value {
         "mode": e.mode,
         "edits": e.edits.edits,
         "edit_count": e.edits.edit_count,
+        "refused_edits": e.edits.refused_edits,
         "proposed_spec": e.edits.proposed_spec,
         "proposed_sha256": e.edits.proposed_sha256,
         "bytes_before": e.edits.bytes_before,
@@ -405,6 +424,8 @@ fn test_pre_sr3(d: &mut serde_json::Value) {
             "confirms_spec_review_id",
             "spec_sha256_before",
             "applied",
+            // SR-4's key too: an event this old has none
+            "refused_edits",
         ] {
             o.remove(k);
         }
@@ -665,6 +686,7 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, proposed_out: Option<&Path>
             "mode": n.mode,
             "edit_count": n.edit_count,
             "proposed_sha256": n.proposed_sha256,
+            "refused_edits": n.refused_edits,
         }),
     };
     let v = serde_json::json!({
@@ -781,6 +803,16 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, proposed_out: Option<&Path>
             }
         }
         lines.push(line);
+    }
+    // SR-4: one line per edit Thoth refused. The reason quotes the anchor,
+    // never a cut of the spec, and the whole text is masked on the way out.
+    for r in n.refused_edits.as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  refused edit {}  {}  {}",
+            r["index"].as_u64().unwrap_or(0),
+            r["field"].as_str().unwrap_or(""),
+            r["reason"].as_str().unwrap_or("")
+        ));
     }
     if n.mode == ReviewMode::Edit.as_str() && st.pending_edits {
         lines.push(format!(
@@ -911,7 +943,7 @@ pub struct StartArgs<'a> {
     /// A profile id (`auto` is refused, RJ-1).
     pub profile: &'a str,
     pub model: Option<&'a str>,
-    pub timeout_seconds: u64,
+    pub timeout_seconds: Option<u64>,
     pub effort: Option<&'a str>,
     pub reason: Option<&'a str>,
     /// SR-3: edit mode.
@@ -944,7 +976,7 @@ pub struct ConfirmArgs<'a> {
     pub task: &'a str,
     pub profile: &'a str,
     pub model: Option<&'a str>,
-    pub timeout_seconds: u64,
+    pub timeout_seconds: Option<u64>,
     pub effort: Option<&'a str>,
     pub reason: Option<&'a str>,
     pub json: bool,
@@ -976,7 +1008,8 @@ struct LaunchArgs<'a> {
     task: &'a str,
     profile: &'a str,
     model: Option<&'a str>,
-    timeout_seconds: u64,
+    /// `--timeout`; `None` takes the default for the effort sent (SMALL-9b).
+    timeout_seconds: Option<u64>,
     effort: Option<&'a str>,
     reason: Option<&'a str>,
     json: bool,
@@ -1127,21 +1160,34 @@ fn launch(paths: &Paths, cwd: &Path, args: LaunchArgs<'_>) -> Result<i32> {
     )?;
     let require_reason = crate::commands::settings::require_reason(&paths.home);
     auto_pick::require_reason_gate(&task_id, command, reason.as_deref(), require_reason)?;
-    // FC-1 (H4): read only to see whether the profile has recovered; an
-    // unreadable ranking does not stop the spec review.
-    let recovered = crate::commands::usage::ranked_candidates(
+    // FC-1 (H4): read to see whether the profile has recovered; an
+    // unreadable ranking does not stop the spec review. SMALL-9a: the quota
+    // reserve refuses here, before the login check starts the CLI.
+    let ranked = crate::commands::usage::ranked_candidates(
         paths,
         role::REVIEWER,
         Some(&task_id),
         Some(&choice.model),
-    )
-    .unwrap_or_default()
-    .iter()
-    .find(|c| c.profile.profile_id == profile.profile_id)
-    .is_some_and(|c| c.recovered && c.profile.status == "rate_limited");
+    );
+    let reserve_note = crate::commands::quota_reserve::launch_gate(
+        crate::commands::settings::quota_reserve_percent(&paths.home),
+        &profile.profile_id,
+        role::REVIEWER,
+        &task_id,
+        ranked.as_deref(),
+    )?;
+    let recovered = ranked
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.profile.profile_id == profile.profile_id)
+        .is_some_and(|c| c.recovered && c.profile.status == "rate_limited");
     let allowed_tools =
         adapter.reviewer_allowed_tools(crate::commands::review::REVIEWER_ALLOWED_TOOLS, false);
     let launch = auto_pick::launch_settings(&choice, &profile);
+    // SMALL-9b: the effort sent picks the limit.
+    let timeout_seconds = args
+        .timeout_seconds
+        .unwrap_or_else(|| crate::adapter::effort::default_timeout_secs(launch.effort.as_deref()));
     let run_spec = crate::adapter::effort::with_launch(&task.spec, &launch)?;
     let (_probed, auth) = crate::commands::profile::probe_auth(paths, &profile.profile_id)?;
     if !auth.logged_in {
@@ -1223,7 +1269,7 @@ fn launch(paths: &Paths, cwd: &Path, args: LaunchArgs<'_>) -> Result<i32> {
         worker_pid: None,
         heartbeat_at: None,
         cancel_requested: 0,
-        timeout_seconds: args.timeout_seconds as i64,
+        timeout_seconds: timeout_seconds as i64,
         run_dir: run_dir.display().to_string(),
         error_text: None,
         harness_bin: Some(crate::adapter::harness_bin(&profile.harness)),
@@ -1289,7 +1335,7 @@ fn launch(paths: &Paths, cwd: &Path, args: LaunchArgs<'_>) -> Result<i32> {
         "profile": profile.profile_id,
         "model": choice.model,
         "allowed_tools": allowed_tools,
-        "timeout_seconds": args.timeout_seconds,
+        "timeout_seconds": timeout_seconds,
         "mode": mode.as_str(),
     });
     if let (Some(edit), Some(o)) = (&edit_review, started.as_object_mut()) {
@@ -1333,6 +1379,7 @@ fn launch(paths: &Paths, cwd: &Path, args: LaunchArgs<'_>) -> Result<i32> {
 
     let mut warnings: Vec<String> = Vec::new();
     warnings.extend(model_warning);
+    warnings.extend(reserve_note);
     warnings.extend(ensured.warning);
     if let Some(note) = launch.effort_note.clone() {
         warnings.push(note);
@@ -1422,7 +1469,7 @@ fn launch(paths: &Paths, cwd: &Path, args: LaunchArgs<'_>) -> Result<i32> {
         &v,
         &format!(
             "{what} {run_id} started on {} (task {task_id}, spec sha256 {}, commit {}, profile \
-             {}, runner pid {runner_pid})\nthe task stays {}; block on it with `thoth wait --run \
+             {}, runner pid {runner_pid}, timeout {timeout_seconds}s)\nthe task stays {}; block on it with `thoth wait --run \
              {run_id}`, then `thoth spec review show {task_id}`",
             choice.model,
             short(&spec_sha256),
@@ -1587,17 +1634,21 @@ pub fn ingest_run(
     let summary = if edits.is_empty() {
         EditsSummary::none(&task.spec)
     } else {
+        // SR-4: an edit that breaks a rule is refused alone; only a proposal
+        // that is not a spec refuses the review here.
         let applied = match spec_edits::apply_edits(&task.spec, &edits, &expected) {
             Ok(a) => a,
             Err(e) => return invalid("edits", e.to_string(), None),
         };
-        match crate::commands::spec_lint::for_repo(conn, root, &applied.proposed) {
-            Ok(report) => {
-                if let Some(refusal) = report.refusal() {
-                    return invalid("lint", format!("the proposed spec is refused: {refusal}"), None);
+        if let Some(proposed) = &applied.proposed {
+            match crate::commands::spec_lint::for_repo(conn, root, proposed) {
+                Ok(report) => {
+                    if let Some(refusal) = report.refusal() {
+                        return invalid("lint", format!("the proposed spec is refused: {refusal}"), None);
+                    }
                 }
+                Err(e) => return invalid("lint", format!("linting the proposed spec failed: {e:#}"), None),
             }
-            Err(e) => return invalid("lint", format!("linting the proposed spec failed: {e:#}"), None),
         }
         EditsSummary::from_applied(&task.spec, &applied)
     };
@@ -1648,11 +1699,15 @@ pub fn ingest_run(
     if let Err(e) = written {
         return invalid("write", format!("recording the spec review failed: {e:#}"), None);
     }
-    let edited = if summary.edit_count > 0 {
+    let mut edited = if summary.edit_count > 0 {
         format!(" with {} edit(s)", summary.edit_count)
     } else {
         String::new()
     };
+    let refused = summary.refused_edits.as_array().map(Vec::len).unwrap_or(0);
+    if refused > 0 {
+        edited.push_str(&format!(", {refused} edit(s) refused"));
+    }
     // A review writes no `result_ingested`, so its run note keeps this text.
     let note = format!("{} over {} criteria{edited}", verdict.as_str(), doc.criteria.len());
     SpecReviewIngest {
@@ -1700,7 +1755,15 @@ fn ingest_confirm(
         }
         Err(e) => return invalid("superseded", format!("reading the edit review {confirms} failed: {e:#}")),
     };
-    if let Err(e) = spec_edits::check_confirm_coverage(&doc, edit_review.edit_count) {
+    // SR-4: the applied edits keep the reviewer's indices, gaps included.
+    let indices: Vec<usize> = edit_review
+        .edits
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["index"].as_u64().map(|i| i as usize))
+        .collect();
+    if let Err(e) = spec_edits::check_confirm_indices(&doc, &indices) {
         return invalid("coverage", e.to_string());
     }
     let Some(proposed) = edit_review.proposed_spec.clone() else {

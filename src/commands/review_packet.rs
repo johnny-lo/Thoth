@@ -12,7 +12,9 @@
 //! after its whole output was masked, and diffs are masked whole.
 //!
 //! The worker's own `summary` is left out on purpose: the reviewer judges from
-//! evidence, not from the worker's prose. Diffs are shown whole, never cut at
+//! evidence, not from the worker's prose. (RVI-1: a file-reading reviewer
+//! gets the whole delivery beside the packet, in `result.json`, for criteria
+//! about what the delivery contains; see `write_review_input`.) Diffs are shown whole, never cut at
 //! `evidence show`'s 4000-byte default (a cut diff hid part of a change from a
 //! reviewer during the trials).
 
@@ -128,18 +130,88 @@ pub(crate) fn packet_markdown(
     Ok((text, rows, redactions))
 }
 
+/// RVI-1 (AC3): how a review-input evidence file of a check with a recorded
+/// execution error begins; the error and `]` follow on the same line.
+const EXECUTION_ERROR_FILE_PREFIX: &str =
+    "[thoth: this check recorded an execution error, so it did not complete cleanly whatever its exit code or output; its whole stored output follows this line. Error: ";
+
+/// RVI-1 (AC3): the execution error `verify` recorded for one of its rows
+/// (`verify:` and `verify@base:`, `detail.event` `control_plane_rerun`): a
+/// refusal, a spawn failure, a timeout, output left incomplete by a
+/// descendant holding the pipe, or no exit code. None for every other row,
+/// and for a check that completed. A hook row's `detail.error` is the failed
+/// command's own output and is shown as such, not here.
+fn execution_error(row: &state::Evidence) -> Option<String> {
+    if row.kind != "command" {
+        return None;
+    }
+    let detail: Value = serde_json::from_str(&row.detail).ok()?;
+    if detail["event"] != "control_plane_rerun" {
+        return None;
+    }
+    detail["error"]
+        .as_str()
+        .filter(|e| !e.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// SMALL-9c (AC3): the line under a diff's heading: its start and end
+/// commits, which rule chose the start (a row recorded before SMALL-9c has
+/// none and started at the run's base), and the files the main line brought
+/// in that are left out of it. Ends with a blank line.
+fn diff_origin_line(d: &Value) -> String {
+    let short = |v: &Value| v.as_str().map(crate::evidence::short_sha).unwrap_or_else(|| "-".into());
+    let rule = match d["diff_from_rule"].as_str() {
+        Some(crate::evidence::DIFF_FROM_MERGE_BASE) => "merge base with the main worktree",
+        _ => "the run's base",
+    };
+    let left_out: Vec<String> = d["integrated_files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().map(one_line))
+        .collect();
+    let left_out = if left_out.is_empty() {
+        "left out: none".to_string()
+    } else {
+        format!(
+            "{} file(s) brought in by merging the main line are left out: {}",
+            left_out.len(),
+            left_out.join(", ")
+        )
+    };
+    format!(
+        "From {} to {} (start: {rule}); {left_out}\n\n",
+        short(&d["from_commit"]),
+        short(&d["to_commit"]),
+    )
+}
+
+/// `text` on one line: line breaks become spaces.
+fn one_line(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
 /// Scope §2.4: a codex reviewer cannot run thoth (E3a), so its input goes
 /// into the review worktree as files. `<worktree>/.agent/review-input/` is
 /// emptied and refilled with `packet.md` (the packet's Markdown, masked) and
 /// `evidence/<CODE>.txt` for every row the packet lists, holding that row's
 /// whole stored blob, lossily decoded and with its secrets masked (RD-1).
-/// Nothing else is written. Returns what was masked in all of them, for the
-/// caller's `secret_redacted` event: a secret in both packet.md and an
-/// evidence file is counted once in each.
+/// RVI-1 (AC3): a check with a recorded execution error gets one line
+/// before its blob that says so and gives the error, masked.
+/// RVI-1: with a `target_run_id`, also `result.json`, the whole delivery
+/// recorded for that run (its newest `result_ingested` event's
+/// `result_json`, never the worktree's mutable file or another run's
+/// delivery), every key and string masked; no file when that run has no
+/// recorded delivery. Nothing else is written. Returns what was masked in all
+/// of them, for the caller's `secret_redacted` event: a secret in both
+/// packet.md and an evidence file is counted once in each, and one in
+/// result.json adds to the kinds without naming an evidence code.
 pub(crate) fn write_review_input(
     conn: &Connection,
     task_id: &str,
     worktree: &Path,
+    target_run_id: Option<&str>,
     masker: &Masker,
 ) -> Result<Redactions> {
     let dir = worktree.join(crate::adapter::codex::REVIEW_INPUT_DIR);
@@ -159,9 +231,32 @@ pub(crate) fn write_review_input(
     for row in &rows {
         let blob = read_blob_masked(row, u64::MAX, masker);
         redactions.note(&row.code, &blob.counts);
+        // RVI-1 (AC3): a check that did not complete cleanly says so at the
+        // top of its file, whatever its exit code or output; the whole
+        // stored blob follows unchanged.
+        let mut text = String::new();
+        if let Some(error) = execution_error(row) {
+            let (error, counts) = masker.mask_text(&error);
+            redactions.note(&row.code, &counts);
+            text.push_str(&format!("{EXECUTION_ERROR_FILE_PREFIX}{}]\n", one_line(&error)));
+        }
+        text.push_str(&blob.shown);
         let path = evidence_dir.join(format!("{}.txt", row.code));
-        std::fs::write(&path, blob.shown.as_bytes())
+        std::fs::write(&path, text.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
+    }
+    if let Some(target) = target_run_id {
+        let mut result = crate::commands::review::target_result(conn, target)?;
+        if !result.is_null() {
+            // Masked whole, keys included, before anything is written.
+            let counts = masker.mask_value(&mut result);
+            redactions.counts.merge(&counts);
+            let path = dir.join(crate::review_json::RESULT_FILE);
+            let mut text = serde_json::to_string_pretty(&result)?;
+            text.push('\n');
+            std::fs::write(&path, text.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
     }
     Ok(redactions)
 }
@@ -203,6 +298,16 @@ fn packet_doc(
         } else {
             Value::Null
         };
+        // RVI-1 (AC3): shown beside the tail even when the check exited 0 or
+        // printed output, so a reviewer never reads it as a clean pass.
+        let execution_error = match execution_error(row) {
+            Some(error) => {
+                let (error, counts) = masker.mask_text(&error);
+                row_counts.merge(&counts);
+                Value::String(error)
+            }
+            None => Value::Null,
+        };
         if row.kind == "diff" {
             // P7-2: what the control plane found changed among the protected
             // files, per diff evidence.
@@ -219,11 +324,27 @@ fn packet_doc(
             let (body, _total, verified) = read_blob(row, u64::MAX);
             let (body, counts) = masker.mask_text(&body);
             row_counts.merge(&counts);
+            // SMALL-9c: where the diff starts and what the main line brought
+            // in that is left out. A row recorded before SMALL-9c has no
+            // rule and left nothing out. The paths are worker-controlled
+            // text outside the masked patch, so they are masked too.
+            let mut integrated = Vec::new();
+            for p in detail["integrated_files"].as_array().into_iter().flatten() {
+                if let Some(p) = p.as_str() {
+                    let (p, counts) = masker.mask_text(p);
+                    row_counts.merge(&counts);
+                    integrated.push(Value::String(p));
+                }
+            }
             diffs.push(json!({
                 "code": row.code,
                 "run_id": row.run_id,
                 "blob_verified": verified,
                 "content": body,
+                "from_commit": detail["from_commit"].as_str(),
+                "to_commit": detail["to_commit"].as_str(),
+                "diff_from_rule": detail["diff_from_rule"].as_str(),
+                "integrated_files": integrated,
             }));
         }
         redactions.note(&row.code, &row_counts);
@@ -234,6 +355,7 @@ fn packet_doc(
             "run_id": row.run_id,
             "label": label,
             "output_tail": output_tail,
+            "execution_error": execution_error,
         }));
     }
 
@@ -253,6 +375,17 @@ fn packet_doc(
             (claims, e.run_id.map(Value::String).unwrap_or(Value::Null))
         }
         None => (Vec::new(), Value::Null),
+    };
+    // REV-3 (AC4): the required checks that did not run on the run whose
+    // claims are shown; nothing without one.
+    let checks_not_run = match claims_run_id.as_str() {
+        Some(run_id) => crate::required_checks::to_json(&crate::required_checks::for_run(
+            conn,
+            task_id,
+            &task.spec,
+            Some(run_id),
+        )?),
+        None => json!([]),
     };
 
     let reviews: Vec<Value> = state::list_reviews_for_task(conn, task_id)?
@@ -297,6 +430,7 @@ fn packet_doc(
         "diffs": diffs,
         "claims": claims,
         "claims_run_id": claims_run_id,
+        "checks_not_run": checks_not_run,
         "approvals": approvals(conn, task_id)?,
         "reviews": reviews,
     });
@@ -523,8 +657,16 @@ fn render_markdown(doc: &Value, handoff_reasons: &std::collections::HashMap<Stri
             e["run_id"].as_str().unwrap_or("-"),
             s(&e["label"]),
         ));
+        // RVI-1 (AC3): a check that did not complete cleanly says so on its
+        // own line, before any output it printed.
+        let execution_error = e["execution_error"].as_str();
+        if let Some(error) = execution_error {
+            m.push_str(&format!("  execution error: {}\n", one_line(error)));
+        }
         if let Some(tail) = e["output_tail"].as_str() {
-            if tail.is_empty() {
+            // A check with nothing stored has its error as `output_tail`
+            // (see `packet_doc`); the line above already shows it.
+            if tail.is_empty() || execution_error == Some(tail) {
                 m.push_str("  (no stored output)\n");
             } else {
                 for line in fenced("", tail).lines() {
@@ -574,6 +716,21 @@ fn render_markdown(doc: &Value, handoff_reasons: &std::collections::HashMap<Stri
     }
     m.push('\n');
 
+    // REV-3 (AC4): the checks the spec's checks field lists that did not run
+    // on the run under review, ahead of the diffs.
+    m.push_str("## Required checks not run\n\n");
+    m.push_str(
+        "Checks the spec's checks field lists that no verify of the run under review (claims run; verify@base: rows do not count) completed: no_verify_row when no verify row names the check, did_not_complete when every row for it was refused, failed to run, timed out, ended without an exit code or left incomplete output. A check that ran and exited non-zero is not listed.\n\n",
+    );
+    let not_run = doc["checks_not_run"].as_array().cloned().unwrap_or_default();
+    if not_run.is_empty() {
+        m.push_str("(none)\n");
+    }
+    for n in &not_run {
+        m.push_str(&format!("{} ({})\n", s(&n["check_id"]), s(&n["reason"])));
+    }
+    m.push('\n');
+
     // (4) diffs
     m.push_str("## Diffs\n\n");
     let diffs = doc["diffs"].as_array().cloned().unwrap_or_default();
@@ -587,6 +744,7 @@ fn render_markdown(doc: &Value, handoff_reasons: &std::collections::HashMap<Stri
             d["run_id"].as_str().unwrap_or("-"),
             d["blob_verified"].as_bool().unwrap_or(false),
         ));
+        m.push_str(&diff_origin_line(d));
         m.push_str(&fenced("diff", s(&d["content"])));
         m.push('\n');
     }

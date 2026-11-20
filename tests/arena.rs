@@ -453,7 +453,10 @@ fn e_arena_url_is_a_text_setting_after_aa_url() {
     let out = f.cmd().env_remove("THOTH_ARENA_URL").args(["config", "list", "--json"]).assert().success().get_output().stdout.clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let settings = v["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 16, "{v}");
+    // AUTO-1a: no hard-coded total (verify-slots was added last); every key
+    // is listed once.
+    let keys: std::collections::BTreeSet<&str> = settings.iter().map(|s| s["key"].as_str().unwrap()).collect();
+    assert_eq!(keys.len(), settings.len(), "{v}");
     let at = settings.iter().position(|s| s["key"] == "arena-url").unwrap();
     assert_eq!(settings[at - 1]["key"], "aa-url", "{v}");
     assert_eq!(settings[at]["kind"], "text");

@@ -96,6 +96,8 @@ impl Fixture {
         // Never the real codex: every test that launches one gets the fake.
         c.env("THOTH_CODEX_BIN", env!("CARGO_BIN_EXE_fake-codex"));
         c.env("THOTH_AGY_BIN", env!("CARGO_BIN_EXE_fake-agy"));
+        // TEST-2: test-only switch (debug builds) that shortens the 1 s poll of the runner and `thoth wait`.
+        c.env("THOTH_TEST_POLL_MS", "100");
         c.current_dir(self.repo.path());
         c
     }

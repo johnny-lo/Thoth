@@ -220,26 +220,31 @@ fn the_two_settings_are_listed_validated_and_overridden_by_env() {
     let f = init();
     let list = json_out(f.cmd().args(["config", "list", "--json"]));
     let settings = list["settings"].as_array().unwrap();
-    // RJ-2 added `arena-url` after `aa-url`: 16 settings, the two records
-    // settings one place later.
-    assert_eq!(settings.len(), 16, "{list}");
-    assert_eq!(settings[11]["key"], "machine-name");
-    assert_eq!(settings[11]["kind"], "text");
-    assert_eq!(settings[11]["env"], "THOTH_MACHINE_NAME");
-    assert_eq!(settings[11]["settable"], true);
-    assert_eq!(settings[11]["source"], "default");
-    let shown = settings[11]["value"].as_str().unwrap();
+    // RJ-2 added `arena-url` after `aa-url`, and SMALL-9a
+    // `quota-reserve-percent` after `live-quota-timeout-ms`: the two records
+    // settings two places later. AUTO-1a added `verify-slots` last, which
+    // moves nothing here.
+    // AUTO-1a: no hard-coded total (verify-slots was added last); every key
+    // is listed once.
+    let keys: std::collections::BTreeSet<&str> = settings.iter().map(|s| s["key"].as_str().unwrap()).collect();
+    assert_eq!(keys.len(), settings.len(), "{list}");
+    assert_eq!(settings[12]["key"], "machine-name");
+    assert_eq!(settings[12]["kind"], "text");
+    assert_eq!(settings[12]["env"], "THOTH_MACHINE_NAME");
+    assert_eq!(settings[12]["settable"], true);
+    assert_eq!(settings[12]["source"], "default");
+    let shown = settings[12]["value"].as_str().unwrap();
     assert!(!shown.is_empty());
     assert!(
         shown.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
         "{shown}"
     );
-    assert_eq!(settings[12]["key"], "records-dir");
-    assert_eq!(settings[12]["env"], "THOTH_RECORDS_DIR");
-    assert_eq!(settings[12]["value"], "unset");
-    assert_eq!(settings[12]["default"], "unset");
-    assert_eq!(settings[12]["source"], "default");
-    assert_eq!(settings[13]["key"], "home");
+    assert_eq!(settings[13]["key"], "records-dir");
+    assert_eq!(settings[13]["env"], "THOTH_RECORDS_DIR");
+    assert_eq!(settings[13]["value"], "unset");
+    assert_eq!(settings[13]["default"], "unset");
+    assert_eq!(settings[13]["source"], "default");
+    assert_eq!(settings[14]["key"], "home");
     assert_eq!(settings[3]["key"], "language");
 
     let out = f
@@ -276,7 +281,8 @@ fn the_two_settings_are_listed_validated_and_overridden_by_env() {
             .env("THOTH_MACHINE_NAME", "env box")
             .args(["config", "list", "--json"]),
     );
-    assert_eq!(list["settings"][10]["source"], "env", "{list}");
+    assert_eq!(list["settings"][12]["key"], "machine-name", "{list}");
+    assert_eq!(list["settings"][12]["source"], "env", "{list}");
 
     let out = f
         .cmd()

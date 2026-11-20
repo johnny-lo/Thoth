@@ -57,13 +57,16 @@ pub struct StartArgs<'a> {
     /// `--model` as typed; `None` keeps the model of the previous reviewer
     /// run of the attempt under review, and is refused when there is none.
     pub model: Option<&'a str>,
-    pub timeout_seconds: u64,
+    /// `--timeout`; `None` takes the default for the effort sent (SMALL-9b).
+    pub timeout_seconds: Option<u64>,
     /// `--effort`, as typed; validated by `start` before anything is written.
     pub effort: Option<&'a str>,
     /// `--reason`, as typed (DT-2); trimmed and checked by `start`.
     pub reason: Option<&'a str>,
-    /// RFIX-1: `--edit`, the reviewer may attach a fix to its REJECT.
-    pub edit: bool,
+    /// RFIX-1: `--edit` (`Some(true)`), the reviewer may attach a fix to its
+    /// REJECT. RFIX-2: `--no-edit` is `Some(false)`; `None` (neither) is
+    /// edit mode for a code task and a plain review for a document task.
+    pub edit: Option<bool>,
     pub json: bool,
 }
 
@@ -169,7 +172,7 @@ fn record_target_diff(
 /// no readable `protected_changes` (recorded before the key existed, or
 /// damaged), one more diff recorded with git. Returns the warnings and the
 /// error of that second recording, if it failed. Nothing is refused here.
-fn prepare_protected_evidence(
+pub(crate) fn prepare_protected_evidence(
     conn: &Connection,
     paths: &Paths,
     repo_id: &str,
@@ -338,7 +341,7 @@ pub struct ConfirmArgs<'a> {
     pub task: &'a str,
     pub profile: &'a str,
     pub model: &'a str,
-    pub timeout_seconds: u64,
+    pub timeout_seconds: Option<u64>,
     pub effort: Option<&'a str>,
     pub reason: Option<&'a str>,
     pub json: bool,
@@ -358,7 +361,7 @@ pub fn confirm(paths: &Paths, cwd: &Path, args: ConfirmArgs<'_>) -> Result<i32> 
             timeout_seconds: args.timeout_seconds,
             effort: args.effort,
             reason: args.reason,
-            edit: false,
+            edit: Some(false),
             json: args.json,
         },
         true,
@@ -377,17 +380,24 @@ struct PendingFix {
     fix_verify: serde_json::Value,
 }
 
-/// `review start` (`--edit` too) and `review confirm`: one launch path, the
-/// mode deciding the worktree, the extra refusals and the started keys.
+/// RFIX-2: the mode `review start` launches in. `--edit` and `--no-edit`
+/// decide; without either, a code task (no task_type, or one that is not
+/// docs, research or review) gets edit mode and a document task a plain
+/// review.
+fn start_mode(edit: Option<bool>, task_spec: &str) -> ReviewMode {
+    match edit {
+        Some(true) => ReviewMode::Edit,
+        Some(false) => ReviewMode::Review,
+        None if spec::is_document_task(task_spec) => ReviewMode::Review,
+        None => ReviewMode::Edit,
+    }
+}
+
+/// `review start` (edit mode or not) and `review confirm`: one launch path,
+/// the mode deciding the worktree, the extra refusals and the started keys.
 fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Result<i32> {
     use crate::commands::auto_pick;
-    let mode = match (confirm, args.edit) {
-        (true, _) => ReviewMode::Confirm,
-        (false, true) => ReviewMode::Edit,
-        (false, false) => ReviewMode::Review,
-    };
-    let is_confirm = mode == ReviewMode::Confirm;
-    let is_edit = mode == ReviewMode::Edit;
+    let is_confirm = confirm;
     let command = if is_confirm { "review confirm" } else { "review start" };
     if is_confirm && std::env::var_os("THOTH_RUN_ID").is_some() {
         bail!("review confirm refuses to run with THOTH_RUN_ID set: the confirmer is chosen by the supervising session, not by a run");
@@ -405,6 +415,8 @@ fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Resu
     let task_id = ids::resolve_prefix(&state::list_task_ids(&conn)?, args.task)?;
     let task = state::get_task(&conn, &task_id)?
         .ok_or_else(|| anyhow::anyhow!("task {task_id} disappeared"))?;
+    let mode = if is_confirm { ReviewMode::Confirm } else { start_mode(args.edit, &task.spec) };
+    let is_edit = mode == ReviewMode::Edit;
     if task.status != TaskStatus::InReview.as_str() {
         bail!(
             "task {task_id} is '{}'; {command} needs in_review",
@@ -503,12 +515,17 @@ fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Resu
     let require_reason = crate::commands::settings::require_reason(&paths.home);
     auto_pick::require_reason_gate(&task_id, command, reason.as_deref(), require_reason)?;
     let launch = auto_pick::launch_settings(&choice, &profile);
+    // SMALL-9b: the effort sent picks the limit; the previous run's is never kept.
+    let timeout_seconds = args
+        .timeout_seconds
+        .unwrap_or_else(|| crate::adapter::effort::default_timeout_secs(launch.effort.as_deref()));
 
-    // RFIX-1: a fix is attached to code only, and refused before the
-    // candidate's evidence is recorded.
-    if is_edit && spec::is_document_task(&task.spec) {
+    // RFIX-1, RFIX-2: a research task's review is a source check, which has
+    // no fix to attach; refused before the candidate's evidence is recorded.
+    // Docs and review tasks take a fix like code (only with --edit).
+    if is_edit && research {
         bail!(
-            "task {task_id} is a document task (task_type docs, research or review); review start --edit attaches fixes to code only, review it without --edit"
+            "task {task_id} is a research task: its review is a source check, and a research task cannot attach fixes; review start --edit is refused, review it without --edit (or with --no-edit)"
         );
     }
     // RFIX-1: what a confirm needs, before any evidence or login check.
@@ -550,6 +567,25 @@ fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Resu
         None
     };
 
+    // FC-1 (H4): read to see whether the profile has recovered or is parked
+    // for another quota group; an unreadable ranking does not stop the
+    // review. SMALL-9a: the quota reserve refuses here, after the refusals
+    // that write nothing and before the candidate's evidence is recorded.
+    let ranked = crate::commands::usage::ranked_candidates(
+        paths,
+        role::REVIEWER,
+        Some(&task_id),
+        Some(&choice.model),
+    );
+    let reserve_note = crate::commands::quota_reserve::launch_gate(
+        crate::commands::settings::quota_reserve_percent(&paths.home),
+        &profile.profile_id,
+        role::REVIEWER,
+        &task_id,
+        ranked.as_deref(),
+    )?;
+    let ranked = ranked.unwrap_or_default();
+
     // LESS-5: the protected test files the candidate changed must have been
     // approved (`checks approve --run`) before a review starts. The candidate's
     // evidence is recorded first, so a run whose diff the runner failed to
@@ -572,17 +608,8 @@ fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Resu
             bail!("{refusal_head}: {why}");
         }
     }
+    warnings.extend(reserve_note);
 
-    // FC-1 (H4): read only to see whether the profile has recovered or is
-    // parked for another quota group; an unreadable ranking does not stop
-    // the review.
-    let ranked = crate::commands::usage::ranked_candidates(
-        paths,
-        role::REVIEWER,
-        Some(&task_id),
-        Some(&choice.model),
-    )
-    .unwrap_or_default();
     let recovered = ranked
         .iter()
         .find(|c| c.profile.profile_id == profile.profile_id)
@@ -687,7 +714,7 @@ fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Resu
         worker_pid: None,
         heartbeat_at: None,
         cancel_requested: 0,
-        timeout_seconds: args.timeout_seconds as i64,
+        timeout_seconds: timeout_seconds as i64,
         run_dir: run_dir.display().to_string(),
         error_text: None,
         harness_bin: Some(crate::adapter::harness_bin(&profile.harness)),
@@ -794,7 +821,7 @@ fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Resu
         "profile": profile.profile_id,
         "model": choice.model,
         "allowed_tools": allowed_tools,
-        "timeout_seconds": args.timeout_seconds,
+        "timeout_seconds": timeout_seconds,
         "mode": mode.as_str(),
     });
     let mut extra = serde_json::Map::new();
@@ -941,7 +968,7 @@ fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Resu
         args.json,
         &v,
         &format!(
-            "{what} {run_id} started on {} (task {task_id}, {} {}, profile {}, runner pid {runner_pid})\n\
+            "{what} {run_id} started on {} (task {task_id}, {} {}, profile {}, runner pid {runner_pid}, timeout {timeout_seconds}s)\n\
              the task stays in_review until the verdict lands; block on it with \
              `thoth wait --run {run_id}`, or watch `thoth events`",
             choice.model,
@@ -1059,6 +1086,12 @@ pub(crate) fn validate_review_document(
             reason: e.to_string(),
             detail: serde_json::json!({"stage": "schema"}),
         })?;
+        if !doc.findings.sources.is_empty() {
+            return Err(ReviewValidationError {
+                reason: "a code review cannot contain research source-check findings".to_string(),
+                detail: serde_json::json!({"stage": "schema"}),
+            });
+        }
         let parsed_spec = spec::parse_spec(&task.spec).map_err(|e| ReviewValidationError {
             reason: format!("the task spec does not parse, so its criteria cannot be checked: {e}"),
             detail: serde_json::json!({"stage": "spec"}),
@@ -1135,6 +1168,13 @@ pub(crate) struct VerdictEventShape<'a> {
     pub(crate) opened: Option<&'a [String]>,
     pub(crate) unopened: Option<&'a [String]>,
     pub(crate) source: Option<&'a str>,
+    /// REV-3 (AC3): the required checks that did not run, as the code review
+    /// was checked against them; recorded as `checks_not_run` (null for a
+    /// research source check). Every reviewer-run code verdict and `record`
+    /// pass `Some` (an edit review's against its target run, a confirm's
+    /// against the edit review run that holds the fix's verify); `None`
+    /// leaves the key out.
+    pub(crate) checks_not_run: Option<&'a [crate::required_checks::NotRun]>,
 }
 
 /// The `verdict` event's `detail`, shared by the reviewer-run path and
@@ -1149,6 +1189,7 @@ pub(crate) fn verdict_event_detail(shape: VerdictEventShape<'_>) -> serde_json::
         opened,
         unopened,
         source,
+        checks_not_run,
     } = shape;
     let mut detail = serde_json::json!({
         "verdict": verdict.as_str(),
@@ -1162,8 +1203,24 @@ pub(crate) fn verdict_event_detail(shape: VerdictEventShape<'_>) -> serde_json::
         "opened": opened,
         "unopened_citation": unopened,
     });
+    // REV-1 (AC3): whether the verdict came with a blocking finding, next to
+    // the reviewer's own verdict (Thoth does not change it). A source check
+    // does not split findings into blocking and advisory, so it records null.
+    // Events written before REV-1 have no such key at all.
     if !doc.findings.sources.is_empty() {
         detail["sources"] = serde_json::json!(doc.findings.sources);
+        detail["has_blocking_findings"] = serde_json::Value::Null;
+    } else {
+        detail["has_blocking_findings"] =
+            serde_json::Value::Bool(review_json::has_blocking_findings(&doc.findings));
+    }
+    // REV-3 (AC3): what the review was checked against.
+    if let Some(list) = checks_not_run {
+        detail["checks_not_run"] = if doc.findings.sources.is_empty() {
+            crate::required_checks::to_json(list)
+        } else {
+            serde_json::Value::Null
+        };
     }
     if let Some(source) = source {
         if let Some(o) = detail.as_object_mut() {
@@ -1172,6 +1229,52 @@ pub(crate) fn verdict_event_detail(shape: VerdictEventShape<'_>) -> serde_json::
         }
     }
     detail
+}
+
+/// REV-3 (AC1): the required checks that did not run on `target_run_id`,
+/// from the task's current spec; always empty for a research source check,
+/// which the rule does not cover (its refusal then never applies).
+pub(crate) fn required_checks_for(
+    conn: &Connection,
+    task: &state::Task,
+    doc: &review_json::ReviewDocument,
+    target_run_id: &str,
+) -> Result<Vec<crate::required_checks::NotRun>> {
+    if !checked_for_required_checks(task, doc) {
+        return Ok(Vec::new());
+    }
+    crate::required_checks::for_run(conn, &task.task_id, &task.spec, Some(target_run_id))
+}
+
+/// Whether REV-3's refusal applies to this document: every code review,
+/// not a research source check.
+fn checked_for_required_checks(task: &state::Task, doc: &review_json::ReviewDocument) -> bool {
+    !spec::is_research_task(&task.spec) && doc.findings.sources.is_empty()
+}
+
+/// REV-3 (AC3): a reviewer run's report, plain or edit mode, held to the
+/// required checks that did not run on `target_run_id`, worked out now.
+/// `Ok(list)` when the report agrees (the list goes into its `verdict`
+/// event); `Err((reason, detail))` for the `review_invalid` the caller
+/// writes, which lands the task `unverified`.
+pub(crate) fn required_checks_gate(
+    conn: &Connection,
+    task: &state::Task,
+    doc: &review_json::ReviewDocument,
+    target_run_id: &str,
+) -> std::result::Result<Vec<crate::required_checks::NotRun>, (String, serde_json::Value)> {
+    let not_run = required_checks_for(conn, task, doc, target_run_id).map_err(|e| {
+        (
+            format!("working out the required checks not run failed: {e:#}"),
+            serde_json::json!({"stage": crate::required_checks::STAGE}),
+        )
+    })?;
+    if checked_for_required_checks(task, doc) {
+        if let Some(why) = crate::required_checks::refusal(doc, &not_run) {
+            return Err((why, crate::required_checks::invalid_detail(&not_run)));
+        }
+    }
+    Ok(not_run)
 }
 
 /// brief §8: validate `.agent/review.json`, write the `reviews` row and the
@@ -1198,6 +1301,14 @@ pub fn ingest_review(
             serde_json::json!({"stage": "target"}),
         );
     }
+
+    // REV-3 (AC3): a code review must agree with the required checks that
+    // did not run on the reviewed run, worked out now; one that does not is
+    // refused like any other unusable report (the task lands unverified).
+    let not_run = match required_checks_gate(conn, task, &doc, target_run_id) {
+        Ok(list) => list,
+        Err((why, detail)) => return review_invalid(conn, run, why, detail),
+    };
 
     let verdict = Verdict::parse(&doc.verdict).unwrap_or(Verdict::Unverified);
     let opened = opened_codes(conn, &run.run_id).unwrap_or_default();
@@ -1249,6 +1360,7 @@ pub fn ingest_review(
                 opened: Some(&opened),
                 unopened: Some(&unopened),
                 source: None,
+                checks_not_run: Some(&not_run),
             }),
         },
     ) {
@@ -1517,6 +1629,31 @@ pub fn record(paths: &Paths, cwd: &Path, args: RecordArgs<'_>) -> Result<i32> {
             target.run_id
         );
     }
+    // REV-3 (AC3): the report must agree with the required checks that did
+    // not run on the run it settles, worked out now, under the write lock.
+    // Refused like an invalid document: one `review_invalid` event, exit 1,
+    // the task left in_review.
+    let not_run = required_checks_for(&tx, &task, &doc, &target.run_id)?;
+    if checked_for_required_checks(&task, &doc) {
+        if let Some(why) = crate::required_checks::refusal(&doc, &not_run) {
+            drop(tx); // explicit: rolls back, though nothing has been written yet
+            let mut detail = crate::required_checks::invalid_detail(&not_run);
+            if let Some(o) = detail.as_object_mut() {
+                o.insert("reason".to_string(), serde_json::Value::String(why.clone()));
+                o.insert("source".to_string(), serde_json::Value::String("external".to_string()));
+            }
+            state::append_event(
+                &conn,
+                &NewEvent {
+                    task_id: Some(task_id.clone()),
+                    run_id: None,
+                    event_type: event_type::REVIEW_INVALID.to_string(),
+                    detail,
+                },
+            )?;
+            bail!("review.json invalid at stage {}: {why}", crate::required_checks::STAGE);
+        }
+    }
     // Hold the write lock before any evidence preparation for source checks.
     // A target that moved since validation must leave no writes behind.
     if verdict == Verdict::Pass && validation_target.is_some() {
@@ -1575,6 +1712,7 @@ pub fn record(paths: &Paths, cwd: &Path, args: RecordArgs<'_>) -> Result<i32> {
                 opened: None,
                 unopened: None,
                 source: Some("external"),
+                checks_not_run: Some(&not_run),
             }),
         },
     )?;
@@ -1671,6 +1809,9 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
                 "fix": serde_json::Value::Null,
                 "merge_branch": serde_json::Value::Null,
                 "merge_commit": serde_json::Value::Null,
+                "blocking": serde_json::Value::Null,
+                "advisory": serde_json::Value::Null,
+                "has_blocking_findings": serde_json::Value::Null,
             }),
             &format!("no review recorded for {task_id}; run `thoth review start {task_id} --profile <id>`"),
         );
@@ -1740,6 +1881,10 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
         .collect();
 
     let brief = crate::brief::for_review(&crate::redact::Masker::current(), &latest.verdict, &doc.findings);
+    // REV-2 (AC5): the newest record's findings split by REV-1's classes,
+    // computed from what is stored, so records older than REV-1 have them
+    // too; `null` for a research source check.
+    let split = review_json::split_findings(&doc.findings);
     let v = serde_json::json!({
         "task_id": task_id,
         "review_count": reviews.len(),
@@ -1760,6 +1905,9 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
         "fix": fix_state.fix,
         "merge_branch": merge_branch,
         "merge_commit": merge_commit,
+        "blocking": split.as_ref().map(|s| s.blocking.clone()),
+        "advisory": split.as_ref().map(|s| s.advisory.clone()),
+        "has_blocking_findings": split.as_ref().map(|s| !s.blocking.is_empty()),
     });
 
     let reviewer_label = match &latest.reviewer_run_id {
@@ -1790,6 +1938,11 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
     }
     for e in &doc.findings.extra_findings {
         lines.push(format!("  extra  {:<6} {} [{}]", e.severity, e.note, e.evidence.join(",")));
+    }
+    if let Some(split) = &split {
+        let refs = |r: &[String]| if r.is_empty() { "-".to_string() } else { r.join(", ") };
+        lines.push(format!("  blocking: {}", refs(&split.blocking)));
+        lines.push(format!("  advisory (not required): {}", refs(&split.advisory)));
     }
     match &opened {
         Some(opened) => lines.push(format!(

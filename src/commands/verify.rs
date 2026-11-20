@@ -145,7 +145,14 @@ struct BaseWorktree {
 
 impl Drop for BaseWorktree {
     fn drop(&mut self) {
-        worktree::remove_worktree(&self.root, &self.path);
+        if let Err(e) = worktree::remove_worktree(&self.root, &self.path) {
+            masked_eprintln!(
+                "thoth: warning: kept the temporary worktree {} ({}): {}",
+                self.path.display(),
+                worktree::LINK_UNREMOVABLE,
+                e.detail()
+            );
+        }
     }
 }
 

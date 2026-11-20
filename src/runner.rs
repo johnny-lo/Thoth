@@ -24,6 +24,36 @@ use std::time::{Duration, Instant};
 
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 const POLL_EVERY: Duration = Duration::from_secs(1);
+
+/// TEST-2: the poll interval a raw value of the test switch asks for. A
+/// decimal integer from 1 to 1000 (surrounding blanks ignored) is that many
+/// milliseconds; anything else - no value, empty, not a decimal integer, 0,
+/// above 1000 - is `POLL_EVERY`. The switch can only shorten the poll.
+pub fn parse_poll_every(raw: Option<&str>) -> Duration {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| (1..=1000).contains(ms))
+        .map(Duration::from_millis)
+        .unwrap_or(POLL_EVERY)
+}
+
+/// TEST-2: the interval of the runner's main loop and of `thoth wait`.
+/// Debug builds read the test-only switch `THOTH_TEST_POLL_MS` (set by
+/// tests/common/mod.rs so integration tests do not wait a whole second per
+/// step); release builds never read it and always poll every `POLL_EVERY`.
+/// Deliberately left out of the user documentation.
+pub fn poll_every() -> Duration {
+    #[cfg(debug_assertions)]
+    {
+        let raw = std::env::var("THOTH_TEST_POLL_MS").ok();
+        parse_poll_every(raw.as_deref())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        parse_poll_every(None)
+    }
+}
 /// How long to keep draining stdout after the child exits before giving up on
 /// the reader thread. A grandchild that inherited the child's stdout handle can
 /// hold the pipe open past the child's own exit (03-process-and-worktree.md:69:
@@ -1868,7 +1898,7 @@ fn watch_attempt<'a>(
                 }
             }
         }
-        std::thread::sleep(POLL_EVERY);
+        std::thread::sleep(poll_every());
     }
 
     // Controller pointer 1 (Task 6 review, binding): once `child.wait()` has
@@ -2157,10 +2187,18 @@ fn run_worker_inner(
             output: Path::new(&run.worktree).join(".agent").join("review.json"),
         })
     } else if is_review && adapter.reads_review_packet() {
+        // RVI-1: a code reviewer also gets the delivery of the run its
+        // `review_started` event names; a source check's input stays as it was.
+        let target = if research {
+            None
+        } else {
+            crate::commands::review::target_run_id_for(conn, &run.run_id)?
+        };
         let redactions = crate::commands::review_packet::write_review_input(
             conn,
             &run.task_id,
             Path::new(&run.worktree),
+            target.as_deref(),
             &masker,
         )?;
         if let Err(e) = crate::redact::record(
@@ -2368,6 +2406,29 @@ fn run_worker_inner(
             &protected_changes,
             sources.as_deref(),
         );
+        // REV-3 (AC2): a code review is told which required checks did not
+        // run on the run under review, as Thoth works them out now from the
+        // task's current spec and that run's verify rows.
+        if !research {
+            let not_run = (|| -> Result<Vec<crate::required_checks::NotRun>> {
+                let task = state::get_task(conn, &run.task_id)?
+                    .ok_or_else(|| anyhow!("task {} disappeared", run.task_id))?;
+                let target = crate::commands::review::target_run_id_for(conn, &run.run_id)?;
+                crate::required_checks::for_run(conn, &run.task_id, &task.spec, target.as_deref())
+            })();
+            match not_run {
+                Ok(list) => prompt.push_str(&crate::review_json::required_checks_prompt_section(
+                    &crate::required_checks::lines(&list),
+                )),
+                Err(e) => {
+                    log_runner_error(
+                        &run_dir,
+                        &format!("working out the required checks not run for the review prompt failed: {e:#}"),
+                    );
+                    prompt.push_str("\n## Required checks not run\nThoth could not work out this list; judge from the evidence index which checks the spec's checks field lists did not run. Thoth still checks your report against the list when it receives it.\n");
+                }
+            }
+        }
         // RFIX-1: an edit-mode reviewer is also told how to attach a fix.
         if code_review_mode == crate::spec_edits::ReviewMode::Edit {
             prompt.push_str(&crate::review_fix_edits::edit_prompt_section(
@@ -2383,6 +2444,7 @@ fn run_worker_inner(
         let rework = rework.map(|r| crate::spec::ReworkAddendum {
             unmet: r.unmet.iter().map(|u| mask_into(counts, u)).collect(),
             extra_findings: r.extra_findings.iter().map(|e| mask_into(counts, e)).collect(),
+            advisory: r.advisory.iter().map(|a| mask_into(counts, a)).collect(),
             ..r
         });
         let reroute = reroute.map(|r| crate::spec::RerouteAddendum { reason: mask_into(counts, &r.reason), ..r });
@@ -3178,6 +3240,21 @@ mod tests {
     use super::*;
     use crate::adapter::ResultEvent;
     use crate::ingest::IngestOutcome;
+
+    /// TEST-2: the test switch only shortens the poll, to 1..=1000 ms; any
+    /// other value (or none) leaves it at one second.
+    #[test]
+    fn poll_interval_is_one_second_unless_the_test_switch_shortens_it() {
+        let second = Duration::from_secs(1);
+        assert_eq!(parse_poll_every(None), second);
+        for raw in ["", "abc", "0", "-1", "1.5", "1001"] {
+            assert_eq!(parse_poll_every(Some(raw)), second, "{raw:?}");
+        }
+        assert_eq!(parse_poll_every(Some("1")), Duration::from_millis(1));
+        assert_eq!(parse_poll_every(Some("100")), Duration::from_millis(100));
+        assert_eq!(parse_poll_every(Some(" 100 ")), Duration::from_millis(100));
+        assert_eq!(parse_poll_every(Some("1000")), Duration::from_millis(1000));
+    }
 
     #[test]
     fn is_run_status_terminal_matches_completed_failed_cancelled_interrupted() {

@@ -217,6 +217,18 @@ pub fn launch_args(harness: &str, sent: Option<&str>) -> Vec<String> {
     }
 }
 
+/// SMALL-9b: the wall-clock limit, in seconds, of a launch given no
+/// `--timeout`, by the effort actually sent (after lowering; `None` for a
+/// model without an effort setting). The one table: `status`'s timeout next
+/// step reads it too.
+pub fn default_timeout_secs(sent: Option<&str>) -> u64 {
+    match sent {
+        Some("high") => 3 * 3600,
+        Some("xhigh" | "max" | "ultra") => 4 * 3600,
+        _ => 3600,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct LaunchSettings {

@@ -360,7 +360,11 @@ fn mcp_has_no_setup_tool() {
         .find(|v| v["id"] == 2)
         .unwrap_or_else(|| panic!("no tools/list answer in {stdout}"));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 36);
+    // AUTO-1a: no hard-coded total (the pipeline tools were added); every
+    // tool is listed once and thoth_guide stays last.
+    let unique: std::collections::BTreeSet<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(unique.len(), tools.len());
+    assert_eq!(tools.last().unwrap()["name"], "thoth_guide");
     for t in tools {
         assert!(!t["name"].as_str().unwrap().contains("setup"), "{t}");
     }

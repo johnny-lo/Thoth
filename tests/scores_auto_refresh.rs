@@ -183,7 +183,10 @@ fn s1_the_switch_is_the_second_setting_and_defaults_off() {
     let out = f.cmd().args(["config", "list", "--json"]).assert().success().get_output().stdout.clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let settings = v["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 16, "{v}");
+    // AUTO-1a: no hard-coded total (verify-slots was added last); every key
+    // is listed once.
+    let keys: std::collections::BTreeSet<&str> = settings.iter().map(|s| s["key"].as_str().unwrap()).collect();
+    assert_eq!(keys.len(), settings.len(), "{v}");
     assert_eq!(settings[1]["key"], "scores-auto-refresh");
     assert_eq!(settings[1]["value"], "off");
     assert_eq!(settings[1]["default"], "off");

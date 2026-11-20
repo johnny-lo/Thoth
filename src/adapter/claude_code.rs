@@ -77,6 +77,8 @@ pub const CHECKS_NOTE: &str = "Run the tests the spec names before you finish. Y
 /// `verify` of the checks above, so the worker runs what the spec names, one
 /// foreground command each. The sentence names no tool: Thoth serves any
 /// language's repo.
+pub const INTERFACE_TEST_LEAD_IN: &str = "Reviewers apply this rule to the tests you add or change: ";
+
 pub const SUITE_NOTE: &str = "Evidence for the whole test suite comes from the control plane's verify of the checks above, not from you. Run the tests the spec names, each as its own foreground command, and do not start a whole-suite run that cannot finish within one command's time limit; when the spec asks for the whole suite, run it in parts that each finish, and keep each part's output.\n";
 
 /// LEAN-1: right after the result.json shape. The summary is for what Thoth
@@ -116,6 +118,12 @@ pub fn protected_section(protected: &crate::protected::Catalogue) -> String {
 /// result.json contract. Ingest rejects a `research` claim without sources
 /// (rule 1) and a completed research delivery without one (rule 7).
 pub const RESEARCH_SECTION: &str = "\n## Research claims\nThis is a research task. For every factual claim in your report, add one claim of kind research to .agent/result.json. Its \"text\" is the claim itself. Its \"sources\" lists at least one source; each source has a \"url\" you actually opened (http://, https:// or file://) and a \"quote\": a verbatim excerpt of that page that supports the claim, at most 500 characters, copied exactly and not paraphrased. Its \"evidence\" may be an empty array. Leave any claim you have no source for out of the report. A completed delivery with no research claim is not accepted. For example:\n{\"kind\":\"research\",\"text\":\"...\",\"evidence\":[],\"sources\":[{\"url\":\"https://...\",\"quote\":\"...\"}]}\n";
+
+/// REV-2 (AC1): the heading of the rework section's advisory list.
+pub const ADVISORY_REWORK_HEAD: &str = "### Advisory findings (not required)\n";
+
+/// REV-2 (AC1): what the rework section says about its advisory list.
+pub const ADVISORY_REWORK_NOTE: &str = "The reviewer also left these advisory findings. They are notes, not required fixes: \"Fix exactly these\" above does not include them, they do not block the merge, and after the merge they are collected into the backlog's small-fixes list. You may fix one in passing when it is cheap and safe.\n";
 
 /// brief section 8: the implementer prompt. The result.json shape is spelled out
 /// literally so the worker has no room to improvise field names. `research`
@@ -234,6 +242,18 @@ fn build_prompt_impl(
         }
         s.push_str("For each finding that changes behaviour, first add or change a test that fails on the code as it is now, and run that test on its own so the failing run is captured; then fix the code and run the test again. Findings that change no behaviour (for example documentation) do not need this.\n");
         s.push_str("Fix exactly these. Do not re-litigate the spec; if you believe a finding is wrong, say so in your summary and fix what you can.\n");
+        // REV-2 (AC1): advisory findings come after the required lists and
+        // the instructions that apply to them, so "these" above never
+        // reaches them.
+        if !r.advisory.is_empty() {
+            s.push_str(ADVISORY_REWORK_HEAD);
+            s.push_str(ADVISORY_REWORK_NOTE);
+            for a in &r.advisory {
+                s.push_str("- ");
+                s.push_str(a.trim());
+                s.push('\n');
+            }
+        }
     }
     // A reroute reuses the attempt and the worktree, but the conversation is
     // new, so the reason the last result.json was refused has to be said.
@@ -273,6 +293,7 @@ fn build_prompt_impl(
     // TESTS-1: the whole suite is verify's job; the worker runs what the spec
     // names, in parts that finish.
     s.push_str(SUITE_NOTE);
+    s.push_str(&format!("{}{}\n", INTERFACE_TEST_LEAD_IN, crate::review_json::INTERFACE_TEST_RULE));
     if research {
         s.push_str(RESEARCH_SECTION);
     }
@@ -394,11 +415,15 @@ pub fn build_review_prompt(
     s.push_str("2. Judge every acceptance criterion separately as met or unmet, and cite at least one evidence code for each judgement. Do not invent codes.\n");
     s.push_str("3. Do not trust the implementer's summary. A claim is not evidence.\n");
     s.push_str("4. Do not modify any file in this directory except .agent/review.json.\n");
-    s.push_str("5. PASS only if every criterion is met. REJECT when a criterion is unmet. UNVERIFIED when the evidence available cannot settle it.\n");
+    // REV-1 (AC2): only a blocking finding is a reason to REJECT; the same
+    // rule text for all three harnesses.
+    s.push_str(&format!("5. {}\n", crate::review_json::VERDICT_RULE));
     s.push_str(&format!("6. {}\n", crate::review_json::INTERFACE_TEST_RULE));
     // TESTS-1 (AC6): the implementer no longer runs the whole suite; the
     // reviewer reads the control plane's verify rows for it.
     s.push_str(&format!("7. {}\n", crate::review_json::SUITE_EVIDENCE_RULE));
+    // REV-3 (AC2): a required check that did not run blocks.
+    s.push_str(&format!("8. {}\n", crate::review_json::REQUIRED_CHECKS_RULE));
 
     s.push_str("\n## Output\n");
     s.push_str("You have no Write tool, so create the file with a shell redirect (a Bash heredoc works). Write `.agent/review.json` in the current directory with exactly this shape:\n");
@@ -1393,11 +1418,14 @@ mod tests {
         let suite = p.find(SUITE_RULE).expect("the suite rule");
         assert!(rule < suite && suite < output, "{p}");
         assert_eq!(p.matches(SUITE_RULE).count(), 1, "{p}");
+        // REV-3 (AC2): the required-checks rule follows it as rule 8, the
+        // last rule before ## Output.
         assert!(p.contains(&format!(
-            "\n6. {}\n7. {SUITE_RULE}\n\n## Output\n",
-            crate::review_json::INTERFACE_TEST_RULE
+            "\n6. {}\n7. {SUITE_RULE}\n8. {}\n\n## Output\n",
+            crate::review_json::INTERFACE_TEST_RULE,
+            crate::review_json::REQUIRED_CHECKS_RULE
         )), "{p}");
-        assert!(!p.contains("\n8. "), "{p}");
+        assert!(!p.contains("\n9. "), "{p}");
         // the id line is untouched; the label lines follow it
         assert!(p.contains("Every id in \"criteria\" must be one of: AC1, AC2. Judge each exactly once."));
         assert!(p.contains("\"severity\":\"minor\",\"note\":\"...\",\"evidence\":[\"E001\"],\"fix_size\":\"S\",\"category\":\"docs\"}"), "{p}");
@@ -1405,12 +1433,24 @@ mod tests {
         for line in [
             "Every unmet criterion and every extra finding carries \"fix_size\" and \"category\". \"fix_size\" is the smallest fix that would resolve it: S (at most 10 changed lines in one file), M (at most about 50 changed lines, or more than one file, no design change), L (larger, or it needs a design or spec change).\n",
             "Every \"fix_size\" must be one of: S, M, L.\n",
-            "Every \"category\" must be one of: spec_mismatch, spec_error, test_missing, test_interface, error_path, concurrency, platform, docs, evidence, files, security, other.\n",
-            "- test_interface: a test bypasses the interface (reads the database or internal state, only compares a fixed string or the exit code, or repeats the implementation's logic)\n",
-            "- other: none of the above\nLeave both out on a met criterion.\n",
+            "Every \"category\" must be one of: spec_mismatch, spec_error, test_missing, test_incomplete, test_interface, error_path, concurrency, platform, docs, evidence, check_not_run, files, security, other.\n",
+            "- test_interface (advisory): a test bypasses the interface (reads the database or internal state, only compares a fixed string or the exit code, or repeats the implementation's logic)\n",
+            "- other (advisory): none of the above\n",
+            "or branches.\nLeave both out on a met criterion.\n",
         ] {
             assert!(after.contains(line), "missing {line:?} in:\n{after}");
         }
+        // REV-1 (AC2): the shared verdict rule replaces "PASS only if every
+        // criterion is met", and every category line names its class, both
+        // taken from the public definitions in src/review_json.rs.
+        assert!(p.contains(&format!("\n5. {}\n", crate::review_json::VERDICT_RULE)), "{p}");
+        assert!(!p.contains("PASS only if every criterion is met"), "{p}");
+        for c in crate::review_json::CATEGORIES {
+            let line = format!("- {} ({}): {}\n", c.name, c.class.as_str(), c.about);
+            assert!(after.contains(&line), "missing {line:?} in:\n{after}");
+        }
+        assert!(after.contains("A finding with no category counts as blocking.\n"), "{after}");
+        assert!(after.contains("Use test_missing when no test of the new or changed behaviour would fail on the old code; use test_incomplete when such a test exists but misses some cases or branches.\n"), "{after}");
         assert!(after.find("Every id in").unwrap() < after.find("Every unmet criterion").unwrap());
     }
 
@@ -1495,17 +1535,20 @@ mod tests {
         ] {
             let at = p.find("## Checks the control plane will re-run\n").expect("section");
             let section = &p[at..];
-            assert!(section.starts_with(
+            let expected = format!(
                 "## Checks the control plane will re-run\ntest: cargo test (argv)\n\
-                 lint: if (Test-Path x) { exit 0 } (powershell)\n\
+                 lint: if (Test-Path x) {{ exit 0 }} (powershell)\n\
                  Run the tests the spec names before you finish. Your verification_requests are kept for \
                  reference only; the control plane runs the checks above.\n\
                  Evidence for the whole test suite comes from the control plane's verify of the \
                  checks above, not from you. Run the tests the spec names, each as its own \
                  foreground command, and do not start a whole-suite run that cannot finish within \
                  one command's time limit; when the spec asks for the whole suite, run it in parts \
-                 that each finish, and keep each part's output.\n\nWhen done, "
-            ), "{section}");
+                 that each finish, and keep each part's output.\n{}{}\n\nWhen done, ",
+                INTERFACE_TEST_LEAD_IN,
+                crate::review_json::INTERFACE_TEST_RULE
+            );
+            assert!(section.starts_with(&expected), "{section}");
             assert!(!p.contains("(none approved yet)"));
             // before the result.json contract, after the spec sections
             assert!(at < p.find("write the file `.agent/result.json`").unwrap());
@@ -1558,6 +1601,32 @@ mod tests {
                         false => assert!(!p.contains("## Research claims"), "{label}"),
                     }
                 }
+            }
+        }
+    }
+
+    /// The implementer prompt carries the reviewers' interface test rule once,
+    /// after the suite note and before the result.json instruction.
+    #[test]
+    fn every_implementer_prompt_carries_the_interface_test_rule_once() {
+        let line = format!(
+            "{}{}\n",
+            INTERFACE_TEST_LEAD_IN,
+            crate::review_json::INTERFACE_TEST_RULE
+        );
+        for research in [false, true] {
+            let prompts = [
+                ("claude", build_prompt("01T", &demo_spec(), None, None, None, &[], &Default::default(), research)),
+                ("codex", build_codex_prompt("01T", &demo_spec(), None, None, None, &[], &Default::default(), research)),
+            ];
+            for (who, p) in prompts {
+                let label = format!("{who} research={research}");
+                assert_eq!(p.matches(crate::review_json::INTERFACE_TEST_RULE).count(), 1, "{label}");
+                assert_eq!(p.matches(&line).count(), 1, "{label}");
+                let at = p.find(&line).unwrap();
+                assert!(p[..at].ends_with('\n') || at == 0, "{label}: starts its own line");
+                assert_eq!(p.find(SUITE_NOTE).unwrap() + SUITE_NOTE.len(), at, "{label}");
+                assert!(at < p.find("write the file `.agent/result.json`").unwrap(), "{label}");
             }
         }
     }
@@ -1685,6 +1754,7 @@ mod tests {
             previous_candidate: "cafebabe".to_string(),
             unmet: vec!["AC1: the retry never fires (evidence E002)".to_string()],
             extra_findings: vec!["major: the test asserts a constant".to_string()],
+            advisory: vec![],
         };
         let p = build_prompt("01T", &demo_spec(), Some(&addendum), None, None, &[], &Default::default(), false);
         assert!(p.contains("## Previous attempt was rejected"));
@@ -1716,6 +1786,7 @@ mod tests {
             previous_candidate: "cafebabe".to_string(),
             unmet: vec!["AC1: the retry never fires".to_string()],
             extra_findings: vec!["major: the test asserts a constant".to_string()],
+            advisory: vec![],
         };
         let p = build_prompt("01T", &demo_spec(), Some(&addendum), None, None, &[], &Default::default(), false);
         assert!(p.contains(ASK));
@@ -1726,6 +1797,56 @@ mod tests {
         let ask_at = p.find(ASK).unwrap();
         assert!(ask_at > p.find("- major: the test asserts a constant").unwrap());
         assert!(ask_at < p.find(".agent/result.json").unwrap());
+    }
+
+    /// REV-2 (AC1): advisory findings get their own subsection after the
+    /// required lists and after "Fix exactly these", in both the Claude and
+    /// the codex prompt; with no advisory findings there is no subsection.
+    #[test]
+    fn the_rework_section_lists_advisory_findings_after_the_required_ones() {
+        let addendum = crate::spec::ReworkAddendum {
+            attempt: 2,
+            previous_run: "01RUNPREV".to_string(),
+            previous_attempt: 1,
+            previous_candidate: "cafebabe".to_string(),
+            unmet: vec!["AC1: the error is swallowed (evidence E002)".to_string()],
+            extra_findings: vec!["major: race on rename".to_string()],
+            advisory: vec![
+                "AC2: help text is stale (evidence E003)".to_string(),
+                "minor: typo in usage".to_string(),
+            ],
+        };
+        for p in [
+            build_prompt("01T", &demo_spec(), Some(&addendum), None, None, &[], &Default::default(), false),
+            build_codex_prompt("01T", &demo_spec(), Some(&addendum), None, None, &[], &Default::default(), false),
+        ] {
+            let head = p.find("### Advisory findings (not required)\n").expect("advisory subsection");
+            let fix = p.find("Fix exactly these.").unwrap();
+            let (required, rest) = p.split_at(head);
+            // the required lists come before "Fix exactly these", the
+            // advisory ones only after it
+            assert!(required.contains("- AC1: the error is swallowed (evidence E002)"));
+            assert!(required.contains("- major: race on rename"));
+            assert!(!required.contains("help text is stale"));
+            assert!(!required.contains("typo in usage"));
+            assert!(fix < head);
+            assert!(rest.contains("- AC2: help text is stale (evidence E003)\n"));
+            assert!(rest.contains("- minor: typo in usage\n"));
+            assert!(rest.contains("not required fixes"));
+            assert!(rest.contains("small-fixes list"));
+            assert!(rest.contains("fix one in passing"));
+            assert!(!rest.contains("the error is swallowed"));
+            assert!(head < p.find(".agent/result.json").unwrap());
+        }
+
+        let none = crate::spec::ReworkAddendum { advisory: vec![], ..addendum };
+        for p in [
+            build_prompt("01T", &demo_spec(), Some(&none), None, None, &[], &Default::default(), false),
+            build_codex_prompt("01T", &demo_spec(), Some(&none), None, None, &[], &Default::default(), false),
+        ] {
+            assert!(p.contains("## Previous attempt was rejected"));
+            assert!(!p.contains("Advisory findings"), "{p}");
+        }
     }
 
     #[test]
@@ -1766,6 +1887,7 @@ mod tests {
             previous_candidate: "cafebabe".to_string(),
             unmet: vec!["AC1: not met".to_string()],
             extra_findings: vec![],
+            advisory: vec![],
         };
         let p = build_prompt("01T", &demo_spec(), Some(&after_a_crash), None, None, &[], &Default::default(), false);
         assert!(p.contains("This is attempt 3"));
@@ -1784,6 +1906,7 @@ mod tests {
             previous_candidate: String::new(),
             unmet: vec!["AC1: not met".to_string()],
             extra_findings: vec![],
+            advisory: vec![],
         };
         let p = build_prompt("01T", &demo_spec(), Some(&nothing_before), None, None, &[], &Default::default(), false);
         assert!(p.contains("A previous attempt was reviewed and rejected"));
@@ -1828,6 +1951,7 @@ mod tests {
             previous_candidate: "cafebabe".to_string(),
             unmet: vec!["AC1: not met".to_string()],
             extra_findings: vec!["found a leak".to_string()],
+            advisory: vec![],
         };
         let reroute = crate::spec::RerouteAddendum {
             previous_run: "01RUNB1".to_string(),

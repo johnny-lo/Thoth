@@ -13,7 +13,7 @@
 use crate::commands::usage;
 use crate::config::Paths;
 use crate::output;
-use crate::review_json::{CATEGORIES, FIX_SIZES};
+use crate::review_json::{category_blocks, CATEGORIES, FIX_SIZES};
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -107,9 +107,27 @@ pub struct Retro {
     pub categories: Vec<Group>,
 }
 
+impl Group {
+    /// REV-2 (AC6): whether this category blocks, by REV-1's definition
+    /// (`review_json::category_blocks`); `unclassified` blocks.
+    pub fn blocking(&self) -> bool {
+        category_blocks(Some(&self.category))
+    }
+}
+
 impl Retro {
     pub fn finding_count(&self) -> usize {
         self.categories.iter().map(|g| g.findings.len()).sum()
+    }
+
+    /// REV-2 (AC6): the findings in blocking categories.
+    pub fn blocking_count(&self) -> usize {
+        self.categories.iter().filter(|g| g.blocking()).map(|g| g.findings.len()).sum()
+    }
+
+    /// REV-2 (AC6): the findings in advisory categories.
+    pub fn advisory_count(&self) -> usize {
+        self.finding_count() - self.blocking_count()
     }
 }
 
@@ -189,7 +207,7 @@ fn findings_of(review: &ReviewRow) -> Vec<(String, Item)> {
     let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
     let category = |v: &Value| {
         text(v, "category")
-            .filter(|c| CATEGORIES.iter().any(|(name, _)| name == c))
+            .filter(|c| CATEGORIES.iter().any(|cat| cat.name == c))
             .unwrap_or_else(|| UNCLASSIFIED.to_string())
     };
     let fix_size = |v: &Value| text(v, "fix_size").filter(|s| FIX_SIZES.contains(&s.as_str()));
@@ -283,6 +301,7 @@ fn to_json(r: &Retro) -> Value {
         .map(|g| {
             json!({
                 "category": g.category,
+                "blocking": g.blocking(),
                 "count": g.findings.len(),
                 "task_count": g.tasks.len(),
                 "tasks": g.tasks.iter().map(|t| json!({
@@ -309,6 +328,8 @@ fn to_json(r: &Retro) -> Value {
         "since": r.since.format(&Rfc3339).unwrap_or_default(),
         "reviews": r.reviews,
         "findings": r.finding_count(),
+        "blocking_findings": r.blocking_count(),
+        "advisory_findings": r.advisory_count(),
         "sizes": r.sizes.to_json(),
         "categories": categories,
     })
@@ -319,20 +340,23 @@ fn human(r: &Retro) -> String {
         return format!("retro: no review findings in the last {} days", r.days);
     }
     let mut lines = vec![format!(
-        "retro: last {} days (since {}): {} reviews, {} findings ({})",
+        "retro: last {} days (since {}): {} reviews, {} findings, {} blocking, {} advisory ({})",
         r.days,
         r.since.format(&Rfc3339).unwrap_or_default(),
         r.reviews,
         r.finding_count(),
+        r.blocking_count(),
+        r.advisory_count(),
         r.sizes.human()
     )];
     for g in &r.categories {
         lines.push(format!(
-            "{}  {} findings in {} tasks  ({})",
+            "{}  {} findings in {} tasks  ({})  ({})",
             g.category,
             g.findings.len(),
             g.tasks.len(),
-            g.sizes.human()
+            g.sizes.human(),
+            if g.blocking() { "blocking" } else { "advisory" }
         ));
         if g.suggest_check {
             lines.push(format!(
@@ -476,5 +500,32 @@ mod tests {
         assert_eq!(names, vec!["platform", "concurrency", "docs"]);
         assert_eq!(r.sizes, Sizes { s: 1, m: 1, l: 1, none: 1 });
         assert_eq!(r.reviews, 4);
+    }
+
+    /// REV-2 (AC6): each group says whether it blocks, by REV-1's
+    /// definition, and the totals split into blocking and advisory.
+    #[test]
+    fn retro_splits_findings_into_blocking_and_advisory() {
+        let no_label = r#"{"criteria":[{"id":"AC1","verdict":"unmet","evidence":[],"note":"n"}],"extra_findings":[]}"#;
+        let rows = vec![
+            row("T1", "2026-10-10T00:00:00Z", &unmet("docs", "S")),
+            row("T2", "2026-10-10T00:00:00Z", &unmet("test_missing", "S")),
+            row("T3", "2026-10-10T00:00:00Z", &unmet("test_incomplete", "S")),
+            row("T4", "2026-10-10T00:00:00Z", no_label),
+        ];
+        let r = summarise(&rows, 7, now());
+        assert!(!group(&r, "docs").blocking());
+        assert!(!group(&r, "test_incomplete").blocking());
+        assert!(group(&r, "test_missing").blocking());
+        assert!(group(&r, UNCLASSIFIED).blocking());
+        assert_eq!(r.blocking_count(), 2);
+        assert_eq!(r.advisory_count(), 2);
+        let v = to_json(&r);
+        assert_eq!(v["blocking_findings"], 2);
+        assert_eq!(v["advisory_findings"], 2);
+        let text = human(&r);
+        assert!(text.lines().next().unwrap().contains("4 findings, 2 blocking, 2 advisory"), "{text}");
+        assert!(text.lines().any(|l| l.starts_with("docs ") && l.ends_with("(advisory)")), "{text}");
+        assert!(text.lines().any(|l| l.starts_with("test_missing ") && l.ends_with("(blocking)")), "{text}");
     }
 }

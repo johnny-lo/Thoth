@@ -118,7 +118,11 @@ fn old_and_new_protocols_and_bad_input() {
     assert_eq!(discover["result"]["resultType"], "complete");
     let list = s.send(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 36);
+    // AUTO-1a: no hard-coded total (the pipeline tools were added); every
+    // tool is listed once and thoth_guide stays last.
+    let unique: std::collections::BTreeSet<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(unique.len(), tools.len());
+    assert_eq!(tools.last().unwrap()["name"], "thoth_guide");
     // Only the tool names are checked: thoth_checks_approve is the one that
     // approves, and none offers protect or unprotect.
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -135,23 +139,33 @@ fn old_and_new_protocols_and_bad_input() {
     // Each confirm tool sits right after its start tool:
     // thoth_review_confirm after thoth_review_start, thoth_spec_review_confirm
     // after thoth_spec_review_start.
-    assert_eq!(
-        names[24..],
-        [
-            "thoth_verify_start",
-            "thoth_job_status",
-            "thoth_checks_list",
-            "thoth_checks_add",
-            "thoth_checks_approve",
-            "thoth_checks_remove",
-            "thoth_config_list",
-            "thoth_doctor",
-            "thoth_spec_lint",
-            "thoth_task_accept",
-            "thoth_task_result",
-            "thoth_guide"
-        ]
-    );
+    // AUTO-1a: found by name and compared in order, so a tool added in
+    // between (thoth_pipeline_start, _show, _stop before thoth_guide) does
+    // not move every expected position.
+    let order = [
+        "thoth_cancel",
+        "thoth_verify_start",
+        "thoth_job_status",
+        "thoth_checks_list",
+        "thoth_checks_add",
+        "thoth_checks_approve",
+        "thoth_checks_remove",
+        "thoth_config_list",
+        "thoth_doctor",
+        "thoth_spec_lint",
+        "thoth_task_accept",
+        "thoth_task_result",
+        "thoth_pipeline_start",
+        "thoth_pipeline_show",
+        "thoth_pipeline_stop",
+        "thoth_guide",
+    ];
+    let at: Vec<usize> = order
+        .iter()
+        .map(|n| names.iter().position(|m| m == n).unwrap_or_else(|| panic!("{n} missing from {names:?}")))
+        .collect();
+    assert!(at.windows(2).all(|w| w[1] == w[0] + 1), "{names:?}");
+    assert_eq!(*names.last().unwrap(), "thoth_guide");
     assert_eq!(names[23], "thoth_cancel");
     assert_eq!(names[15], "thoth_review_start");
     assert_eq!(names[16], "thoth_review_confirm");
@@ -898,4 +912,141 @@ fn task_create_starts_at_base_or_at_the_head_of_the_repo_worktree() {
         assert_eq!(v["result"]["isError"], true, "{bad}: {v}");
     }
     assert_eq!(count(&mut s, 8), before);
+}
+
+/// The inherited variables whose names hold KEY, TOKEN, SECRET or PASSWORD
+/// (names only); SMALL-9a's case drops them from every thoth it starts.
+fn secret_like_vars() -> Vec<std::ffi::OsString> {
+    std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            let upper = name.to_string_lossy().to_uppercase();
+            ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w))
+        })
+        .collect()
+}
+
+/// SMALL-9a AC5 (h): thoth_dispatch on an account past the quota reserve is
+/// a tool error with the refusal, and starts no run.
+#[test]
+fn dispatch_past_the_quota_reserve_is_a_tool_error() {
+    let f = common::fixture();
+    let thoth = |args: &[&str]| {
+        let mut c = f.cmd();
+        for name in secret_like_vars() {
+            c.env_remove(name);
+        }
+        c.args(args).assert().success().get_output().stdout.clone()
+    };
+    thoth(&["init"]);
+    let cfg = f.home_path().join("profiles").join("codex-q");
+    std::fs::create_dir_all(cfg.join("sessions")).unwrap();
+    let shown = cfg.display().to_string();
+    thoth(&["profile", "add", "codex-q", "--provider", "openai", "--harness", "codex", "--config-dir", &shown]);
+    let line = json!({"timestamp": "2026-10-29T00:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
+        "limit_id": "codex", "limit_name": null,
+        "primary": {"used_percent": 97.0, "window_minutes": 300, "resets_at": 4_102_444_800u64},
+        "secondary": {"used_percent": 1.0, "window_minutes": 10080, "resets_at": 4_102_444_800u64}
+    }}});
+    std::fs::write(cfg.join("sessions").join("rollout.jsonl"), format!("{line}\n")).unwrap();
+    thoth(&["config", "set", "quota-reserve-percent", "5"]);
+
+    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    c.arg("mcp")
+        .current_dir(f.repo.path())
+        .env("THOTH_HOME", f.home.path())
+        .env("THOTH_CLAUDE_BIN", env!("CARGO_BIN_EXE_fake-claude"))
+        .env("THOTH_CODEX_BIN", env!("CARGO_BIN_EXE_fake-codex"))
+        .env("THOTH_AGY_BIN", env!("CARGO_BIN_EXE_fake-agy"))
+        .env("THOTH_ARENA_URL", common::offline_arena_url(f.home.path()))
+        .env("FAKE_SCENARIO", "ok")
+        .env_remove("THOTH_RUN_ID")
+        .env_remove("THOTH_INBOX_DIR")
+        .env_remove("THOTH_EXE")
+        .env_remove("FAKE_TASK_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in secret_like_vars() {
+        c.env_remove(name);
+    }
+    let mut child = c.spawn().unwrap();
+    let input = child.stdin.take().unwrap();
+    let output = BufReader::new(child.stdout.take().unwrap());
+    let mut s = Server { child, input, output };
+
+    let spec = json!({"goal":"g","acceptance_criteria":["AC1: x"],"constraints":[],"non_goals":[],"excluded_alternatives":[],"risk":"low"});
+    let created = s.call(1, "thoth_task_create", json!({"title":"reserve","spec":spec}));
+    let task = created["result"]["structuredContent"]["task_id"].as_str().unwrap().to_owned();
+    let refused = s.call(
+        2,
+        "thoth_dispatch",
+        json!({"task": task, "profile": "codex-q", "model": "gpt-5.6-luna", "effort": "medium"}),
+    );
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    let message = refused["result"]["structuredContent"]["error"].as_str().unwrap_or_default().to_string();
+    assert!(message.contains("quota-reserve-percent 5") && message.contains("codex-q"), "{refused}");
+    let status = s.call(3, "thoth_status", json!({"task": task}));
+    assert_eq!(status["result"]["structuredContent"]["runs"], json!([]), "{status}");
+}
+
+/// SMALL-9b AC1: thoth_dispatch without `timeout` passes no flag, so the run
+/// gets the default for its effort: three hours at high.
+#[test]
+fn dispatch_without_a_timeout_gets_the_default_for_its_effort() {
+    let f = common::fixture();
+    let thoth = |args: &[&str]| {
+        let mut c = f.cmd();
+        for name in secret_like_vars() {
+            c.env_remove(name);
+        }
+        c.args(args).assert().success().get_output().stdout.clone()
+    };
+    thoth(&["init"]);
+    let cfg = f.home_path().join("profiles").join("claude-a");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let shown = cfg.display().to_string();
+    thoth(&["profile", "add", "claude-a", "--provider", "anthropic", "--harness", "claude-code", "--config-dir", &shown]);
+    let spec_file = f.home_path().join("spec.json");
+    std::fs::write(&spec_file, common::Fixture::SPEC).unwrap();
+    let shown = spec_file.display().to_string();
+    let created: Value = serde_json::from_slice(&thoth(&["task", "create", "-f", &shown, "--json"])).unwrap();
+    let task = created["task_id"].as_str().unwrap().to_owned();
+
+    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    c.arg("mcp")
+        .current_dir(f.repo.path())
+        .env("THOTH_HOME", f.home.path())
+        .env("THOTH_CLAUDE_BIN", env!("CARGO_BIN_EXE_fake-claude"))
+        .env("THOTH_CODEX_BIN", env!("CARGO_BIN_EXE_fake-codex"))
+        .env("THOTH_AGY_BIN", env!("CARGO_BIN_EXE_fake-agy"))
+        .env("THOTH_ARENA_URL", common::offline_arena_url(f.home.path()))
+        .env("FAKE_SCENARIO", "ok")
+        .env("FAKE_TASK_ID", &task)
+        .env_remove("THOTH_RUN_ID")
+        .env_remove("THOTH_INBOX_DIR")
+        .env_remove("THOTH_EXE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in secret_like_vars() {
+        c.env_remove(name);
+    }
+    let mut child = c.spawn().unwrap();
+    let input = child.stdin.take().unwrap();
+    let output = BufReader::new(child.stdout.take().unwrap());
+    let mut s = Server { child, input, output };
+
+    let dispatched = s.call(
+        1,
+        "thoth_dispatch",
+        json!({"task": task, "profile": "claude-a", "model": "sonnet", "effort": "high", "reason": "SMALL-9b test"}),
+    );
+    assert_eq!(dispatched["result"]["isError"], false, "{dispatched}");
+    let d = &dispatched["result"]["structuredContent"];
+    assert_eq!(d["timeout_seconds"], 10800, "{dispatched}");
+    let run = d["run_id"].as_str().unwrap().to_owned();
+    // let the run finish before the temporary state directory goes away
+    let mut id = 2;
+    wait_run(&mut s, &mut id, &run);
 }

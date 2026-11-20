@@ -31,6 +31,7 @@ mod process;
 mod protected;
 mod records;
 mod redact;
+mod required_checks;
 mod result_json;
 mod review_fix_edits;
 mod review_json;
@@ -158,6 +159,12 @@ fn main() {
         cli::Command::Worktrees { action } => match action {
             cli::WorktreesAction::Prune { json } => *json,
         },
+        cli::Command::Pipeline { action } => match action {
+            cli::PipelineAction::Start { json, .. } => *json,
+            cli::PipelineAction::Show { json, .. } => *json,
+            cli::PipelineAction::Stop { json, .. } => *json,
+        },
+        cli::Command::PipelineRun { .. } => false,
     };
     let code = match run(parsed) {
         Ok(code) => code,
@@ -337,14 +344,14 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                 cli::TaskAction::Show { task, json } => {
                     commands::task::show(&paths, &cwd, &task, json)
                 }
-                cli::TaskAction::UpdateSpec { task, file, json } => refreshing(
-                    &paths,
-                    commands::task::update_spec(&paths, &cwd, &task, &file, json),
-                ),
-                cli::TaskAction::Close { task, reason, json } => refreshing(
-                    &paths,
-                    commands::task::close(&paths, &cwd, &task, &reason, json),
-                ),
+                cli::TaskAction::UpdateSpec { task, file, json } => {
+                    commands::pipeline::ownership_gate(&paths, &cwd, commands::pipeline::Target::Task(&task), "task update-spec")?;
+                    refreshing(&paths, commands::task::update_spec(&paths, &cwd, &task, &file, json))
+                }
+                cli::TaskAction::Close { task, reason, json } => {
+                    commands::pipeline::ownership_gate(&paths, &cwd, commands::pipeline::Target::Task(&task), "task close")?;
+                    refreshing(&paths, commands::task::close(&paths, &cwd, &task, &reason, json))
+                }
                 cli::TaskAction::Accept { task, reason, json } => refreshing(
                     &paths,
                     commands::task::accept(&paths, &cwd, &task, &reason, json),
@@ -382,6 +389,7 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
         } => {
             let paths = config::Paths::from_env()?;
             let cwd = std::env::current_dir()?;
+            commands::pipeline::ownership_gate(&paths, &cwd, commands::pipeline::Target::Task(&task), "dispatch")?;
             let result = commands::dispatch::run(
                 &paths,
                 &cwd,
@@ -435,11 +443,13 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
         cli::Command::Resume { run, json } => {
             let paths = config::Paths::from_env()?;
             let cwd = std::env::current_dir()?;
+            commands::pipeline::ownership_gate(&paths, &cwd, commands::pipeline::Target::Run(&run), "resume")?;
             refreshing(&paths, commands::resume::run(&paths, &cwd, &run, json))
         }
         cli::Command::Submit { file, run, json } => {
             let paths = config::Paths::from_env()?;
             let cwd = std::env::current_dir()?;
+            commands::pipeline::ownership_gate(&paths, &cwd, commands::pipeline::Target::Run(&run), "submit")?;
             refreshing(&paths, commands::submit::run(&paths, &cwd, &file, &run, json))
         }
         cli::Command::Evidence { action } => {
@@ -481,8 +491,16 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                     effort,
                     reason,
                     edit,
+                    no_edit,
                     json,
                 } => {
+                    commands::pipeline::ownership_gate(&paths, &cwd, commands::pipeline::Target::Task(&task), "review start")?;
+                    // RFIX-2: neither flag leaves the mode to the task type.
+                    let edit = match (edit, no_edit) {
+                        (true, _) => Some(true),
+                        (false, true) => Some(false),
+                        (false, false) => None,
+                    };
                     let result = commands::review::start(
                         &paths,
                         &cwd,
@@ -508,6 +526,7 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                     reason,
                     json,
                 } => {
+                    commands::pipeline::ownership_gate(&paths, &cwd, commands::pipeline::Target::Task(&task), "review confirm")?;
                     let result = commands::review::confirm(
                         &paths,
                         &cwd,
@@ -527,6 +546,7 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                     commands::review::show(&paths, &cwd, &task, full, json)
                 }
                 cli::ReviewAction::Record { task, file, json } => {
+                    commands::pipeline::ownership_gate(&paths, &cwd, commands::pipeline::Target::Task(&task), "review record")?;
                     let result = commands::review::record(
                         &paths,
                         &cwd,
@@ -583,6 +603,7 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                         reason,
                         json,
                     } => {
+                        commands::pipeline::ownership_gate(&paths, &cwd, commands::pipeline::Target::Task(&task), "spec review confirm")?;
                         let result = commands::spec_review::confirm(
                             &paths,
                             &cwd,
@@ -684,6 +705,62 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
             let cwd = std::env::current_dir()?;
             match action {
                 cli::WorktreesAction::Prune { json } => commands::worktrees::prune(&paths, &cwd, json),
+            }
+        }
+        cli::Command::Pipeline { action } => {
+            let paths = config::Paths::from_env()?;
+            let cwd = std::env::current_dir()?;
+            match action {
+                cli::PipelineAction::Start {
+                    task,
+                    implementers,
+                    reviewers,
+                    max_attempts,
+                    timeout,
+                    review_timeout,
+                    verify_timeout,
+                    verify_wait,
+                    reason,
+                    quota_threshold,
+                    fold_on_reject,
+                    json,
+                } => refreshing(
+                    &paths,
+                    commands::pipeline::start(
+                        &paths,
+                        &cwd,
+                        commands::pipeline::StartArgs {
+                            task: &task,
+                            implementers: &implementers,
+                            reviewers: &reviewers,
+                            max_attempts: max_attempts.as_deref(),
+                            timeout: timeout.as_deref(),
+                            review_timeout: review_timeout.as_deref(),
+                            verify_timeout: verify_timeout.as_deref(),
+                            verify_wait: verify_wait.as_deref(),
+                            reason: reason.as_deref(),
+                            quota_threshold: quota_threshold.as_deref(),
+                            fold_on_reject,
+                            json,
+                        },
+                    ),
+                ),
+                cli::PipelineAction::Show { task, wait, json } => {
+                    commands::pipeline::show(&paths, &cwd, &task, wait.as_deref(), json)
+                }
+                cli::PipelineAction::Stop { task, json } => {
+                    refreshing(&paths, commands::pipeline::stop(&paths, &cwd, &task, json))
+                }
+            }
+        }
+        cli::Command::PipelineRun { pipeline, supervised } => {
+            // Linux: outside a runner unit, re-run inside one (as run-worker
+            // does), so verify can be killed as a whole and a dead pipeline
+            // takes its verify with it. Windows: always `None`.
+            let args = ["pipeline-run".to_string(), pipeline.clone()];
+            match process::ensure_supervised(&args, supervised)? {
+                Some(code) => Ok(code),
+                None => commands::pipeline::run_background(&pipeline),
             }
         }
     }

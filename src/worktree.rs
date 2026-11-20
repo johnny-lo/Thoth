@@ -174,12 +174,150 @@ pub fn branches_containing(repo_root: &Path, sha: &str) -> Result<Vec<String>> {
     .collect())
 }
 
+/// Why a worktree was kept when its directory links could not be removed
+/// safely (`worktree_kept.detail.reason`).
+pub const LINK_UNREMOVABLE: &str = "link_unremovable";
+
+/// A worktree's directory links could not be removed safely, so nothing else
+/// was done to it: no `git worktree remove`, no recursive delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkCleanupError {
+    /// The entry that could not be read, inspected or removed.
+    pub path: PathBuf,
+    pub error: String,
+}
+
+impl LinkCleanupError {
+    fn new(path: &Path, what: &str, e: impl std::fmt::Display) -> Self {
+        LinkCleanupError { path: path.to_path_buf(), error: format!("{what}: {e}") }
+    }
+
+    /// The path and the error, for a `kept` entry's `detail`.
+    pub fn detail(&self) -> String {
+        format!("{}: {}", self.path.display(), self.error)
+    }
+}
+
+impl std::fmt::Display for LinkCleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{LINK_UNREMOVABLE}: the worktree's directory links could not be removed safely, \
+             so it was left in place: {}",
+            self.detail()
+        )
+    }
+}
+
+impl std::error::Error for LinkCleanupError {}
+
+/// Whether the entry `ft` describes (read without following it) is a link to
+/// a directory. Windows: a directory symlink or a junction (both are
+/// name-surrogate reparse points, which std reports as symlinks). Elsewhere:
+/// a symlink whose target is a directory or does not exist (missing, or a
+/// path through a file); a dangling one is removed too, since unlinking never
+/// touches a target. When the target cannot be read for any other reason
+/// (permission denied, a link loop), nobody can tell what it is, so that is
+/// an error naming the link, and the caller leaves the worktree alone.
+fn is_dir_link(
+    path: &Path,
+    ft: &std::fs::FileType,
+) -> std::result::Result<bool, LinkCleanupError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        let _ = path;
+        Ok(ft.is_symlink_dir())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::ErrorKind;
+        if !ft.is_symlink() {
+            return Ok(false);
+        }
+        match std::fs::metadata(path) {
+            Ok(m) => Ok(m.is_dir()),
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(true),
+            Err(e) => Err(LinkCleanupError::new(path, "reading the link's target failed", e)),
+        }
+    }
+}
+
+/// Removes one directory link as a directory entry, never its target.
+fn remove_dir_link(path: &Path) -> std::io::Result<()> {
+    // Windows: RemoveDirectoryW on a junction or directory symlink drops the
+    // reparse point itself. Unix: unlink never follows a symlink.
+    #[cfg(windows)]
+    {
+        std::fs::remove_dir(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Walks `root` without descending into links and skipping every `.git`
+/// entry, and removes each directory symlink or junction it finds as a link
+/// entry, never touching what it points to. Run before `git worktree remove
+/// --force`, which on Windows has followed a `node_modules` junction and
+/// emptied its target (2026-10-14). Any read, metadata or removal failure -
+/// including a link whose target cannot be read - stops here with the entry
+/// and the error, leaving that link in place; the caller must then leave the
+/// worktree alone. A `root` that does not exist is not an error (git reports
+/// it); a `root` that is itself a link is.
+pub fn remove_dir_links(root: &Path) -> std::result::Result<usize, LinkCleanupError> {
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(LinkCleanupError::new(root, "reading metadata failed", e)),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(LinkCleanupError::new(
+            root,
+            "refusing",
+            "the worktree path is itself a link",
+        ));
+    }
+    if !meta.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| LinkCleanupError::new(&dir, "reading the directory failed", e))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| LinkCleanupError::new(&dir, "reading the directory failed", e))?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            let ft = std::fs::symlink_metadata(&path)
+                .map_err(|e| LinkCleanupError::new(&path, "reading metadata failed", e))?
+                .file_type();
+            if is_dir_link(&path, &ft)? {
+                remove_dir_link(&path)
+                    .map_err(|e| LinkCleanupError::new(&path, "removing the link failed", e))?;
+                removed += 1;
+            } else if ft.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// `git worktree remove --force PATH`, and nothing else: no fallback to
 /// deleting the directory. The worktree sweep has already decided the
 /// directory is safe to drop; when git still refuses (a file locked on
 /// Windows), the caller keeps the directory and reports git's message.
 /// The branch is left alone - `git worktree remove` never deletes one.
+/// Every directory link inside is removed first (`remove_dir_links`); when
+/// that fails the error is a `LinkCleanupError` and git is never run.
 pub fn remove_worktree_force(repo_root: &Path, path: &Path) -> Result<()> {
+    remove_dir_links(path)?;
     let mut cmd = Command::new("git");
     cmd.arg("worktree")
         .arg("remove")
@@ -462,8 +600,15 @@ pub fn checkout_detached(dir: &Path, commit: &str) -> Result<()> {
 /// Remove a linked worktree that `ensure_detached_worktree` made for a
 /// throwaway job (the `verify --at-base` checkout). Best effort by design: it
 /// runs from a drop guard, where there is nobody to return an error to, so it
-/// falls back to deleting the directory and pruning git's bookkeeping.
-pub fn remove_worktree(repo_root: &Path, path: &Path) {
+/// falls back to deleting the directory and pruning git's bookkeeping. The
+/// directory links inside are removed first; when that fails nothing else
+/// happens - neither git nor the recursive delete runs - and the error says
+/// which entry and why, for the caller to report.
+pub fn remove_worktree(
+    repo_root: &Path,
+    path: &Path,
+) -> std::result::Result<(), LinkCleanupError> {
+    remove_dir_links(path)?;
     let mut cmd = Command::new("git");
     cmd.arg("worktree")
         .arg("remove")
@@ -480,6 +625,95 @@ pub fn remove_worktree(repo_root: &Path, path: &Path) {
         prune.args(["worktree", "prune"]).current_dir(repo_root);
         let _ = crate::process::quiet(&mut prune).output();
     }
+    Ok(())
+}
+
+/// The local branches under `refs/heads/PREFIX`, as names without
+/// `refs/heads/` (full ref names are read, so a tag of the same name cannot
+/// change how a branch is spelled).
+pub fn local_branches_under(repo_root: &Path, prefix: &str) -> Result<Vec<String>> {
+    let pattern = format!("refs/heads/{prefix}");
+    Ok(git_capture(repo_root, &["for-each-ref", "--format=%(refname)", &pattern])?
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("refs/heads/").map(str::to_string))
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// The branches some worktree (the main one included) has checked out, as
+/// names without `refs/heads/`.
+pub fn checked_out_branches(repo_root: &Path) -> Result<Vec<String>> {
+    Ok(git_capture(repo_root, &["worktree", "list", "--porcelain"])?
+        .lines()
+        .filter_map(|l| l.trim_end().strip_prefix("branch refs/heads/").map(str::to_string))
+        .collect())
+}
+
+/// The commit a full ref name points to: `Ok(None)` when there is no such ref
+/// (`rev-parse --verify --quiet` exits 1), `Err` for a real failure.
+pub fn ref_commit(repo_root: &Path, refname: &str) -> Result<Option<String>> {
+    let out = crate::process::quiet(
+        Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &format!("{refname}^{{commit}}")])
+            .current_dir(repo_root),
+    )
+    .output()?;
+    match out.status.code() {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string())),
+        Some(1) => Ok(None),
+        code => bail!(
+            "git rev-parse --verify {refname} failed in {} (exit {code:?}): {}",
+            repo_root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
+/// The merge commits in `base..branch` (both full ref names).
+pub fn merges_between(repo_root: &Path, base: &str, branch: &str) -> Result<Vec<String>> {
+    let range = format!("{base}..{branch}");
+    Ok(git_capture(repo_root, &["rev-list", "--merges", &range])?
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// `git cherry BASE BRANCH` verbatim: one line per commit of `BASE..BRANCH`,
+/// `-` when an equivalent change is already in `BASE`, `+` when not.
+pub fn cherry(repo_root: &Path, base: &str, branch: &str) -> Result<String> {
+    git_capture(repo_root, &["cherry", base, branch])
+}
+
+/// Deletes the local branch `branch`. Without `force`, `git branch -d`, with
+/// `BASE` standing in as the branch's upstream for this one command: git then
+/// checks the branch is merged into `refs/heads/BASE` rather than into
+/// whatever the main tree has checked out. With `force`, `git branch -D`.
+/// git's own refusal (a checked-out branch, a lock) comes back as the error.
+pub fn delete_branch(repo_root: &Path, branch: &str, base: &str, force: bool) -> Result<()> {
+    let mut cmd = Command::new("git");
+    if !force {
+        cmd.arg("-c")
+            .arg(format!("branch.{branch}.remote=."))
+            .arg("-c")
+            .arg(format!("branch.{branch}.merge=refs/heads/{base}"));
+    }
+    cmd.arg("branch")
+        .arg(if force { "-D" } else { "-d" })
+        .arg("--")
+        .arg(branch)
+        .current_dir(repo_root);
+    crate::process::quiet(&mut cmd);
+    let out = cmd.output()?;
+    if !out.status.success() {
+        bail!(
+            "git branch {} {branch} failed (exit {:?}): {}",
+            if force { "-D" } else { "-d" },
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// `git worktree prune`: drop registrations whose directory is gone. Best effort.
@@ -539,10 +773,18 @@ pub fn diff_name_only(dir: &Path, from: &str, to: &str) -> Result<Vec<String>> {
 /// Parses `git diff --name-only -z`: each path followed by a NUL. Paths are
 /// passed on as git wrote them - no trim, no unquoting.
 fn parse_name_only_z(bytes: &[u8]) -> Vec<String> {
+    split_z(bytes)
+        .into_iter()
+        .map(|p| String::from_utf8_lossy(&p).to_string())
+        .collect()
+}
+
+/// The NUL-terminated paths of a `-z` listing, as raw bytes.
+fn split_z(bytes: &[u8]) -> Vec<Vec<u8>> {
     bytes
         .split(|b| *b == 0)
         .filter(|p| !p.is_empty())
-        .map(|p| String::from_utf8_lossy(p).to_string())
+        .map(<[u8]>::to_vec)
         .collect()
 }
 
@@ -590,6 +832,130 @@ fn parse_name_status_z(bytes: &[u8]) -> Vec<(char, String)> {
 pub fn diff_patch(dir: &Path, from: &str, to: &str) -> Result<Vec<u8>> {
     let range = format!("{from}..{to}");
     git_capture_bytes(dir, &["diff", "--patch", "--stat", &range])
+}
+
+/// SMALL-9c: the best common ancestor of `a` and `b` (`git merge-base`), or
+/// `None` when they have none. git exits 1 with nothing printed when there is
+/// no merge base; any other failure is an error.
+pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
+    let out = crate::process::quiet(
+        Command::new("git").args(["merge-base", a, b]).current_dir(dir),
+    )
+    .output()?;
+    match out.status.code() {
+        Some(0) => {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if sha.is_empty() {
+                bail!("git merge-base printed nothing in {}", dir.display());
+            }
+            Ok(Some(sha))
+        }
+        Some(1) if out.stdout.is_empty() && out.stderr.is_empty() => Ok(None),
+        code => bail!(
+            "git merge-base failed in {} (exit {code:?}): {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
+/// SMALL-9c: every file-level path the range changes, as `git diff` lists
+/// it: a blob, symlink or gitlink entry that differs (object, type or mode;
+/// an added or deleted path counts). A directory is never listed itself,
+/// only what changed below it; a path that is a file on one side and a
+/// directory on the other is listed for its file side. Without rename
+/// detection, so a moved file is both of its paths, and with submodule
+/// entries always compared by commit whatever `diff.ignoreSubmodules` says.
+/// Paths are git's raw bytes, not decoded: a path that is not UTF-8 and one
+/// that holds U+FFFD must not compare equal.
+pub fn changed_paths(dir: &Path, from: &str, to: &str) -> Result<Vec<Vec<u8>>> {
+    let range = format!("{from}..{to}");
+    Ok(split_z(&git_capture_bytes(
+        dir,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "-z",
+            &range,
+        ],
+    )?))
+}
+
+/// SMALL-9c: every path whose tree entry differs between `from` and `to`,
+/// directories included: like `changed_paths`, plus each directory whose
+/// tree object differs (`git diff-tree -r -t`). A path absent from this list
+/// has the same tree entry (object, type and mode) in both commits, or is
+/// absent from both; a directory is judged by its own tree object, never by
+/// the paths that changed below it. Raw bytes, as in `changed_paths`.
+pub fn changed_entries(dir: &Path, from: &str, to: &str) -> Result<Vec<Vec<u8>>> {
+    Ok(split_z(&git_capture_bytes(
+        dir,
+        &[
+            "diff-tree",
+            "-r",
+            "-t",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--name-only",
+            "-z",
+            from,
+            to,
+        ],
+    )?))
+}
+
+/// SMALL-9c: the pathspec that keeps the whole tree except `exclude`, each
+/// path matched literally (no glob, no magic) and from the top of the tree
+/// whatever directory git runs in. Empty when nothing is excluded, so the
+/// command is exactly the unfiltered one. Like every git pathspec, an
+/// excluded path also excludes everything below it: a caller that must not
+/// hide such a path checks for one first.
+fn excluding_pathspec(exclude: &[String]) -> Vec<String> {
+    if exclude.is_empty() {
+        return Vec::new();
+    }
+    let mut args = vec!["--".to_string(), ":/".to_string()];
+    args.extend(exclude.iter().map(|p| format!(":(top,exclude,literal){p}")));
+    args
+}
+
+/// Runs `git <base args> [-- :/ :(top,exclude,literal)PATH...]`.
+fn git_capture_bytes_excluding(dir: &Path, base: &[&str], exclude: &[String]) -> Result<Vec<u8>> {
+    let spec = excluding_pathspec(exclude);
+    let mut args: Vec<&str> = base.to_vec();
+    args.extend(spec.iter().map(String::as_str));
+    git_capture_bytes(dir, &args)
+}
+
+/// SMALL-9c: `diff_stat` without the `exclude` paths.
+pub fn diff_stat_excluding(dir: &Path, from: &str, to: &str, exclude: &[String]) -> Result<String> {
+    let range = format!("{from}..{to}");
+    let bytes = git_capture_bytes_excluding(dir, &["diff", "--stat", &range], exclude)?;
+    Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
+}
+
+/// SMALL-9c: `diff_name_only` without the `exclude` paths.
+pub fn diff_name_only_excluding(
+    dir: &Path,
+    from: &str,
+    to: &str,
+    exclude: &[String],
+) -> Result<Vec<String>> {
+    let range = format!("{from}..{to}");
+    Ok(parse_name_only_z(&git_capture_bytes_excluding(
+        dir,
+        &["diff", "--name-only", "-z", &range],
+        exclude,
+    )?))
+}
+
+/// SMALL-9c: `diff_patch` without the `exclude` paths; with nothing excluded
+/// it is `diff_patch` byte for byte.
+pub fn diff_patch_excluding(dir: &Path, from: &str, to: &str, exclude: &[String]) -> Result<Vec<u8>> {
+    let range = format!("{from}..{to}");
+    git_capture_bytes_excluding(dir, &["diff", "--patch", "--stat", &range], exclude)
 }
 
 /// `git show --stat` for one commit: three `--format` lines (full sha, subject,
@@ -972,6 +1338,338 @@ mod tests {
         assert!(err.contains("git worktree remove failed"), "{err}");
     }
 
+    /// A directory link at `link` to `target`: a junction on Windows (no
+    /// privilege needed), a symlink elsewhere.
+    fn dir_link(target: &Path, link: &Path) {
+        #[cfg(windows)]
+        {
+            let out = Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "mklink /J: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    /// An outside directory holding a marker file and a subdirectory.
+    fn outside_target() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("inner")).unwrap();
+        std::fs::write(dir.path().join("inner").join("deep.txt"), "deep\n").unwrap();
+        let marker = dir.path().join("marker.txt");
+        std::fs::write(&marker, "precious contents\n").unwrap();
+        (dir, marker)
+    }
+
+    fn assert_target_intact(dir: &Path, marker: &Path) {
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "precious contents\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("inner").join("deep.txt")).unwrap(),
+            "deep\n"
+        );
+    }
+
+    /// A worktree with a link at its top (`node_modules`) and one two
+    /// directories down, each to its own outside directory.
+    fn worktree_with_nested_links() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        [(tempfile::TempDir, PathBuf); 2],
+    ) {
+        let (repo, head) = tmp_repo();
+        let holder = tempfile::tempdir().unwrap();
+        let wt = holder.path().join("01HZTASK-a1");
+        ensure_worktree(repo.path(), &wt, &branch_name("01HZTASK", 1), &head).unwrap();
+        let top = outside_target();
+        let nested = outside_target();
+        dir_link(top.0.path(), &wt.join("node_modules"));
+        std::fs::create_dir_all(wt.join("pkg").join("deep")).unwrap();
+        dir_link(nested.0.path(), &wt.join("pkg").join("deep").join("vendor"));
+        (repo, holder, wt, [top, nested])
+    }
+
+    /// Links removal: both public removal functions drop nested directory
+    /// links as links, then the worktree, and leave every target as it was.
+    #[test]
+    fn both_removal_functions_remove_nested_dir_links_without_touching_their_targets() {
+        let (repo, _holder, wt, targets) = worktree_with_nested_links();
+        remove_worktree_force(repo.path(), &wt).unwrap();
+        assert!(!wt.exists(), "{} is still there", wt.display());
+        for (dir, marker) in &targets {
+            assert_target_intact(dir.path(), marker);
+        }
+
+        let (repo, _holder, wt, targets) = worktree_with_nested_links();
+        remove_worktree(repo.path(), &wt).unwrap();
+        assert!(!wt.exists(), "{} is still there", wt.display());
+        for (dir, marker) in &targets {
+            assert_target_intact(dir.path(), marker);
+        }
+    }
+
+    /// Makes removing `link` fail until the guard is dropped. Windows: a
+    /// handle on the link itself that does not share delete access. Unix: a
+    /// read-only parent directory (`None` as root, which ignores it).
+    #[cfg(windows)]
+    fn block_link_removal(link: &Path) -> Option<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(link)
+                .unwrap(),
+        )
+    }
+
+    /// Gives a directory whose permissions a test took away its `0o755` back
+    /// when dropped.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn block_link_removal(link: &Path) -> Option<RestoreMode> {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        let parent = link.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        Some(RestoreMode(parent))
+    }
+
+    /// Links removal: when a link cannot be removed, neither function runs
+    /// git or a recursive delete - the worktree, its files and its
+    /// registration stay, and so does the target - and the error names the
+    /// link. Once the link can go, the removal goes through.
+    #[test]
+    fn a_link_that_cannot_be_removed_leaves_the_worktree_and_its_target() {
+        let (repo, _holder, wt, targets) = worktree_with_nested_links();
+        let link = wt.join("pkg").join("deep").join("vendor");
+        let Some(guard) = block_link_removal(&link) else {
+            return;
+        };
+        let canon_wt = std::fs::canonicalize(&wt).unwrap();
+        let still_registered = || {
+            list_worktrees(repo.path())
+                .unwrap()
+                .iter()
+                .any(|p| std::fs::canonicalize(p).ok() == Some(canon_wt.clone()))
+        };
+
+        let err = remove_worktree_force(repo.path(), &wt).unwrap_err();
+        let link_err = err
+            .downcast_ref::<LinkCleanupError>()
+            .unwrap_or_else(|| panic!("not a LinkCleanupError: {err:#}"));
+        assert_eq!(link_err.path, link);
+        assert!(link_err.detail().contains("vendor"), "{}", link_err.detail());
+        assert!(err.to_string().contains(LINK_UNREMOVABLE), "{err}");
+        assert!(wt.join("a.txt").is_file(), "git or a recursive delete ran");
+        assert!(wt.join(".git").exists());
+        assert!(still_registered());
+
+        let err = remove_worktree(repo.path(), &wt).unwrap_err();
+        assert_eq!(err.path, link);
+        assert!(wt.join("a.txt").is_file(), "the recursive fallback ran");
+        assert!(wt.join("b.txt").is_file());
+        assert!(still_registered());
+        for (dir, marker) in &targets {
+            assert_target_intact(dir.path(), marker);
+        }
+
+        drop(guard);
+        remove_worktree_force(repo.path(), &wt).unwrap();
+        assert!(!wt.exists());
+        assert!(!still_registered());
+        for (dir, marker) in &targets {
+            assert_target_intact(dir.path(), marker);
+        }
+    }
+
+    /// A worktree holding `pkg/vendor`, a symlink to `inner` in an outside
+    /// directory that has lost its search permission, so reading what the
+    /// link points to fails with "permission denied" while the link itself
+    /// could be unlinked.
+    #[cfg(unix)]
+    struct UnreadableLinkTarget {
+        repo: tempfile::TempDir,
+        _holder: tempfile::TempDir,
+        wt: PathBuf,
+        canon_wt: PathBuf,
+        link: PathBuf,
+        // Declared before `target`, so the permission comes back before the
+        // outside directory is deleted.
+        guard: Option<RestoreMode>,
+        target: (tempfile::TempDir, PathBuf),
+    }
+
+    #[cfg(unix)]
+    impl UnreadableLinkTarget {
+        /// `None` as root, where a directory without search permission can
+        /// still be read: the test has nothing to check there.
+        fn new(test: &str) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc::geteuid() } == 0 {
+                masked_eprintln!("{test}: skipped, running as root (permission checks do not apply)");
+                return None;
+            }
+            let (repo, head) = tmp_repo();
+            let holder = tempfile::tempdir().unwrap();
+            let wt = holder.path().join("01HZTASK-a1");
+            ensure_worktree(repo.path(), &wt, &branch_name("01HZTASK", 1), &head).unwrap();
+            let canon_wt = std::fs::canonicalize(&wt).unwrap();
+            let target = outside_target();
+            std::fs::create_dir_all(wt.join("pkg")).unwrap();
+            let link = wt.join("pkg").join("vendor");
+            dir_link(&target.0.path().join("inner"), &link);
+            std::fs::set_permissions(target.0.path(), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let guard = Some(RestoreMode(target.0.path().to_path_buf()));
+            let e = std::fs::metadata(&link).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "precondition: {e}");
+            Some(UnreadableLinkTarget { repo, _holder: holder, wt, canon_wt, link, guard, target })
+        }
+
+        fn registered(&self) -> bool {
+            list_worktrees(self.repo.path())
+                .unwrap()
+                .iter()
+                .any(|p| std::fs::canonicalize(p).ok() == Some(self.canon_wt.clone()))
+        }
+
+        /// Cleanup stopped at the link: the error names it and the failure,
+        /// the link is still there, and neither git nor a recursive delete
+        /// touched the worktree or its registration.
+        fn assert_stopped_at_the_link(&self, err: &LinkCleanupError) {
+            assert_eq!(err.path, self.link);
+            let detail = err.detail();
+            assert!(detail.contains(&self.link.display().to_string()), "{detail}");
+            assert!(detail.contains("Permission denied"), "{detail}");
+            assert!(
+                std::fs::symlink_metadata(&self.link).unwrap().file_type().is_symlink(),
+                "the link was removed"
+            );
+            assert!(self.wt.join("a.txt").is_file(), "git or a recursive delete ran");
+            assert!(self.wt.join("b.txt").is_file(), "git or a recursive delete ran");
+            assert!(self.wt.join(".git").exists());
+            assert!(self.registered());
+        }
+
+        fn give_the_permission_back(&mut self) {
+            drop(self.guard.take());
+        }
+
+        fn assert_removed_with_the_target_intact(&self) {
+            assert!(!self.wt.exists(), "{} is still there", self.wt.display());
+            assert!(!self.registered());
+            assert_target_intact(self.target.0.path(), &self.target.1);
+        }
+    }
+
+    /// Unix: a link whose target cannot be read for any reason but its
+    /// absence might be a directory link, so `remove_worktree_force` stops
+    /// before git and reports the link and the error; with the permission
+    /// back the removal goes through.
+    #[cfg(unix)]
+    #[test]
+    fn remove_worktree_force_stops_before_git_when_a_link_target_cannot_be_read() {
+        let test = "remove_worktree_force_stops_before_git_when_a_link_target_cannot_be_read";
+        let Some(mut s) = UnreadableLinkTarget::new(test) else {
+            return;
+        };
+        let err = remove_worktree_force(s.repo.path(), &s.wt).unwrap_err();
+        let link_err = err
+            .downcast_ref::<LinkCleanupError>()
+            .unwrap_or_else(|| panic!("not a LinkCleanupError: {err:#}"));
+        s.assert_stopped_at_the_link(link_err);
+        assert!(err.to_string().contains(LINK_UNREMOVABLE), "{err}");
+
+        s.give_the_permission_back();
+        remove_worktree_force(s.repo.path(), &s.wt).unwrap();
+        s.assert_removed_with_the_target_intact();
+    }
+
+    /// Unix: the same for `remove_worktree`, which also must not reach its
+    /// recursive-delete fallback.
+    #[cfg(unix)]
+    #[test]
+    fn remove_worktree_stops_before_git_and_its_fallback_when_a_link_target_cannot_be_read() {
+        let test = "remove_worktree_stops_before_git_and_its_fallback_when_a_link_target_cannot_be_read";
+        let Some(mut s) = UnreadableLinkTarget::new(test) else {
+            return;
+        };
+        let err = remove_worktree(s.repo.path(), &s.wt).unwrap_err();
+        s.assert_stopped_at_the_link(&err);
+
+        s.give_the_permission_back();
+        remove_worktree(s.repo.path(), &s.wt).unwrap();
+        s.assert_removed_with_the_target_intact();
+    }
+
+    /// Unix: a dangling symlink - its target missing, or a path through a
+    /// file - is still removed as a link entry by both functions, before git.
+    #[cfg(unix)]
+    #[test]
+    fn both_removal_functions_remove_dangling_links_as_link_entries() {
+        for force in [true, false] {
+            let (repo, head) = tmp_repo();
+            let holder = tempfile::tempdir().unwrap();
+            let wt = holder.path().join("01HZTASK-a1");
+            ensure_worktree(repo.path(), &wt, &branch_name("01HZTASK", 1), &head).unwrap();
+            let file = holder.path().join("a-file");
+            std::fs::write(&file, "not a directory\n").unwrap();
+            let missing = wt.join("node_modules");
+            std::os::unix::fs::symlink(holder.path().join("missing"), &missing).unwrap();
+            let through_a_file = wt.join("vendor");
+            std::os::unix::fs::symlink(file.join("sub"), &through_a_file).unwrap();
+            for link in [&missing, &through_a_file] {
+                assert!(std::fs::metadata(link).is_err(), "precondition: {} dangles", link.display());
+            }
+
+            if force {
+                remove_worktree_force(repo.path(), &wt).unwrap();
+            } else {
+                remove_worktree(repo.path(), &wt).unwrap();
+            }
+            assert!(!wt.exists(), "{} is still there", wt.display());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "not a directory\n");
+        }
+        let (repo, head) = tmp_repo();
+        let holder = tempfile::tempdir().unwrap();
+        let wt = holder.path().join("01HZTASK-a1");
+        ensure_worktree(repo.path(), &wt, &branch_name("01HZTASK", 1), &head).unwrap();
+        std::os::unix::fs::symlink(holder.path().join("missing"), wt.join("node_modules"))
+            .unwrap();
+        assert_eq!(remove_dir_links(&wt), Ok(1), "removed as a link entry");
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+    }
+
     /// WT-1 AC1 (5): a worker worktree's HEAD is on its branch; a detached
     /// commit - in a review worktree or in the main tree - is on no branch.
     #[test]
@@ -1082,6 +1780,71 @@ mod tests {
         assert!(patch.contains("+two"), "the patch body must be there: {patch}");
         assert!(patch.contains("+fn t() {}"), "including the test file: {patch}");
         assert!(patch.contains("2 files changed"), "and the stat block");
+    }
+
+    /// SMALL-9c: excluded paths are matched literally and from the top of
+    /// the tree. The paths are written straight into the index, since `*`
+    /// and `:` cannot be file names on Windows.
+    #[test]
+    fn excluding_helpers_match_each_path_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let git = |args: &[&str], input: Option<&[u8]>| -> String {
+            let mut child = Command::new("git")
+                .args(["-c", "core.protectNTFS=false"])
+                .args(args)
+                .current_dir(r)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            if let Some(input) = input {
+                stdin.write_all(input).unwrap();
+            }
+            drop(stdin);
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "--initial-branch=main"], None);
+        git(&["config", "user.email", "test@example.com"], None);
+        git(&["config", "user.name", "thoth test"], None);
+        git(&["commit", "--allow-empty", "-q", "-m", "base"], None);
+        let base = git(&["rev-parse", "HEAD"], None);
+        let blob = git(&["hash-object", "-w", "--stdin"], Some(b"x\n"));
+        let paths = ["s*.rs", "sa.rs", ":c.rs", "src/a [b].rs", "src/a b.rs", "src/ab.rs"];
+        for p in paths {
+            git(&["update-index", "--add", "--cacheinfo", &format!("100644,{blob},{p}")], None);
+        }
+        git(&["commit", "-q", "-m", "paths"], None);
+        let head = git(&["rev-parse", "HEAD"], None);
+
+        let exclude: Vec<String> = ["s*.rs", ":c.rs", "src/a [b].rs"].iter().map(|s| s.to_string()).collect();
+        let mut files = diff_name_only_excluding(r, &base, &head, &exclude).unwrap();
+        files.sort();
+        assert_eq!(files, ["sa.rs", "src/a b.rs", "src/ab.rs"]);
+        let stat = diff_stat_excluding(r, &base, &head, &exclude).unwrap();
+        assert!(stat.contains("3 files changed"), "{stat}");
+        let patch = String::from_utf8(diff_patch_excluding(r, &base, &head, &exclude).unwrap()).unwrap();
+        assert!(!patch.contains("s*.rs") && !patch.contains(":c.rs") && !patch.contains("[b]"), "{patch}");
+        assert!(patch.contains("src/a b.rs"), "{patch}");
+        // from a subdirectory the paths are still read from the top
+        std::fs::create_dir_all(r.join("src")).unwrap();
+        let mut in_sub = diff_name_only_excluding(&r.join("src"), &base, &head, &exclude).unwrap();
+        in_sub.sort();
+        assert_eq!(in_sub, files);
+        // nothing excluded is the unfiltered command, byte for byte
+        assert_eq!(diff_patch_excluding(r, &base, &head, &[]).unwrap(), diff_patch(r, &base, &head).unwrap());
+        // everything excluded leaves nothing
+        let all: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+        assert!(diff_name_only_excluding(r, &base, &head, &all).unwrap().is_empty());
+        assert!(diff_stat_excluding(r, &base, &head, &all).unwrap().is_empty());
+        assert!(diff_patch_excluding(r, &base, &head, &all).unwrap().is_empty());
+        // changed_paths sees every path; merge_base finds the base
+        assert_eq!(changed_paths(r, &base, &head).unwrap().len(), paths.len());
+        assert_eq!(merge_base(r, &base, &head).unwrap().as_deref(), Some(base.as_str()));
     }
 
     #[test]

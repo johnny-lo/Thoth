@@ -57,27 +57,137 @@ pub const FIX_SIZES: [&str; 3] = ["S", "M", "L"];
 /// `parse_review` reads it as absent.
 const NO_LABEL: &str = "none";
 
+/// REV-1: whether a finding of a category blocks the merge (the behaviour
+/// would be wrong) or is a note for later (advisory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingClass {
+    Blocking,
+    Advisory,
+}
+
+impl FindingClass {
+    /// The word the review prompts put next to each category.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FindingClass::Blocking => "blocking",
+            FindingClass::Advisory => "advisory",
+        }
+    }
+}
+
+/// One entry of `CATEGORIES`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Category {
+    pub name: &'static str,
+    pub class: FindingClass,
+    pub about: &'static str,
+}
+
+const fn blocking(name: &'static str, about: &'static str) -> Category {
+    Category { name, class: FindingClass::Blocking, about }
+}
+
+const fn advisory(name: &'static str, about: &'static str) -> Category {
+    Category { name, class: FindingClass::Advisory, about }
+}
+
 /// The fixed list a reviewer labels each finding with, so `thoth retro` can
 /// group repeated findings without a model. The reviewer prompts, the codex /
-/// agy schema and `retro` all take the names and wording from here.
-pub const CATEGORIES: [(&str, &str); 12] = [
-    ("spec_mismatch", "the change does not do what a criterion says, or does what a constraint or non-goal rules out"),
-    ("spec_error", "the spec itself is wrong, contradictory, or cannot be met as written"),
-    ("test_missing", "a behaviour change has no test, or its test would also pass on the old code"),
-    ("test_interface", "a test bypasses the interface (reads the database or internal state, only compares a fixed string or the exit code, or repeats the implementation's logic)"),
-    ("error_path", "a failure is swallowed or mis-reported, or leaves partial state behind"),
-    ("concurrency", "a race, check-then-act, lock or transaction problem"),
-    ("platform", "behaviour differs between Windows and Linux (paths, shells, encodings, processes)"),
-    ("docs", "docs, help text or comments do not match the behaviour"),
-    ("evidence", "a required command was not run or not cited, or a claim has no evidence"),
-    ("files", "a file outside the allowed set changed, a dependency was added, or a protected file was touched"),
-    ("security", "a secret, credential or permission is exposed"),
-    ("other", "none of the above"),
+/// agy schema and `retro` all take the names and wording from here, and REV-1
+/// keeps each category's class (blocking or advisory) here and nowhere else.
+pub const CATEGORIES: [Category; 14] = [
+    blocking("spec_mismatch", "the change does not do what a criterion says, or does what a constraint or non-goal rules out"),
+    blocking("spec_error", "the spec itself is wrong, contradictory, or cannot be met as written; the spec needs changing, not the implementation redoing"),
+    blocking("test_missing", "a new or changed behaviour has no test at all that would fail on the old code"),
+    advisory("test_incomplete", "a behaviour has a test that would fail on the old code, but the test misses some cases or branches"),
+    advisory("test_interface", "a test bypasses the interface (reads the database or internal state, only compares a fixed string or the exit code, or repeats the implementation's logic)"),
+    blocking("error_path", "a failure is swallowed or mis-reported, or leaves partial state behind"),
+    blocking("concurrency", "a race, check-then-act, lock or transaction problem"),
+    blocking("platform", "behaviour differs between Windows and Linux (paths, shells, encodings, processes)"),
+    advisory("docs", "docs, help text or comments do not match the behaviour"),
+    // REV-3: a check the spec's checks field lists that did not run is
+    // check_not_run, not evidence.
+    advisory("evidence", "a command was not run or not cited, or a claim has no evidence; not a check the spec's checks field lists, which is check_not_run"),
+    blocking("check_not_run", "a check the spec's checks field lists did not run on the run under review: no verify row for it, or none that completed"),
+    blocking("files", "a file outside the allowed set changed, a dependency was added, or a protected file was touched"),
+    blocking("security", "a secret, credential or permission is exposed"),
+    advisory("other", "none of the above"),
 ];
+
+/// REV-1 (AC2): the verdict rule every code review prompt carries in place
+/// of the old "PASS only if every criterion is met" rule. Thoth does not
+/// enforce it beyond the PASS-with-unmet check in `parse_review`; the verdict
+/// stays the reviewer's, and the `verdict` event records
+/// `has_blocking_findings` next to it.
+pub const VERDICT_RULE: &str = "REJECT only when at least one finding is blocking: an unmet criterion or an extra finding whose category is blocking, or that has no category. PASS when every criterion is met and no extra finding is blocking; advisory extra findings may go with a PASS. When the only gap in a criterion falls in an advisory category, judge the criterion met and record that gap as an extra finding with that category. UNVERIFIED when the evidence available cannot settle it.";
+
+/// REV-1 (AC3): whether a finding with this category blocks the merge. No
+/// category counts as blocking, so a missed label never lets a finding
+/// through; so does a name outside `CATEGORIES` (which `parse_review`
+/// refuses anyway).
+pub fn category_blocks(category: Option<&str>) -> bool {
+    let Some(name) = category.map(str::trim).filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case(NO_LABEL)) else {
+        return true;
+    };
+    CATEGORIES
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+        .is_none_or(|c| c.class == FindingClass::Blocking)
+}
+
+/// REV-1 (AC3): whether a review's findings hold at least one blocking
+/// finding: an unmet criterion or an extra finding whose category blocks
+/// (`category_blocks`). A met criterion never counts.
+pub fn has_blocking_findings(findings: &Findings) -> bool {
+    findings
+        .criteria
+        .iter()
+        .any(|c| c.verdict.trim() == "unmet" && category_blocks(c.category.as_deref()))
+        || findings
+            .extra_findings
+            .iter()
+            .any(|e| category_blocks(e.category.as_deref()))
+}
+
+/// REV-2 (AC5): a review's findings split by class, as references: each
+/// unmet criterion by its id, each extra finding as `extra_findings[N]`
+/// (from 0, as an edit binds it), criteria first, each in document order.
+/// `None` for a research source check (`sources` not empty), whose findings
+/// are not split.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FindingSplit {
+    pub blocking: Vec<String>,
+    pub advisory: Vec<String>,
+}
+
+pub fn split_findings(findings: &Findings) -> Option<FindingSplit> {
+    if !findings.sources.is_empty() {
+        return None;
+    }
+    let mut split = FindingSplit::default();
+    let criteria = findings
+        .criteria
+        .iter()
+        .filter(|c| c.verdict.trim() == "unmet")
+        .map(|c| (c.id.clone(), c.category.as_deref()));
+    let extras = findings
+        .extra_findings
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (format!("extra_findings[{i}]"), e.category.as_deref()));
+    for (reference, category) in criteria.chain(extras) {
+        if category_blocks(category) {
+            split.blocking.push(reference);
+        } else {
+            split.advisory.push(reference);
+        }
+    }
+    Some(split)
+}
 
 /// The reviewer rule every review prompt's `## Rules` carries right before
 /// `SUITE_EVIDENCE_RULE`.
-pub const INTERFACE_TEST_RULE: &str ="New or changed tests must check behaviour through the interface: a CLI command, its --json output, or a public function. A test that reads the database or other internal state directly, only compares a fixed string, only checks the exit code, or repeats the implementation's logic is a finding: report it with category test_interface.";
+pub const INTERFACE_TEST_RULE: &str ="New or changed tests must check behaviour through the interface: a CLI command, its --json output, an HTTP endpoint, or a public function. A test that reads the database or other internal state directly, only compares a fixed string, only checks the exit code, or repeats the implementation's logic is a finding: report it with category test_interface.";
 
 /// TESTS-1 (AC6): the rule every review prompt ends its `## Rules` with, the
 /// number after `INTERFACE_TEST_RULE`. The worker prompt's `SUITE_NOTE` tells
@@ -86,14 +196,89 @@ pub const INTERFACE_TEST_RULE: &str ="New or changed tests must check behaviour 
 /// control plane collected) and what does not count as it.
 pub const SUITE_EVIDENCE_RULE: &str = "The implementer is told to run only the tests the spec names; the whole suite is run by the control plane's verify, which appears in the evidence index as rows labelled verify: with collected_by control_plane. Do not judge a criterion unmet or UNVERIFIED because the implementer did not run the whole suite itself, and do not count an implementer's cut-off or empty whole-suite output as missing evidence when a verify row covers the same check. Use only a candidate verify row for the same run and check, with successful completion and usable output; a verify@base: row, a failed, refused, timed-out or incomplete verify does not prove that check passed. When no usable verify row exists for a check, report what is missing in an extra finding with category evidence; do not treat an existing row as success or waive an explicit evidence requirement.";
 
-/// The category names alone, in `CATEGORIES` order.
-pub fn category_names() -> Vec<&'static str> {
-    CATEGORIES.iter().map(|(name, _)| *name).collect()
+/// REV-3 (AC2): the rule every code review prompt's `## Rules` carries right
+/// after `SUITE_EVIDENCE_RULE`. Thoth refuses a report that breaks it
+/// (`required_checks::refusal`); the list it names is appended to the prompt
+/// by `required_checks_prompt_section`.
+pub const REQUIRED_CHECKS_RULE: &str = "A check listed in the spec's checks field is a required check. It ran only when a verify of the run under review (not a verify@base: row) recorded it with an exit code and no execution error; a required check that ran and exited non-zero ran, and is judged as before. When a required check did not run - no verify row for it (no_verify_row), or only rows that were refused, failed to run, timed out, ended without an exit code or left incomplete output (did_not_complete) - write one extra finding with category check_not_run for each such check, with the check id and the reason in its note, and give the verdict REJECT. For a required check this replaces the evidence finding the previous rule asks for. The section ## Required checks not run at the end of this prompt lists what Thoth found when it started this review; thoth refuses a report that has required checks not run without a REJECT and a check_not_run finding, or a check_not_run finding without a REJECT. Any other missing evidence, including a command an acceptance criterion or constraint names, stays category evidence.";
+
+/// REV-3 (AC2): the section appended to a code review prompt listing the
+/// required checks that did not run when the review started, one
+/// `CHECK_ID (REASON)` line each, or saying there are none.
+pub fn required_checks_prompt_section(lines: &[String]) -> String {
+    let mut s = String::from("\n## Required checks not run\n");
+    if lines.is_empty() {
+        s.push_str("None: every check the spec's checks field lists ran on the run under review, or the spec lists none.\n");
+    } else {
+        s.push_str("These checks the spec's checks field lists did not run on the run under review; write one check_not_run extra finding for each and give the verdict REJECT:\n");
+        for line in lines {
+            s.push_str(&format!("- {line}\n"));
+        }
+    }
+    s
 }
 
-/// The `## Output` lines every review prompt uses to explain `fix_size` and
-/// `category`; the caller adds how a met criterion carries them.
+/// RVI-1: the name of the delivered result in a file-reading reviewer's input
+/// folder, next to `packet.md`.
+pub const RESULT_FILE: &str = "result.json";
+
+/// RVI-1 (AC4): the check whose scope the reviewer is told when the task's
+/// checks list it.
+pub const LINUX_CONTAINER_CHECK: &str = "linux-container";
+
+/// RVI-1 (AC3): what a silent check's evidence proves, for the file-reading
+/// reviewers' `## Delivered result and check evidence` section.
+pub const SILENT_CHECK_RULE: &str = "A check that completed with a recorded exit code 0 and no execution error passed, even when both its output streams are empty: an empty evidence file, or an index entry that says (no stored output), is not by itself missing evidence, and counts as usable output for that check. This holds for a silent clippy or public-tree check as for any other. It does not widen what proves a pass: only a candidate verify row of the same run and the same check counts, and a verify@base: row, a check that only started, a failed, refused, timed-out or incomplete check, an unknown exit status (exit -), or output that is missing because it was not captured does not prove a pass. A check whose execution error was recorded did not complete cleanly, even when its exit code is 0 or it printed output: packet.md shows that error on an execution error: line under the check's index entry, and its evidence file begins with it. When a criterion asks for particular output, that output has to be there.";
+
+/// RVI-1 (AC4): the scope of `linux-container` in this repository, from its
+/// own description of the check (clippy plus `tests/install_scripts.rs`).
+pub const LINUX_CONTAINER_RULE: &str = "This task's checks list linux-container. In this repository that check runs Linux clippy and the installation-script tests (tests/install_scripts.rs), not the whole Linux cargo test suite. A successful linux-container row supports that scope only: do not judge a criterion unmet merely because its log has no whole-suite test count, and do not infer from the check's name that the whole Linux suite passed. A criterion that needs the whole Linux suite is not supported by that row alone.";
+
+/// RVI-1: the `## Your input` line naming the delivered result, for a
+/// reviewer whose input folder is `input`.
+pub fn result_file_line(input: &str) -> String {
+    format!("{input}/{RESULT_FILE} is the whole result the implementer delivered for the run under review, as thoth recorded it when that run's result was ingested, with secrets masked: its brief, summary, claims and every other field, wherever the worker put them. It is neither the worktree's own .agent/result.json nor another run's delivery. When it is missing, no delivery was recorded for that run.\n")
+}
+
+/// RVI-1 (AC2-AC4): the `## Delivered result and check evidence` section of
+/// the codex and antigravity reviewer prompts. The linux-container scope is
+/// there only when `checks` lists that check.
+pub fn delivery_and_checks_section(input: &str, checks: &[String]) -> String {
+    let mut s = String::from("\n## Delivered result and check evidence\n");
+    s.push_str(&format!("- Read {input}/{RESULT_FILE} when a criterion asks for something the delivery itself has to contain, such as a mapping from acceptance criteria to tests. Look for it anywhere in the file, not only in the claims, and read the content itself: a field's name or length is not its content. A criterion that needs delivered content the file does not contain is unmet.\n"));
+    s.push_str(&format!("- Content in {RESULT_FILE} proves only what the worker delivered, not that what it says is true. Check every behaviour it claims against the candidate and the evidence files, and keep citing an actual code from the packet's evidence index for every met criterion: {RESULT_FILE} has no code of its own, so never cite it as one.\n"));
+    s.push_str(&format!("- {SILENT_CHECK_RULE}\n"));
+    if checks.iter().any(|c| c == LINUX_CONTAINER_CHECK) {
+        s.push_str(&format!("- {LINUX_CONTAINER_RULE}\n"));
+    }
+    s
+}
+
+/// The category names alone, in `CATEGORIES` order.
+pub fn category_names() -> Vec<&'static str> {
+    CATEGORIES.iter().map(|c| c.name).collect()
+}
+
+/// The `## Output` lines every code review prompt uses to explain `fix_size`
+/// and `category`; the caller adds how a met criterion carries them. REV-1:
+/// each category line names its class, and the lines after the list say
+/// what a missing category counts as and how test_missing and
+/// test_incomplete differ.
 pub fn finding_labels_prompt() -> String {
+    let mut s = labels_prompt(true);
+    s.push_str("A blocking finding means the behaviour would be wrong and blocks the merge; an advisory finding is a note to fix later and does not block the merge. A finding with no category counts as blocking.\n");
+    s.push_str("Use test_missing when no test of the new or changed behaviour would fail on the old code; use test_incomplete when such a test exists but misses some cases or branches.\n");
+    s
+}
+
+/// REV-1 (AC2): the same label lines for the research source check, which
+/// does not split categories into blocking and advisory: the list and the
+/// wording only.
+pub fn source_check_labels_prompt() -> String {
+    labels_prompt(false)
+}
+
+fn labels_prompt(with_class: bool) -> String {
     let mut s = String::new();
     s.push_str("Every unmet criterion and every extra finding carries \"fix_size\" and \"category\". \"fix_size\" is the smallest fix that would resolve it: S (at most 10 changed lines in one file), M (at most about 50 changed lines, or more than one file, no design change), L (larger, or it needs a design or spec change).\n");
     s.push_str(&format!("Every \"fix_size\" must be one of: {}.\n", FIX_SIZES.join(", ")));
@@ -101,8 +286,12 @@ pub fn finding_labels_prompt() -> String {
         "Every \"category\" must be one of: {}.\n",
         category_names().join(", ")
     ));
-    for (name, about) in CATEGORIES {
-        s.push_str(&format!("- {name}: {about}\n"));
+    for c in CATEGORIES {
+        if with_class {
+            s.push_str(&format!("- {} ({}): {}\n", c.name, c.class.as_str(), c.about));
+        } else {
+            s.push_str(&format!("- {}: {}\n", c.name, c.about));
+        }
     }
     s
 }
@@ -425,8 +614,8 @@ fn normalise_labels(
     };
     *category = match blank_is_none(category) {
         None => None,
-        Some(v) => match CATEGORIES.iter().find(|(name, _)| name.eq_ignore_ascii_case(&v)) {
-            Some((name, _)) => Some(name.to_string()),
+        Some(v) => match CATEGORIES.iter().find(|c| c.name.eq_ignore_ascii_case(&v)) {
+            Some(c) => Some(c.name.to_string()),
             None => return Err(ReviewError::BadCategory { at: at.to_string(), value: v }),
         },
     };
@@ -711,7 +900,7 @@ mod tests {
         }
         assert_eq!(
             parse_review(typo).unwrap_err().to_string(),
-            "review.json extra_findings[0] category must be one of: spec_mismatch, spec_error, test_missing, test_interface, error_path, concurrency, platform, docs, evidence, files, security, other, got 'typo'"
+            "review.json extra_findings[0] category must be one of: spec_mismatch, spec_error, test_missing, test_incomplete, test_interface, error_path, concurrency, platform, docs, evidence, check_not_run, files, security, other, got 'typo'"
         );
     }
 
@@ -721,8 +910,8 @@ mod tests {
         let findings = &s["properties"]["findings"]["properties"];
         let sizes = serde_json::json!(["S", "M", "L", "none"]);
         let categories = serde_json::json!([
-            "spec_mismatch", "spec_error", "test_missing", "test_interface", "error_path",
-            "concurrency", "platform", "docs", "evidence", "files", "security", "other", "none"
+            "spec_mismatch", "spec_error", "test_missing", "test_incomplete", "test_interface", "error_path",
+            "concurrency", "platform", "docs", "evidence", "check_not_run", "files", "security", "other", "none"
         ]);
         for items in [&findings["criteria"]["items"], &findings["extra_findings"]["items"]] {
             assert_eq!(items["properties"]["fix_size"]["type"], "string");

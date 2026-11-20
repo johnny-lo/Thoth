@@ -463,7 +463,7 @@ fn a_good_agy_run_reaches_in_review_with_exit_codes_from_the_transcript() {
     assert_eq!(
         calls[0]["args"],
         serde_json::json!(["-p", prompt, "--output-format", "stream-json", "--model", MODEL,
-            "--dangerously-skip-permissions", "--print-timeout", "2100s"])
+            "--dangerously-skip-permissions", "--print-timeout", "3900s"])
     );
     assert!(prompt.contains("When done, commit your work on the current branch"), "{prompt}");
     assert!(!prompt.contains("Do not commit"), "{prompt}");
@@ -787,7 +787,7 @@ fn an_agy_quota_stop_interrupts_and_resume_continues_the_conversation() {
     assert_eq!(
         calls[1]["args"],
         serde_json::json!(["-p", resume_prompt, "--output-format", "stream-json", "--model", MODEL,
-            "--dangerously-skip-permissions", "--print-timeout", "2100s", "--conversation", CONV])
+            "--dangerously-skip-permissions", "--print-timeout", "3900s", "--conversation", CONV])
     );
     let started = last_event(&f, &run_id, "run_started").unwrap();
     assert_eq!(started["mode"], "resume", "{started}");
@@ -1314,7 +1314,7 @@ fn an_agy_run_is_launched_with_a_workspace_hook_and_the_default_allow_list() {
     assert_eq!(
         calls[0]["args"],
         serde_json::json!(["-p", prompt, "--output-format", "stream-json", "--model", MODEL,
-            "--dangerously-skip-permissions", "--print-timeout", "2100s"])
+            "--dangerously-skip-permissions", "--print-timeout", "3900s"])
     );
     let usage = last_event(&f, &run_id, "run_usage").expect("run_usage");
     assert_eq!(usage["tools_denied"], 0, "{usage}");
@@ -2080,12 +2080,18 @@ fn claude_candidate() -> (common::Fixture, String, String) {
 /// `review start --profile agy-a` with a fake-agy reviewer scenario, then
 /// `wait --run` on the reviewer. Returns the `review start --json` output.
 fn agy_review(f: &common::Fixture, task_id: &str, scenario: &str) -> Value {
+    agy_review_with(f, task_id, scenario, &[])
+}
+
+/// `agy_review` with `extra` flags on `review start`.
+fn agy_review_with(f: &common::Fixture, task_id: &str, scenario: &str, extra: &[&str]) -> Value {
     let out = f
         .cmd()
         .env("FAKE_SCENARIO", scenario)
         .env("FAKE_AGY_DATA_DIR", agy_data(f))
         .env("FAKE_AGY_ARGS_LOG", agy_args_log(f))
         .args(["review", "start", task_id, "--profile", "agy-a", "--model", MODEL, "--json"])
+        .args(extra)
         .assert()
         .success()
         .get_output()
@@ -2130,7 +2136,9 @@ fn structured_output(run_dir: &std::path::Path) -> Value {
 #[test]
 fn an_agy_reviewer_reads_its_input_files_and_its_pass_settles_the_task_pass() {
     let (f, task_id, implementer_run) = claude_candidate();
-    let r = agy_review(&f, &task_id, "review_pass");
+    // RFIX-2: a plain review, whose schema (no `edits`) this test compares;
+    // a code task is in edit mode by default.
+    let r = agy_review_with(&f, &task_id, "review_pass", &["--no-edit"]);
     let reviewer_run = r["run_id"].as_str().unwrap().to_string();
     let wt = std::path::PathBuf::from(r["worktree"].as_str().unwrap());
     let run_dir = std::path::PathBuf::from(r["run_dir"].as_str().unwrap());
@@ -2145,7 +2153,7 @@ fn an_agy_reviewer_reads_its_input_files_and_its_pass_settles_the_task_pass() {
     assert_eq!(
         calls[0]["args"],
         serde_json::json!(["-p", prompt, "--output-format", "stream-json", "--model", MODEL,
-            "--dangerously-skip-permissions", "--print-timeout", "2100s", "--json-schema", schema.to_str().unwrap()])
+            "--dangerously-skip-permissions", "--print-timeout", "3900s", "--json-schema", schema.to_str().unwrap()])
     );
     assert_eq!(
         std::fs::canonicalize(calls[0]["cwd"].as_str().unwrap()).unwrap(),
@@ -2158,7 +2166,7 @@ fn an_agy_reviewer_reads_its_input_files_and_its_pass_settles_the_task_pass() {
         "cannot write files", "Do not run thoth", "Your final message is the review document",
         "do not try to write that file yourself", "Every id in \"criteria\" must be one of: AC1, AC2",
         "1. Read the candidate diff before anything else", "2. Judge every acceptance criterion exactly once",
-        "3. Do not trust the implementer's summary or claims", "4. PASS only if every criterion is met",
+        "3. Do not trust the implementer's summary or claims", "4. REJECT only when at least one finding is blocking",
     ] {
         assert!(prompt.contains(needle), "{needle} missing from {prompt}");
     }
@@ -2452,4 +2460,27 @@ fn antigravity_reviewer_refuses_a_claude_alias_and_a_codex_model_without_writing
         .unwrap();
     assert_eq!(started, 0);
     assert_eq!(f.task_status(&task_id), "in_review");
+}
+
+// RVI-1 --------------------------------------------------------------------
+
+mod rvi;
+
+/// RVI-1 AC1, AC2, AC6, AC7: an antigravity reviewer reads the target run's
+/// whole recorded delivery from `.agent/review-input/result.json`.
+#[test]
+fn rvi_an_agy_reviewer_reads_the_target_runs_recorded_delivery() {
+    rvi::delivered_result_is_read_from_the_target_run(rvi::Reviewer::Agy);
+}
+
+/// RVI-1 AC5 (and AC4 without linux-container in the spec).
+#[test]
+fn rvi_an_agy_reviewers_result_file_is_masked() {
+    rvi::delivered_result_is_masked(rvi::Reviewer::Agy);
+}
+
+/// RVI-1 AC3 and AC4 with linux-container in the spec.
+#[test]
+fn rvi_an_agy_reviewer_counts_a_silent_success_and_nothing_weaker() {
+    rvi::check_evidence_rules(rvi::Reviewer::Agy);
 }

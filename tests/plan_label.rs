@@ -620,11 +620,12 @@ fn plan_dispatch_review_and_spec_review_store_and_show_the_plan() {
         assert_eq!(r["profile"], "claude-b", "{v}");
     }
 
-    // review start
+    // review start (RFIX-2: --no-edit, whose first line is `review RUN ...`;
+    // an edit review's reads `review (edit mode) RUN ...`)
     let mut c = f.cmd();
     c.env("FAKE_SCENARIO", "review_pass")
         .env("FAKE_TASK_ID", &t1)
-        .args(["review", "start", &t1, "--profile", "claude-a", "--model", "haiku"]);
+        .args(["review", "start", &t1, "--profile", "claude-a", "--model", "haiku", "--no-edit"]);
     let out = ok_text(&f, c, "review start");
     let line = first_line(&out);
     assert!(line.starts_with("review "), "{out}");

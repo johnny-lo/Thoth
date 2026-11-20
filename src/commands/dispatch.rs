@@ -124,29 +124,51 @@ pub fn stuck_reason(conn: &rusqlite::Connection, task_id: &str) -> Result<Option
         return Ok(None);
     }
     let last = &rejects[rejects.len() - STUCK_REPEATS..];
-    let mut criterion_ids = Vec::new();
+    // REV-2 (AC2): only blocking findings count. The verdict event's
+    // `criteria` carry no category, so each REJECT's class comes from the
+    // review record its `review_id` points at; `None` here (no such record,
+    // or unreadable findings) makes every criterion of that REJECT blocking.
+    let reviews = state::list_reviews_for_task(conn, task_id)?;
+    let findings_of = |d: &serde_json::Value| -> Option<crate::review_json::Findings> {
+        let id = d["review_id"].as_str()?;
+        let review = reviews.iter().find(|r| r.review_id == id)?;
+        serde_json::from_str::<crate::review_json::Findings>(&review.findings).ok()
+    };
+    let last_findings: Vec<(&serde_json::Value, Option<crate::review_json::Findings>)> =
+        last.iter().map(|(_, d)| (d, findings_of(d))).collect();
+    let blocking_unmet_in = |d: &serde_json::Value, f: &Option<crate::review_json::Findings>, id: &str| {
+        let unmet = d["criteria"].as_array().is_some_and(|cs| {
+            cs.iter().any(|x| x["id"].as_str() == Some(id) && x["verdict"].as_str() == Some("unmet"))
+        });
+        let category = f
+            .as_ref()
+            .and_then(|f| f.criteria.iter().find(|c| c.id == id))
+            .and_then(|c| c.category.as_deref());
+        unmet && crate::review_json::category_blocks(category)
+    };
     for c in last[0].1["criteria"].as_array().into_iter().flatten() {
         if c["verdict"].as_str() == Some("unmet") {
             if let Some(id) = c["id"].as_str() {
-                if last.iter().all(|(_, d)| d["criteria"].as_array().is_some_and(|cs| cs.iter().any(|x| x["id"].as_str() == Some(id) && x["verdict"].as_str() == Some("unmet")))) {
-                    criterion_ids.push(id.to_string());
+                if last_findings.iter().all(|(d, f)| blocking_unmet_in(d, f, id)) {
+                    return Ok(Some(StuckReason::Criterion(id.to_string())));
                 }
             }
         }
     }
-    if let Some(id) = criterion_ids.into_iter().next() {
-        return Ok(Some(StuckReason::Criterion(id)));
-    }
-    let reviews = state::list_reviews_for_task(conn, task_id)?;
-    for (_, detail) in last {
-        let Some(review_id) = detail["review_id"].as_str() else { continue };
-        let Some(review) = reviews.iter().find(|r| r.review_id == review_id) else { continue };
-        let Ok(findings) = serde_json::from_str::<crate::review_json::Findings>(&review.findings) else { continue };
-        for finding in findings.extra_findings {
+    for (_, findings) in &last_findings {
+        let Some(findings) = findings else { continue };
+        for finding in &findings.extra_findings {
             let note = normalize_finding(&finding.note);
-            if !note.is_empty() && last.iter().all(|(_, d)| {
-                d["review_id"].as_str().and_then(|id| reviews.iter().find(|r| r.review_id == id)).and_then(|r| serde_json::from_str::<crate::review_json::Findings>(&r.findings).ok()).is_some_and(|f| f.extra_findings.iter().any(|x| normalize_finding(&x.note) == note))
-            }) {
+            if !note.is_empty()
+                && last_findings.iter().all(|(_, f)| {
+                    f.as_ref().is_some_and(|f| {
+                        f.extra_findings.iter().any(|x| {
+                            normalize_finding(&x.note) == note
+                                && crate::review_json::category_blocks(x.category.as_deref())
+                        })
+                    })
+                })
+            {
                 return Ok(Some(StuckReason::Finding(note)));
             }
         }
@@ -161,7 +183,8 @@ pub struct DispatchArgs<'a> {
     /// `--model` as typed; `None` keeps the model of the attempt's previous
     /// implementer run, and is refused when there is none (RJ-1).
     pub model: Option<&'a str>,
-    pub timeout_seconds: u64,
+    /// `--timeout`; `None` takes the default for the effort sent (SMALL-9b).
+    pub timeout_seconds: Option<u64>,
     pub allowed_tools: &'a str,
     /// One-shot override for `tasks.attempt_cap`: permit this dispatch if the
     /// attempt it computes is at most `N`. Writes nothing, so the next dispatch
@@ -265,35 +288,67 @@ pub fn next_attempt(existing_max: Option<i64>, from_reject: bool) -> i64 {
     }
 }
 
-/// brief §9: flattens a review's `findings` into the two lists a rework
-/// addendum carries - one line per unmet criterion, one per extra finding.
+/// What `fold_findings` makes of a review: the two required lists a rework
+/// addendum carries, and (REV-2) the advisory findings it lists apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoldedFindings {
+    /// One line per blocking unmet criterion, and per unsupported source.
+    pub unmet: Vec<String>,
+    /// One line per blocking extra finding, and per unreachable source.
+    pub extra: Vec<String>,
+    /// REV-2: one line per advisory unmet criterion (`ID: NOTE`), then one
+    /// per advisory extra finding (`SEVERITY: NOTE`), in document order.
+    pub advisory: Vec<String>,
+}
+
+impl FoldedFindings {
+    /// Every line folded in, required and advisory.
+    pub fn len(&self) -> usize {
+        self.unmet.len() + self.extra.len() + self.advisory.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// brief §9: flattens a review's `findings` into the lists a rework addendum
+/// carries - one line per unmet criterion, one per extra finding. REV-2: a
+/// finding whose category is advisory (`review_json::category_blocks`; no
+/// category blocks) goes to `advisory` instead of the required lists. A
+/// research source check's findings (`sources` not empty) are not split: all
+/// of them stay required.
 ///
 /// Text, not structure, because the consumer is a prompt. Unparseable findings
 /// fold to nothing: a rework with no addendum is a worse outcome than no rework,
 /// but a panic here would be worse than both.
-pub fn fold_findings(findings_json: &str, sources: &[crate::review_json::SourceToCheck]) -> (Vec<String>, Vec<String>) {
+pub fn fold_findings(findings_json: &str, sources: &[crate::review_json::SourceToCheck]) -> FoldedFindings {
     let Ok(f) = serde_json::from_str::<crate::review_json::Findings>(findings_json) else {
-        return (Vec::new(), Vec::new());
+        return FoldedFindings::default();
     };
-    let mut unmet: Vec<String> = f
-        .criteria
-        .iter()
-        .filter(|c| c.verdict.trim() == "unmet")
-        .map(|c| {
-            let note = c.note.clone().unwrap_or_default();
-            let body = if note.trim().is_empty() {
-                "not met".to_string()
-            } else {
-                note.trim().to_string()
-            };
-            let cited = c.evidence.join(",");
-            if cited.is_empty() {
-                format!("{}: {body}", c.id)
-            } else {
-                format!("{}: {body} (evidence {cited})", c.id)
-            }
-        })
-        .collect();
+    let source_check = !f.sources.is_empty();
+    let blocks = |category: Option<&str>| source_check || crate::review_json::category_blocks(category);
+    let mut unmet: Vec<String> = Vec::new();
+    let mut advisory: Vec<String> = Vec::new();
+    for c in f.criteria.iter().filter(|c| c.verdict.trim() == "unmet") {
+        let note = c.note.clone().unwrap_or_default();
+        let body = if note.trim().is_empty() {
+            "not met".to_string()
+        } else {
+            note.trim().to_string()
+        };
+        let cited = c.evidence.join(",");
+        let line = if cited.is_empty() {
+            format!("{}: {body}", c.id)
+        } else {
+            format!("{}: {body} (evidence {cited})", c.id)
+        };
+        if blocks(c.category.as_deref()) {
+            unmet.push(line);
+        } else {
+            advisory.push(line);
+        }
+    }
     let mut extra: Vec<String> = Vec::new();
     for source in &f.sources {
         let body = match sources.iter().find(|s| s.id == source.id) {
@@ -306,24 +361,25 @@ pub fn fold_findings(findings_json: &str, sources: &[crate::review_json::SourceT
             _ => {}
         }
     }
-    extra.extend(f
-        .extra_findings
-        .iter()
-        .map(|e| {
-            let severity = if e.severity.trim().is_empty() {
-                "finding".to_string()
-            } else {
-                e.severity.trim().to_string()
-            };
-            let cited = e.evidence.join(",");
-            if cited.is_empty() {
-                format!("{severity}: {}", e.note.trim())
-            } else {
-                format!("{severity}: {} (evidence {cited})", e.note.trim())
-            }
-        })
-        .collect::<Vec<_>>());
-    (unmet, extra)
+    for e in &f.extra_findings {
+        let severity = if e.severity.trim().is_empty() {
+            "finding".to_string()
+        } else {
+            e.severity.trim().to_string()
+        };
+        let cited = e.evidence.join(",");
+        let line = if cited.is_empty() {
+            format!("{severity}: {}", e.note.trim())
+        } else {
+            format!("{severity}: {} (evidence {cited})", e.note.trim())
+        };
+        if blocks(e.category.as_deref()) {
+            extra.push(line);
+        } else {
+            advisory.push(line);
+        }
+    }
+    FoldedFindings { unmet, extra, advisory }
 }
 
 /// brief §9: the run's spec is the task spec plus a `rework` object. The task's
@@ -596,16 +652,24 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
     )?;
     let require_reason = crate::commands::settings::require_reason(&paths.home);
     auto_pick::require_reason_gate(&task_id, "dispatch", reason.as_deref(), require_reason)?;
-    // FC-1 (H4): the ranking is read only to see whether the profile has
+    // FC-1 (H4): the ranking is read to see whether the profile has
     // recovered or is parked for another quota group; an unreadable ranking
-    // does not stop the dispatch.
+    // does not stop the dispatch. SMALL-9a: the quota reserve refuses here,
+    // after the refusals above and before the login check starts the CLI.
     let ranked = crate::commands::usage::ranked_candidates(
         paths,
         crate::model::role::IMPLEMENTER,
         Some(&task_id),
         Some(&choice.model),
-    )
-    .unwrap_or_default();
+    );
+    let reserve_note = crate::commands::quota_reserve::launch_gate(
+        crate::commands::settings::quota_reserve_percent(&paths.home),
+        &profile.profile_id,
+        crate::model::role::IMPLEMENTER,
+        &task_id,
+        ranked.as_deref(),
+    )?;
+    let ranked = ranked.unwrap_or_default();
     let own = ranked.iter().find(|c| c.profile.profile_id == profile.profile_id);
     let recovered = own.is_some_and(|c| c.recovered && c.profile.status == "rate_limited");
     let parked_elsewhere = own.is_some_and(|c| c.parked_elsewhere);
@@ -641,7 +705,12 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
     // comes from the newest `rate_limited` quota event, which is what parked it.
     let mut warnings: Vec<String> = Vec::new();
     warnings.extend(model_warning);
+    warnings.extend(reserve_note);
     let launch = auto_pick::launch_settings(&choice, &profile);
+    // SMALL-9b: the effort sent picks the limit; the previous run's is never kept.
+    let timeout_seconds = args
+        .timeout_seconds
+        .unwrap_or_else(|| crate::adapter::effort::default_timeout_secs(launch.effort.as_deref()));
     if let Some(note) = launch.effort_note.clone() {
         warnings.push(note);
     }
@@ -726,11 +795,11 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
             );
         };
         folded_by = Some(if spec_rewrite { "spec_rewrite" } else { "control_plane" });
-        let (unmet, extra) = if spec_rewrite {
+        let folded = if spec_rewrite {
             // Excluded alternative: folding the reviewer's findings on top of
             // the rewritten spec would put back a finding the Supervisor may
             // have dropped on purpose.
-            (Vec::new(), Vec::new())
+            FoldedFindings::default()
         } else {
             // The newest REJECT verdict is the one being reworked. An older PASS
             // or UNVERIFIED review must not supply the findings.
@@ -738,19 +807,20 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
                 .into_iter()
                 .rev()
                 .find(|r| r.verdict == crate::review_json::Verdict::Reject.as_str());
-            let (unmet, extra) = match &rejected {
+            let folded = match &rejected {
                 Some(r) => fold_findings(&r.findings, &crate::review_json::sources_to_check(
                     &crate::commands::review::target_result(&conn, &r.target_run_id)?,
                 )),
-                None => (Vec::new(), Vec::new()),
+                None => FoldedFindings::default(),
             };
             // R3 (fix round 1): a rework with nothing folded in still costs the
             // task an attempt against its cap, and the worker is told to "fix
             // exactly these" with nothing listed. It is not worth refusing -
             // the Supervisor may have rewritten the spec instead - but it must
             // not happen quietly. AC3: a spec-rewrite rework folds zero
-            // findings by design, so it does not warn here at all.
-            if unmet.is_empty() && extra.is_empty() {
+            // findings by design, so it does not warn here at all. REV-2: a
+            // rework that folds only advisory findings does not warn either.
+            if folded.is_empty() {
                 warnings.push(format!(
                     "task {task_id} is being reworked as attempt {attempt}, but no reviewer \
                      findings could be folded into its spec ({}). The worker will get the \
@@ -761,7 +831,7 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
                     }
                 ));
             }
-            (unmet, extra)
+            folded
         };
         let previous = rework_from.clone();
         rework = Some(crate::spec::ReworkAddendum {
@@ -777,8 +847,9 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
                 .as_ref()
                 .and_then(|r| r.candidate_commit.clone())
                 .unwrap_or_default(),
-            unmet,
-            extra_findings: extra,
+            unmet: folded.unmet,
+            extra_findings: folded.extra,
+            advisory: folded.advisory,
         });
     }
 
@@ -933,7 +1004,7 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
         worker_pid: None,
         heartbeat_at: None,
         cancel_requested: 0,
-        timeout_seconds: args.timeout_seconds as i64,
+        timeout_seconds: timeout_seconds as i64,
         run_dir: run_dir.display().to_string(),
         error_text: None,
         // final-review Important 3: record the harness this run is actually
@@ -1151,7 +1222,14 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
         }
         StartOutcome::Refused(e) => {
             if spec_changed.get() && outcome == EnsureOutcome::Created {
-                worktree::remove_worktree(&root, &wt);
+                if let Err(e) = worktree::remove_worktree(&root, &wt) {
+                    masked_eprintln!(
+                        "thoth: warning: kept the worktree {} ({}): {}",
+                        wt.display(),
+                        worktree::LINK_UNREMOVABLE,
+                        e.detail()
+                    );
+                }
             }
             emit_warnings(&warnings);
             return Err(e);
@@ -1180,7 +1258,10 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
         "attempt_cap": attempt_cap,
         "rework": rework.is_some(),
         "base_commit": worktree_base,
-        "folded_findings": rework.as_ref().map(|r| r.unmet.len() + r.extra_findings.len()).unwrap_or(0),
+        // REV-2: every line folded in, required and advisory; the advisory
+        // ones alone are `folded_advisory`.
+        "folded_findings": rework.as_ref().map(|r| r.unmet.len() + r.extra_findings.len() + r.advisory.len()).unwrap_or(0),
+        "folded_advisory": rework.as_ref().map(|r| r.advisory.len()).unwrap_or(0),
         "folded_by": folded_by,
         "spec_review": {
             "required": sr_required,
@@ -1195,7 +1276,7 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
         "worktree_reused": outcome == EnsureOutcome::Reused,
         "runner_pid": runner_pid,
         "run_dir": run_dir.display().to_string(),
-        "timeout_seconds": args.timeout_seconds,
+        "timeout_seconds": timeout_seconds,
         "effort_requested": launch.effort_requested,
         "effort": launch.effort,
         "effort_note": launch.effort_note,
@@ -1223,7 +1304,7 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
         Lang::En,
     );
     let human = format!(
-        "dispatched {run_id} (task {task_id}, attempt {attempt}, profile {named}, runner pid {runner_pid})"
+        "dispatched {run_id} (task {task_id}, attempt {attempt}, profile {named}, runner pid {runner_pid}, timeout {timeout_seconds}s)"
     );
     output::emit(args.json, &v, &human);
     Ok(0)
@@ -1524,7 +1605,7 @@ mod tests {
         })
         .to_string();
 
-        let (unmet, extra) = fold_findings(&findings, &[]);
+        let FoldedFindings { unmet, extra, advisory } = fold_findings(&findings, &[]);
         assert_eq!(unmet.len(), 2, "only the unmet criteria travel: {unmet:?}");
         assert_eq!(unmet[0], "AC1: the retry never fires (evidence E002)");
         assert_eq!(
@@ -1534,10 +1615,50 @@ mod tests {
         assert_eq!(extra.len(), 2);
         assert_eq!(extra[0], "major: the test asserts a constant (evidence E004)");
         assert_eq!(extra[1], "finding: a stray TODO");
+        assert!(advisory.is_empty(), "no category blocks: {advisory:?}");
 
         // junk folds to nothing rather than panicking
-        assert_eq!(fold_findings("not json", &[]), (Vec::new(), Vec::new()));
-        assert_eq!(fold_findings("{}", &[]), (Vec::new(), Vec::new()));
+        assert_eq!(fold_findings("not json", &[]), FoldedFindings::default());
+        assert_eq!(fold_findings("{}", &[]), FoldedFindings::default());
+    }
+
+    /// REV-2 (AC1): an advisory finding is listed apart, in the same format;
+    /// a blocking or unlabelled one stays required.
+    #[test]
+    fn fold_findings_lists_advisory_findings_apart() {
+        let findings = serde_json::json!({
+            "criteria": [
+                {"id": "AC1", "verdict": "unmet", "evidence": ["E002"], "note": "swallows the error", "category": "error_path"},
+                {"id": "AC2", "verdict": "unmet", "evidence": ["E003"], "note": "help text is stale", "category": "docs"},
+                {"id": "AC3", "verdict": "met", "evidence": ["E001"], "category": "docs"}
+            ],
+            "extra_findings": [
+                {"severity": "minor", "note": "typo in usage", "evidence": ["E004"], "category": "docs"},
+                {"severity": "major", "note": "unlabelled", "evidence": []},
+                {"severity": "major", "note": "race on rename", "evidence": [], "category": "concurrency"}
+            ]
+        })
+        .to_string();
+        let folded = fold_findings(&findings, &[]);
+        assert_eq!(folded.unmet, vec!["AC1: swallows the error (evidence E002)"]);
+        assert_eq!(folded.extra, vec!["major: unlabelled", "major: race on rename"]);
+        assert_eq!(
+            folded.advisory,
+            vec!["AC2: help text is stale (evidence E003)", "minor: typo in usage (evidence E004)"]
+        );
+        assert_eq!(folded.len(), 5);
+    }
+
+    /// REV-2 (AC1): a research source check's findings are not split.
+    #[test]
+    fn fold_findings_keeps_every_source_check_finding_required() {
+        let findings = serde_json::json!({"sources":[
+            {"id":"S1", "url":"file:///bad", "verdict":"not_supported", "reason":"absent"}],
+            "extra_findings":[{"severity":"minor", "note":"report typo", "category":"docs"}]}).to_string();
+        let folded = fold_findings(&findings, &[]);
+        assert_eq!(folded.unmet, vec!["S1: file:///bad: absent"]);
+        assert_eq!(folded.extra, vec!["minor: report typo"]);
+        assert!(folded.advisory.is_empty());
     }
 
     #[test]
@@ -1553,10 +1674,10 @@ mod tests {
             {"id":"S2", "url":"file:///bad", "verdict":"not_supported", "reason":"quote absent"},
             {"id":"S3", "url":"file:///dead", "verdict":"unreachable", "reason":"not found"}],
             "extra_findings":[{"severity":"minor", "note":"report typo"}]}).to_string();
-        let (unmet, extra) = fold_findings(&findings, &sources);
+        let FoldedFindings { unmet, extra, .. } = fold_findings(&findings, &sources);
         assert_eq!(unmet, vec!["claim 2 (S2): retry — file:///bad: quote absent"]);
         assert_eq!(extra, vec!["unreachable: claim 2 (S3): retry — file:///dead: not found; replace the source", "minor: report typo"]);
-        let (unmet, extra) = fold_findings(&findings, &[]);
+        let FoldedFindings { unmet, extra, .. } = fold_findings(&findings, &[]);
         assert_eq!(unmet, vec!["S2: file:///bad: quote absent"]);
         assert_eq!(extra[0], "unreachable: S3: file:///dead: not found; replace the source");
     }
@@ -1572,6 +1693,7 @@ mod tests {
             previous_candidate: "cafebabe".to_string(),
             unmet: vec!["AC1: not met".to_string()],
             extra_findings: vec![],
+            advisory: vec![],
         };
         let out = rework_spec(task_spec, &addendum).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1817,6 +1939,66 @@ mod tests {
         assert_eq!(stuck_reason(&conn, "T1").unwrap(), None);
         add_reject(&conn, 3, "same");
         assert_eq!(stuck_reason(&conn, "T1").unwrap(), Some(StuckReason::Criterion("AC1".into())));
+    }
+
+    fn add_labelled_reject(conn: &rusqlite::Connection, n: usize, ac_category: Option<&str>, extra_category: Option<&str>) {
+        let review_id = format!("L{n}");
+        let mut criterion = serde_json::json!({"id":"AC1","verdict":"unmet","note":"n"});
+        if let Some(c) = ac_category {
+            criterion["category"] = c.into();
+        }
+        let mut extra = serde_json::json!({"note":"same note","severity":"major"});
+        if let Some(c) = extra_category {
+            extra["category"] = c.into();
+        }
+        state::insert_review(conn, &state::Review {
+            review_id: review_id.clone(), target_run_id: "R1".into(), reviewer_run_id: None,
+            verdict: "REJECT".into(),
+            findings: serde_json::json!({"criteria": [criterion], "extra_findings":[extra]}).to_string(),
+            created_at: format!("2026-09-27T00:00:0{n}Z"),
+        }).unwrap();
+        reroute_event(conn, event_type::VERDICT, serde_json::json!({"verdict":"REJECT","review_id":review_id,"criteria":[{"id":"AC1","verdict":"unmet"}]}));
+    }
+
+    /// REV-2 (AC2): an advisory unmet criterion or extra finding does not
+    /// count towards stuck; one blocking REJECT among three advisory is not
+    /// enough either.
+    #[test]
+    fn stuck_reason_counts_only_blocking_findings() {
+        let conn = repeated_event_db();
+        for n in 1..=3 {
+            add_labelled_reject(&conn, n, Some("docs"), Some("test_interface"));
+        }
+        assert_eq!(stuck_reason(&conn, "T1").unwrap(), None);
+
+        let conn = repeated_event_db();
+        add_labelled_reject(&conn, 1, Some("error_path"), Some("docs"));
+        add_labelled_reject(&conn, 2, Some("docs"), Some("docs"));
+        add_labelled_reject(&conn, 3, Some("error_path"), Some("docs"));
+        assert_eq!(stuck_reason(&conn, "T1").unwrap(), None);
+
+        let conn = repeated_event_db();
+        for n in 1..=3 {
+            add_labelled_reject(&conn, n, Some("docs"), Some("security"));
+        }
+        assert_eq!(stuck_reason(&conn, "T1").unwrap(), Some(StuckReason::Finding("same note".into())));
+
+        let conn = repeated_event_db();
+        for n in 1..=3 {
+            add_labelled_reject(&conn, n, Some("spec_mismatch"), Some("docs"));
+        }
+        assert_eq!(stuck_reason(&conn, "T1").unwrap(), Some(StuckReason::Criterion("AC1".into())));
+    }
+
+    /// REV-2 (AC2): a verdict event whose review record cannot be found
+    /// counts its unmet criterion as blocking.
+    #[test]
+    fn stuck_reason_counts_a_criterion_blocking_when_its_review_is_missing() {
+        let conn = repeated_event_db();
+        for n in 1..=3 {
+            reroute_event(&conn, event_type::VERDICT, serde_json::json!({"verdict":"REJECT","review_id":format!("GONE{n}"),"criteria":[{"id":"AC4","verdict":"unmet"}]}));
+        }
+        assert_eq!(stuck_reason(&conn, "T1").unwrap(), Some(StuckReason::Criterion("AC4".into())));
     }
 
     #[test]

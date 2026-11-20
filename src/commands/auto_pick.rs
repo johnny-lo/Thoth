@@ -120,7 +120,7 @@ impl Choice {
 /// has no effort setting, the model has none (haiku), or (AGY-1) the agy
 /// model name carries its level itself (`gemini-3.8-flash-high`), in which
 /// case `launch_settings` records that level through `effort::resolve`.
-fn effort_optional(profile: &Profile, model: &str) -> bool {
+pub(crate) fn effort_optional(profile: &Profile, model: &str) -> bool {
     effort::carried_level(&profile.harness, model).is_some()
         || matches!(
             effort::supported_levels(&profile.harness, model, Path::new(&profile.config_dir)),

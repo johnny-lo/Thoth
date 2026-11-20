@@ -29,8 +29,9 @@ pub const FORBIDDEN: &[&[&str]] = &[
     &["config", "unset-secret"],
     &["hook"],
     &["run-worker"],
+    &["pipeline-run"],
 ];
-const INSTRUCTIONS: &str = "Before first use, call thoth_guide or load the thoth-dispatch skill. These tools are for the commander workflow. Start with thoth_status. thoth_dispatch, thoth_review_start and thoth_spec_review_start return a run id immediately; use thoth_wait repeatedly, with each wait limited by the server maximum. Verify takes two steps: thoth_verify_start re-runs the repository's approved checks in the background and returns a job id at once, then thoth_job_status reports the job until its status is no longer `working`: completed, failed or unknown. A check added with thoth_checks_add stays pending and is not run until it is approved. The commander approves with thoth_checks_approve, which needs a reason that is recorded for the reviewer; with run it also approves the protected test files that run changed, which thoth_review_start waits for. A person can also approve with `thoth checks approve` in a terminal. See the thoth-dispatch skill and docs/mcp.md for the complete workflow.";
+const INSTRUCTIONS: &str = "Before first use, call thoth_guide or load the thoth-dispatch skill. These tools are for the commander workflow. Start with thoth_status. thoth_dispatch, thoth_review_start and thoth_spec_review_start return a run id immediately; use thoth_wait repeatedly, with each wait limited by the server maximum. Verify takes two steps: thoth_verify_start re-runs the repository's approved checks in the background and returns a job id at once, then thoth_job_status reports the job until its status is no longer `working`: completed, failed or unknown. A check added with thoth_checks_add stays pending and is not run until it is approved. The commander approves with thoth_checks_approve, which needs a reason that is recorded for the reviewer; with run it also approves the protected test files that run changed, which thoth_review_start waits for. A person can also approve with `thoth checks approve` in a terminal. thoth_pipeline_start runs the implementer and reviewer you supply to a short conclusion; read thoth_pipeline_show first, the full evidence after. See the thoth-dispatch skill and docs/mcp.md for the complete workflow.";
 
 pub struct Options {
     pub default_repo: Option<PathBuf>,
@@ -61,6 +62,8 @@ pub const STATE_CHANGING: &[&str] = &[
     "thoth_checks_add",
     "thoth_checks_approve",
     "thoth_checks_remove",
+    "thoth_pipeline_start",
+    "thoth_pipeline_stop",
 ];
 
 /// Set in the environment of `thoth_checks_approve`'s child only, so the
@@ -597,9 +600,13 @@ fn execute(
             ] {
                 flag(&mut argv, a, n, f)
             }
-            // RFIX-1: `edit` is a boolean switch, not a valued flag.
-            if a.get("edit") == Some(&Value::Bool(true)) {
-                argv.push("--edit".into())
+            // RFIX-1: `edit` is a boolean switch, not a valued flag. RFIX-2:
+            // false is `--no-edit` on review start; left out, the CLI's
+            // default for the task type applies.
+            match a.get("edit") {
+                Some(Value::Bool(true)) => argv.push("--edit".into()),
+                Some(Value::Bool(false)) if t.name == "thoth_review_start" => argv.push("--no-edit".into()),
+                _ => {}
             }
         }
         "thoth_review_show" => {
@@ -701,6 +708,61 @@ fn execute(
             flag(&mut argv, a, "reason", "reason")
         }
         "thoth_checks_remove" => pos!("id"),
+        "thoth_pipeline_start" => {
+            pos!("task");
+            for (n, f) in [("implementers", "implementer"), ("reviewers", "reviewer")] {
+                let items = a[n].as_array().cloned().unwrap_or_default();
+                if items.is_empty() {
+                    return tool_error(format!("parameter {n} must not be empty"), None, None, None);
+                }
+                for item in items {
+                    argv.push(format!("--{f}={}", item.as_str().unwrap()))
+                }
+            }
+            for n in ["timeout", "review_timeout", "verify_timeout", "verify_wait"] {
+                if let Some(text) = a.get(n).and_then(Value::as_str) {
+                    if let Err(e) = crate::cli::parse_duration_secs(text) {
+                        return tool_error(format!("parameter {n}: {e}"), None, None, None);
+                    }
+                }
+            }
+            if a.get("max_attempts").and_then(Value::as_i64).is_some_and(|n| n < 1) {
+                return tool_error("parameter max_attempts must be at least 1".into(), None, None, None);
+            }
+            if a.get("fold_on_reject") == Some(&Value::Bool(true)) {
+                argv.push("--fold-on-reject".into())
+            }
+            for (n, f) in [
+                ("reason", "reason"),
+                ("quota_threshold", "quota-threshold"),
+                ("max_attempts", "max-attempts"),
+                ("timeout", "timeout"),
+                ("review_timeout", "review-timeout"),
+                ("verify_timeout", "verify-timeout"),
+                ("verify_wait", "verify-wait"),
+            ] {
+                flag(&mut argv, a, n, f)
+            }
+        }
+        "thoth_pipeline_show" => {
+            pos!("task");
+            match a.get("wait_seconds") {
+                None => {}
+                Some(v) => match v.as_i64() {
+                    Some(0) => {}
+                    Some(n) if n >= 1 && (n as u64) <= o.max_wait => argv.push(format!("--wait={n}s")),
+                    _ => {
+                        return tool_error(
+                            format!("parameter wait_seconds must be between 0 and {} seconds", o.max_wait),
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                },
+            }
+        }
+        "thoth_pipeline_stop" => pos!("task"),
         "thoth_doctor" => flag(&mut argv, a, "shell", "shell"),
         "thoth_spec_lint" => {
             let file = match (a.get("spec"), a.get("file").and_then(Value::as_str)) {
@@ -756,7 +818,7 @@ fn execute(
     // Exit 1 from doctor means "some item failed", and from spec lint "the
     // spec has an error"; either way stdout is still the full report.
     if out.status.success()
-        || (t.name == "thoth_wait" && out.status.code() == Some(3))
+        || (matches!(t.name, "thoth_wait" | "thoth_pipeline_show") && out.status.code() == Some(3))
         || (matches!(t.name, "thoth_doctor" | "thoth_spec_lint") && out.status.code() == Some(1))
     {
         let doc = if let Some(p) = packet {
@@ -903,11 +965,11 @@ mod tests {
                 t.name
             );
         }
-        assert_eq!(STATE_CHANGING.len(), 18);
+        // No hard-coded total: the list only has to name each tool once.
         let mut names = STATE_CHANGING.to_vec();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), STATE_CHANGING.len());
     }
     #[test]
     fn forbidden_sequences_are_enforced() {

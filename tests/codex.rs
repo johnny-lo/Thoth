@@ -524,11 +524,17 @@ fn claude_candidate() -> (common::Fixture, PathBuf, String, String) {
 /// `review start --profile codex-a` with a fake-codex reviewer scenario, then
 /// `wait --run` on the reviewer. Returns the `review start --json` output.
 fn codex_review(f: &common::Fixture, task_id: &str, scenario: &str) -> serde_json::Value {
+    codex_review_with(f, task_id, scenario, &[])
+}
+
+/// `codex_review` with `extra` flags on `review start`.
+fn codex_review_with(f: &common::Fixture, task_id: &str, scenario: &str, extra: &[&str]) -> serde_json::Value {
     let out = f
         .cmd()
         .env("FAKE_SCENARIO", scenario)
         .env("FAKE_CODEX_ARGS_LOG", args_log(f))
         .args(["review", "start", task_id, "--profile", "codex-a", "--model", MODEL, "--effort", "medium", "--json"])
+        .args(extra)
         .assert()
         .success()
         .get_output()
@@ -560,7 +566,9 @@ fn stable_packet_part(packet: &str) -> String {
 #[test]
 fn a_codex_reviewer_reads_its_input_files_and_its_pass_settles_the_task_pass() {
     let (f, cfg, task_id, implementer_run) = claude_candidate();
-    let r = codex_review(&f, &task_id, "review_pass");
+    // RFIX-2: a plain review, whose schema (no `edits`) this test compares;
+    // a code task is in edit mode by default.
+    let r = codex_review_with(&f, &task_id, "review_pass", &["--no-edit"]);
     let reviewer_run = r["run_id"].as_str().unwrap().to_string();
     let wt = PathBuf::from(r["worktree"].as_str().unwrap());
     let run_dir = PathBuf::from(r["run_dir"].as_str().unwrap());
@@ -812,4 +820,27 @@ fn a_codex_implementer_is_reviewed_by_a_claude_code_reviewer() {
     let verdict = event_detail(&f, &reviewer_run, "verdict").unwrap();
     assert_eq!(verdict["verdict"], "PASS", "{verdict}");
     assert_eq!(exec_invocations(&f).len(), 1, "only the implementer ran codex");
+}
+
+// RVI-1 --------------------------------------------------------------------
+
+mod rvi;
+
+/// RVI-1 AC1, AC2, AC6, AC7: a codex reviewer reads the target run's whole
+/// recorded delivery from `.agent/review-input/result.json`.
+#[test]
+fn rvi_a_codex_reviewer_reads_the_target_runs_recorded_delivery() {
+    rvi::delivered_result_is_read_from_the_target_run(rvi::Reviewer::Codex);
+}
+
+/// RVI-1 AC5 (and AC4 without linux-container in the spec).
+#[test]
+fn rvi_a_codex_reviewers_result_file_is_masked() {
+    rvi::delivered_result_is_masked(rvi::Reviewer::Codex);
+}
+
+/// RVI-1 AC3 and AC4 with linux-container in the spec.
+#[test]
+fn rvi_a_codex_reviewer_counts_a_silent_success_and_nothing_weaker() {
+    rvi::check_evidence_rules(rvi::Reviewer::Codex);
 }

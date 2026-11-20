@@ -100,7 +100,7 @@ pub fn source_check_prompt(
          Verdict: any not_supported means REJECT; otherwise any unreachable means UNVERIFIED; otherwise all supported means PASS.\n\
          extra_findings use severity, note, evidence, fix_size and category.\n{}",
         serde_json::to_string(sources).expect("source list serializes"),
-        crate::review_json::finding_labels_prompt(),
+        crate::review_json::source_check_labels_prompt(),
     )
 }
 
@@ -598,6 +598,32 @@ mod tests {
             assert_eq!(serde_json::from_str::<serde_json::Value>(line).unwrap(), serde_json::to_value(&sources).unwrap());
             assert!(prompt.contains("independent") && prompt.contains("T1"));
             assert!(!prompt.contains("## Evidence") && !prompt.contains("## Rules"));
+        }
+    }
+
+    /// REV-1 (AC2): the source check lists test_incomplete with the other
+    /// categories and their wording, but keeps its own verdict rule: no
+    /// blocking/advisory marks and no code-review verdict rule.
+    #[test]
+    fn source_prompts_list_test_incomplete_without_the_blocking_split() {
+        use crate::review_json::{FindingClass, CATEGORIES, VERDICT_RULE};
+        let sources = crate::review_json::sources_to_check(&serde_json::json!({"claims":[
+            {"kind":"research", "text":"claim", "sources":[{"url":"file:///page", "quote":"quote"}]}]}));
+        for harness in ["claude-code", "codex", "antigravity"] {
+            let prompt = source_check_prompt("T1", harness, &sources);
+            let list = prompt
+                .lines()
+                .find_map(|l| l.strip_prefix("Every \"category\" must be one of: "))
+                .unwrap_or_else(|| panic!("{harness}: no category line in:\n{prompt}"));
+            assert!(list.split([',', '.']).any(|n| n.trim() == "test_incomplete"), "{harness}: {list}");
+            for c in CATEGORIES {
+                assert!(prompt.contains(&format!("- {}: {}\n", c.name, c.about)), "{harness}: {} in:\n{prompt}", c.name);
+            }
+            assert!(!prompt.contains(VERDICT_RULE), "{harness}:\n{prompt}");
+            for class in [FindingClass::Blocking, FindingClass::Advisory] {
+                assert!(!prompt.contains(class.as_str()), "{harness}:\n{prompt}");
+            }
+            assert!(prompt.contains("Verdict: any not_supported means REJECT; otherwise any unreachable means UNVERIFIED; otherwise all supported means PASS.\n"), "{harness}");
         }
     }
 

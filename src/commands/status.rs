@@ -77,6 +77,25 @@ fn others_with_quota(run: &Run, with_quota: Option<&[String]>) -> Option<Vec<Str
     with_quota.map(|ids| ids.iter().filter(|id| **id != run.account).cloned().collect())
 }
 
+/// SMALL-9b: the `--timeout` a timed-out run's next step suggests: twice the
+/// larger of its own limit and the default for its effort, at most the 7-day
+/// maximum, in the shortest form `--timeout` takes (`6h`, `90m`, `45s`).
+fn larger_timeout(run: &Run) -> String {
+    let effort = crate::adapter::effort::parse_launch(&run.spec).and_then(|l| l.effort);
+    let default = crate::adapter::effort::default_timeout_secs(effort.as_deref());
+    let secs = (run.timeout_seconds.max(0) as u64)
+        .max(default)
+        .saturating_mul(2)
+        .min(crate::cli::MAX_DURATION_SECS);
+    if secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// FC-1 (H1): what to do about a run that stopped early, by its status and
 /// interruption reason, naming its profile, run, task and model. `None` for a
 /// run that needs nothing (completed, cancelled, still going, failed/user).
@@ -141,7 +160,8 @@ pub(crate) fn next_step(run: &Run, with_quota: Option<&[String]>) -> Option<Stri
         }
         ("failed", Some("timeout")) => format!(
             "the run hit its wall-clock timeout; dispatch again with a larger --timeout: \
-             {dispatch} --timeout 2h"
+             {dispatch} --timeout {}",
+            larger_timeout(run)
         ),
         ("failed", None) => format!(
             "the harness reported a failure; read error_text, then dispatch again: {dispatch}"
@@ -253,6 +273,9 @@ fn open_task_rows(
             "updated_at": t.updated_at,
             "repo": repo,
             "live_run": live_run(&runs),
+            // AUTO-1a: the task's newest pipeline in short, or null (also for
+            // a repository opened read-only that never started one).
+            "pipeline": crate::commands::pipeline::status_of_task_brief(conn, &t.task_id),
         });
         let line = format!(
             "{}  {:<11} runs={} {}{}",
@@ -491,6 +514,18 @@ pub fn run(paths: &Paths, cwd: &Path, task: Option<&str>, json: bool) -> Result<
                     lines.push(l);
                 }
             }
+            // AUTO-1a: the task's newest pipeline, or null.
+            let pipeline = crate::commands::pipeline::status_of_task(&conn, &task_id, &now);
+            if pipeline.is_object() {
+                lines.push(format!(
+                    "  pipeline: {} {} at {}{}{}",
+                    pipeline["pipeline_id"].as_str().unwrap_or("-"),
+                    pipeline["status"].as_str().unwrap_or("-"),
+                    pipeline["step"].as_str().unwrap_or("-"),
+                    if pipeline["stale"] == serde_json::json!(true) { "  STALE" } else { "" },
+                    pipeline["stop_reason"].as_str().map(|r| format!("  ({r})")).unwrap_or_default()
+                ));
+            }
             // BASE-1: the branch the task started from lives only in its
             // task_created event; null for a task created before it.
             let base_branch = state::latest_event_of_type(&conn, event_type::TASK_CREATED, Some(&task_id))?
@@ -513,6 +548,7 @@ pub fn run(paths: &Paths, cwd: &Path, task: Option<&str>, json: bool) -> Result<
                     "attempt": max_attempt,
                     "attempt_cap": attempt_cap,
                     "stuck": stuck.as_ref().map(|s| serde_json::json!({"kind": s.kind(), "value": s.value(), "count": 3})),
+                    "pipeline": pipeline,
                 }),
                 &lines.join("\n"),
             );

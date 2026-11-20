@@ -157,8 +157,10 @@ pub enum Command {
         /// attempt keeps the previous run's.
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, value_parser = parse_duration_secs, default_value = "30m")]
-        timeout: u64,
+        /// Wall-clock limit (45, 5s, 30m, 2h); the default follows the effort sent:
+        /// none, low or medium 1h; high 3h; xhigh, max or ultra 4h.
+        #[arg(long, value_parser = parse_duration_secs)]
+        timeout: Option<u64>,
         #[arg(long = "allowed-tools", default_value = DEFAULT_ALLOWED_TOOLS)]
         allowed_tools: String,
         /// Permit an attempt up to N for this dispatch only, past the task's
@@ -288,6 +290,76 @@ pub enum Command {
     Worktrees {
         #[command(subcommand)]
         action: WorktreesAction,
+    },
+    /// Run a task to a short conclusion in the background with the implementers and reviewers you supply: dispatch, wait, protected-change gate, verify, review.
+    Pipeline {
+        #[command(subcommand)]
+        action: PipelineAction,
+    },
+    /// Internal: the background process of one pipeline. Not part of the public surface.
+    #[command(hide = true, name = "pipeline-run")]
+    PipelineRun {
+        pipeline: String,
+        /// Internal: set only on the copy `process::ensure_supervised` re-runs
+        /// inside a systemd unit (Linux).
+        #[arg(long, hide = true)]
+        supervised: bool,
+    },
+}
+
+// No Debug: the reason may hold text the masker has not seen yet.
+#[derive(Subcommand)]
+pub enum PipelineAction {
+    /// Start the background pipeline for a code task that is queued, in_review, reject, unverified, interrupted or failed. Every choice is yours: Thoth walks your --implementer and --reviewer lists forward in order (never ranking, reordering or wrapping), reworks a REJECT on the next implementer entry and moves on from an entry that is ineligible, out of quota or interrupted.
+    Start {
+        task: String,
+        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept. Used in order: rework and hand-over take the next entry; a repeated entry authorises reuse.
+        #[arg(long = "implementer", value_name = "PROFILE:MODEL[:EFFORT]", allow_hyphen_values = true)]
+        implementers: Vec<String>,
+        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept. Used in order from the first usable entry; one with the implementer run's model and effort is skipped.
+        #[arg(long = "reviewer", value_name = "PROFILE:MODEL[:EFFORT]", allow_hyphen_values = true)]
+        reviewers: Vec<String>,
+        /// Skip an entry whose deciding quota window is at least N percent used (1 to 100; read from `thoth profile usage`, no refresh). Left out: only recommend's eligibility decides.
+        #[arg(long = "quota-threshold", value_name = "N", allow_hyphen_values = true)]
+        quota_threshold: Option<String>,
+        /// At important/high risk, append a REJECT's findings unchanged to the spec's constraints and rework, instead of stopping for your rewrite.
+        #[arg(long = "fold-on-reject")]
+        fold_on_reject: bool,
+        /// The highest attempt number the task may reach (default: the task's attempt_cap).
+        #[arg(long = "max-attempts", value_name = "N", allow_hyphen_values = true)]
+        max_attempts: Option<String>,
+        /// Wall-clock limit passed to dispatch (45, 5s, 30m, 2h); left out, dispatch keeps its effort-based default.
+        #[arg(long, value_name = "D", allow_hyphen_values = true)]
+        timeout: Option<String>,
+        /// Wall-clock limit passed to review start; left out, review start keeps its effort-based default.
+        #[arg(long = "review-timeout", value_name = "D", allow_hyphen_values = true)]
+        review_timeout: Option<String>,
+        /// Per-check deadline passed to verify (default 120m).
+        #[arg(long = "verify-timeout", value_name = "D", allow_hyphen_values = true)]
+        verify_timeout: Option<String>,
+        /// How long to wait for a free verify slot (default 2h).
+        #[arg(long = "verify-wait", value_name = "D", allow_hyphen_values = true)]
+        verify_wait: Option<String>,
+        /// Why these choices; required even when require-reason is off, and sent with every launch.
+        #[arg(long, allow_hyphen_values = true)]
+        reason: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the task's newest pipeline: a short conclusion first, then its settings and steps.
+    Show {
+        task: String,
+        /// Wait up to D for the pipeline to stop; exit 3 if it is still running then.
+        #[arg(long, value_name = "D", allow_hyphen_values = true)]
+        wait: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the task's running pipeline to stop. No worker is cancelled; use `thoth cancel RUN` for that.
+    Stop {
+        task: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -429,8 +501,10 @@ pub enum SpecReviewAction {
         /// an earlier one.
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, value_parser = parse_duration_secs, default_value = "30m")]
-        timeout: u64,
+        /// Wall-clock limit (45, 5s, 30m, 2h); the default follows the effort sent:
+        /// none, low or medium 1h; high 3h; xhigh, max or ultra 4h.
+        #[arg(long, value_parser = parse_duration_secs)]
+        timeout: Option<u64>,
         /// Reasoning effort: low, medium, high, xhigh, max or ultra (see
         /// dispatch). Required every time; it can be left out only when the
         /// model has no effort setting.
@@ -457,8 +531,10 @@ pub enum SpecReviewAction {
         /// The model. Required every time.
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, value_parser = parse_duration_secs, default_value = "30m")]
-        timeout: u64,
+        /// Wall-clock limit (45, 5s, 30m, 2h); the default follows the effort sent:
+        /// none, low or medium 1h; high 3h; xhigh, max or ultra 4h.
+        #[arg(long, value_parser = parse_duration_secs)]
+        timeout: Option<u64>,
         /// Reasoning effort, as for spec review start.
         #[arg(long)]
         effort: Option<String>,
@@ -502,8 +578,10 @@ pub enum ReviewAction {
         /// the review of the same attempt again keeps the previous run's.
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, value_parser = parse_duration_secs, default_value = "30m")]
-        timeout: u64,
+        /// Wall-clock limit (45, 5s, 30m, 2h); the default follows the effort sent:
+        /// none, low or medium 1h; high 3h; xhigh, max or ultra 4h.
+        #[arg(long, value_parser = parse_duration_secs)]
+        timeout: Option<u64>,
         /// Reasoning effort: low, medium, high, xhigh, max or ultra (see
         /// dispatch). Required on the first review of an attempt (unless the
         /// model has no effort setting); starting it again keeps the previous
@@ -517,9 +595,16 @@ pub enum ReviewAction {
         /// Edit mode: the reviewer may attach a small fix to its REJECT,
         /// which thoth applies in the fix worktree, checks against fixed
         /// bounds and commits on thoth/TASK/aN-fix for `verify` and
-        /// `review confirm`. Code tasks only.
-        #[arg(long)]
+        /// `review confirm`. Code tasks get edit mode by default; docs and
+        /// review tasks only with --edit; a research task cannot attach a
+        /// fix (its review is a source check).
+        #[arg(long, conflicts_with = "no_edit")]
         edit: bool,
+        /// A plain review: no fix is attached, even on a code task (where
+        /// edit mode is the default). Docs, review and research tasks are
+        /// reviewed this way unless --edit is given (refused for research).
+        #[arg(long)]
+        no_edit: bool,
         #[arg(long)]
         json: bool,
     },
@@ -533,8 +618,10 @@ pub enum ReviewAction {
         /// model at the edit review's effort.
         #[arg(long)]
         model: String,
-        #[arg(long, value_parser = parse_duration_secs, default_value = "30m")]
-        timeout: u64,
+        /// Wall-clock limit (45, 5s, 30m, 2h); the default follows the effort sent:
+        /// none, low or medium 1h; high 3h; xhigh, max or ultra 4h.
+        #[arg(long, value_parser = parse_duration_secs)]
+        timeout: Option<u64>,
         /// Reasoning effort, as for review start; required unless the model
         /// has no effort setting.
         #[arg(long)]
@@ -750,7 +837,7 @@ pub enum EvidenceAction {
 /// value near `u64::MAX`. Nothing in Phase 1 legitimately waits or times out
 /// longer than a week, so anything past that is almost certainly a typo
 /// (an extra digit, a wrong unit) rather than an intentional value.
-const MAX_DURATION_SECS: u64 = 7 * 24 * 3600;
+pub(crate) const MAX_DURATION_SECS: u64 = 7 * 24 * 3600;
 
 /// Accept `45`, `5s`, `30m`, `2h`. A bare number means seconds.
 pub fn parse_duration_secs(s: &str) -> Result<u64, String> {
