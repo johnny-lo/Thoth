@@ -387,6 +387,12 @@ fn packet_doc(
         )?),
         None => json!([]),
     };
+    // VSCOPE-1: what the scoped checks of the newest verify of that run (not
+    // a `--at-base` one) actually ran.
+    let test_scope = match claims_run_id.as_str() {
+        Some(run_id) => test_scope_for_run(conn, task_id, run_id)?,
+        None => json!([]),
+    };
 
     let reviews: Vec<Value> = state::list_reviews_for_task(conn, task_id)?
         .into_iter()
@@ -431,6 +437,7 @@ fn packet_doc(
         "claims": claims,
         "claims_run_id": claims_run_id,
         "checks_not_run": checks_not_run,
+        "test_scope": test_scope,
         "approvals": approvals(conn, task_id)?,
         "reviews": reviews,
     });
@@ -439,6 +446,33 @@ fn packet_doc(
     let counts = masker.mask_value(&mut doc);
     redactions.counts.merge(&counts);
     Ok((doc, rows, redactions))
+}
+
+/// VSCOPE-1: `test_scope`: each row with a `scope` in the newest `verify_ran`
+/// of `run_id` that is not a `--at-base` one, as `{"check_id", ...scope}`;
+/// `[]` without such an event or such rows.
+fn test_scope_for_run(conn: &Connection, task_id: &str, run_id: &str) -> Result<Value> {
+    let mut stmt = conn.prepare(
+        "SELECT detail FROM events WHERE task_id = ?1 AND run_id = ?2 AND type = ?3 ORDER BY seq DESC",
+    )?;
+    let details = stmt
+        .query_map(rusqlite::params![task_id, run_id, event_type::VERIFY_RAN], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    let newest = details
+        .iter()
+        .map(|d| serde_json::from_str::<Value>(d).unwrap_or(Value::Null))
+        .find(|d| d.get("at_commit").is_none());
+    let mut out = Vec::new();
+    for row in newest.iter().flat_map(|d| d["results"].as_array().cloned().unwrap_or_default()) {
+        let Some(scope) = row.get("scope").and_then(Value::as_object) else { continue };
+        let mut item = serde_json::Map::new();
+        item.insert("check_id".into(), row["check_id"].clone());
+        for (k, v) in scope {
+            item.insert(k.clone(), v.clone());
+        }
+        out.push(Value::Object(item));
+    }
+    Ok(Value::Array(out))
 }
 
 /// LESS-5: the approvals the reviewer should know about, oldest first: every
@@ -728,6 +762,20 @@ fn render_markdown(doc: &Value, handoff_reasons: &std::collections::HashMap<Stri
     }
     for n in &not_run {
         m.push_str(&format!("{} ({})\n", s(&n["check_id"]), s(&n["reason"])));
+    }
+    m.push('\n');
+
+    // VSCOPE-1: what the scoped checks ran, ahead of the diffs.
+    m.push_str("## Test scope\n\n");
+    m.push_str(
+        "Scoped checks of the newest verify of the run under review ran only the test targets below (each with its sources: spec, diff_added, diff_modified), or every test target when a shared test file, src/bin/, Cargo.toml, Cargo.lock or build.rs changed. Existing tests outside the scope run only in the whole suite (thoth suite run) on the main line.\n\n",
+    );
+    let scoped = doc["test_scope"].as_array().cloned().unwrap_or_default();
+    if scoped.is_empty() {
+        m.push_str("(none)\n");
+    }
+    for t in &scoped {
+        m.push_str(&format!("{}: {}\n", s(&t["check_id"]), crate::commands::verify::scope_text(t)));
     }
     m.push('\n');
 

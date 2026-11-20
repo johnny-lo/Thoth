@@ -10,13 +10,13 @@ use crate::commands::models::ModelSnapshot;
 use crate::commands::usage::{self, ExtraBucket, Window};
 use crate::config::Paths;
 use crate::db::global::Profile;
-use crate::db::state;
+use crate::db::{reports, state};
 use crate::lang::Lang;
 use crate::model::event_type;
 use crate::output;
 use crate::plan_label;
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -216,13 +216,7 @@ impl Snapshot {
         // deleted repo is skipped, and nothing is created for it.
         let mut repos = Vec::new();
         {
-            let mut stmt = global.prepare(
-                "SELECT repo_id, COALESCE(root_path, '') FROM repos ORDER BY root_path, repo_id",
-            )?;
-            let rows =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            for row in rows {
-                let (repo_id, root) = row?;
+            for (repo_id, root) in reports::repo_roots(&global)? {
                 let path = paths.state_db(&repo_id);
                 if path.is_file() {
                     repos.push((root, usage::read_only(&path)?));
@@ -295,17 +289,7 @@ impl Snapshot {
 
 fn add_work(conn: &Connection, account: &mut Account) -> Result<()> {
     let id = account.profile.profile_id.as_str();
-    let mut stmt = conn
-        .prepare("SELECT COALESCE(role, ''), started_at, ended_at FROM runs WHERE account = ?1")?;
-    let rows = stmt.query_map([id], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, Option<String>>(1)?,
-            r.get::<_, Option<String>>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (role, started, ended) = row?;
+    for (role, started, ended) in reports::account_run_times(conn, id)? {
         match role.as_str() {
             "implementer" => account.implementer_runs += 1,
             "reviewer" => account.reviewer_runs += 1,
@@ -326,39 +310,20 @@ fn add_work(conn: &Connection, account: &mut Account) -> Result<()> {
 }
 
 fn load_tasks(conn: &Connection) -> Result<Vec<TaskRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.task_id, COALESCE(t.title, ''), COALESCE(t.status, ''), COALESCE(t.risk, ''),
-                COALESCE(t.updated_at, ''),
-                (SELECT MAX(r.attempt) FROM runs r
-                  WHERE r.task_id = t.task_id AND r.role = 'implementer'),
-                (SELECT v.verdict FROM reviews v JOIN runs r ON r.run_id = v.target_run_id
-                  WHERE r.task_id = t.task_id ORDER BY v.created_at DESC LIMIT 1)
-         FROM tasks t",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(TaskRow {
-            id: r.get(0)?,
-            title: r.get(1)?,
-            status: r.get(2)?,
-            risk: r.get(3)?,
-            updated_at: r.get(4)?,
-            attempts: r.get(5)?,
-            verdict: r.get(6)?,
-            newest_run: None,
+    let tasks = reports::report_tasks(conn)?;
+    Ok(tasks
+        .into_iter()
+        .map(|t| TaskRow {
+            id: t.id,
+            title: t.title,
+            status: t.status,
+            risk: t.risk,
+            updated_at: t.updated_at,
+            attempts: t.attempts,
+            verdict: t.verdict,
+            newest_run: t.newest_run,
         })
-    })?;
-    let mut tasks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut newest = conn.prepare(
-        "SELECT run_id, COALESCE(account, ''), COALESCE(model, ''), interrupted_reason,
-                harness_session_id IS NOT NULL
-         FROM runs WHERE task_id = ?1 ORDER BY run_id DESC LIMIT 1",
-    )?;
-    for t in &mut tasks {
-        t.newest_run = newest
-            .query_row([&t.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-            .optional()?;
-    }
-    Ok(tasks)
+        .collect())
 }
 
 fn group_tasks(root: String, tasks: Vec<TaskRow>) -> RepoTasks {
@@ -407,26 +372,8 @@ fn load_missing_note(conn: &Connection) -> Result<Option<MissingNote>> {
 }
 
 fn load_findings(conn: &Connection) -> Result<Vec<Finding>> {
-    let mut stmt = conn.prepare(
-        "SELECT COALESCE(r.task_id, ''), COALESCE(t.title, ''), v.verdict,
-                COALESCE(v.findings, ''), COALESCE(v.created_at, '')
-         FROM reviews v
-         JOIN runs r ON r.run_id = v.target_run_id
-         LEFT JOIN tasks t ON t.task_id = r.task_id
-         WHERE v.verdict IN ('REJECT', 'UNVERIFIED')",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-        ))
-    })?;
     let mut out = Vec::new();
-    for row in rows {
-        let (task_id, task_title, verdict, findings, created_at) = row?;
+    for (task_id, task_title, verdict, findings, created_at) in reports::rejected_reviews(conn)? {
         let findings: Value = serde_json::from_str(&findings).unwrap_or(Value::Null);
         let text =
             |v: &Value, key: &str| v.get(key).and_then(Value::as_str).unwrap_or("").to_string();

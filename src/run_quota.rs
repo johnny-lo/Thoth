@@ -17,6 +17,7 @@ use crate::adapter::{HARNESS_CLAUDE_CODE, HARNESS_CODEX};
 use crate::commands::usage;
 use crate::config::Paths;
 use crate::db::global;
+use crate::db::reports;
 use crate::db::state::{self, NewEvent};
 use crate::model::event_type;
 use anyhow::Result;
@@ -134,13 +135,7 @@ pub(crate) fn claude_readings(
     run_id: &str,
     window: &str,
 ) -> Result<Vec<Reading>> {
-    let mut stmt =
-        conn.prepare("SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq")?;
-    let details = stmt
-        .query_map([run_id, event_type::RATE_LIMIT_WARNING], |r| {
-            r.get::<_, Option<String>>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let details = reports::run_rate_limit_warning_details(conn, run_id)?;
     Ok(details
         .into_iter()
         .flatten()
@@ -237,19 +232,7 @@ fn overlapping_runs(
     start: OffsetDateTime,
     end: OffsetDateTime,
 ) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT run_id, started_at, ended_at FROM runs
-         WHERE account = ?1 AND run_id != ?2 AND started_at IS NOT NULL",
-    )?;
-    let rows = stmt
-        .query_map([account, run_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = reports::other_started_runs(conn, account, run_id)?;
     Ok(rows
         .into_iter()
         .filter(|(_, started, ended)| {

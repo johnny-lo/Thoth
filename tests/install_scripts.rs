@@ -74,6 +74,17 @@ try {
     }
 } finally { $k.Close() }";
 
+/// `READ_PATH_VALUE` once for each key in $env:THOTH_TEST_REG_KEYS (one per
+/// line), so one powershell.exe reads several keys: one output line per key,
+/// in order.
+#[cfg(windows)]
+fn read_path_values() -> String {
+    format!(
+        "foreach ($thothTestKey in $env:THOTH_TEST_REG_KEYS.Split([char]10)) {{\n\
+         $env:THOTH_TEST_REG_KEY = $thothTestKey\n{READ_PATH_VALUE}\n}}"
+    )
+}
+
 /// The Path value of a key under HKCU, compared losslessly: the exit status
 /// and raw output bytes of `reg query KEY /v Path`, plus the value as
 /// PowerShell reads it. reg.exe maps characters outside the console code page
@@ -96,29 +107,70 @@ impl RegSnapshot {
     /// Like `take`, without panicking: `Drop` uses it while a failed
     /// assertion unwinds.
     fn try_take(key: &str) -> Result<Self, String> {
-        let subkey = key
-            .strip_prefix(r"HKCU\")
-            .ok_or_else(|| format!("{key} is not under HKCU"))?;
-        let reg = Command::new("reg")
-            .args(["query", key, "/v", "Path"])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("reg query {key}: {e}"))?;
+        let [snapshot] = Self::try_take_all([key]);
+        snapshot
+    }
+
+    /// `try_take` for several keys at one moment: `reg query` once per key,
+    /// then one powershell.exe that reads every key. Each key's result has
+    /// the same checks as `try_take`; a failure shared by all keys (for
+    /// example powershell.exe failing) is every key's error.
+    fn try_take_all<const N: usize>(keys: [&str; N]) -> [Result<Self, String>; N] {
+        match Self::read_all(&keys) {
+            Ok(snapshots) => snapshots.try_into().expect("one result per key"),
+            Err(e) => keys.map(|_| Err(e.clone())),
+        }
+    }
+
+    fn read_all(keys: &[&str]) -> Result<Vec<Result<Self, String>>, String> {
+        let names = keys.join(" and ");
+        let subkeys = keys
+            .iter()
+            .map(|key| {
+                key.strip_prefix(r"HKCU\")
+                    .ok_or_else(|| format!("{key} is not under HKCU"))
+            })
+            .collect::<Result<Vec<&str>, String>>()?;
+        let regs = keys
+            .iter()
+            .map(|key| {
+                Command::new("reg")
+                    .args(["query", key, "/v", "Path"])
+                    .stdin(Stdio::null())
+                    .output()
+                    .map_err(|e| format!("reg query {key}: {e}"))
+            })
+            .collect::<Result<Vec<Output>, String>>()?;
         let ps = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", READ_PATH_VALUE])
-            .env("THOTH_TEST_REG_KEY", subkey)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &read_path_values()])
+            .env("THOTH_TEST_REG_KEYS", subkeys.join("\n"))
             .stdin(Stdio::null())
             .output()
             .map_err(|e| format!("powershell.exe: {e}"))?;
         let text = String::from_utf8(ps.stdout)
-            .map_err(|e| format!("reading {key}'s Path printed non-UTF-8 output: {e}"))?;
+            .map_err(|e| format!("reading {names}'s Path printed non-UTF-8 output: {e}"))?;
         if !ps.status.success() {
             return Err(format!(
-                "reading {key}'s Path failed: {text}{}",
+                "reading {names}'s Path failed: {text}{}",
                 String::from_utf8_lossy(&ps.stderr)
             ));
         }
-        let fields: Vec<&str> = text.trim_end_matches(['\r', '\n']).split(' ').collect();
+        let lines: Vec<&str> = text.trim_end_matches(['\r', '\n']).lines().collect();
+        if lines.len() != keys.len() {
+            return Err(format!("reading {names}'s Path printed {text:?}"));
+        }
+        Ok(keys
+            .iter()
+            .zip(regs)
+            .zip(lines)
+            .map(|((key, reg), text)| Self::parse(key, reg, text))
+            .collect())
+    }
+
+    /// One key's snapshot from its `reg query` output and the line
+    /// PowerShell printed for it.
+    fn parse(key: &str, reg: Output, text: &str) -> Result<Self, String> {
+        let fields: Vec<&str> = text.split(' ').collect();
         let value = match fields[..] {
             ["missing"] => None,
             ["present", kind, hex] if hex.len() % 4 == 0 => {
@@ -293,7 +345,12 @@ impl Fixture {
             }
             // Similar names must not match; accept coreutils text and binary markers,
             // as well as uppercase hashes.
-            let digest = hash(&asset);
+            // Both assets have the same bytes in every fixture of this test
+            // process, so each is hashed once and the digest reused.
+            static LATEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            static TAGGED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            let cached = if release == "latest/download" { &LATEST } else { &TAGGED };
+            let digest = cached.get_or_init(|| hash(&asset)).clone();
             let entry = if release == "latest/download" {
                 format!("{}  {ASSET}", digest.to_uppercase())
             } else {
@@ -347,11 +404,7 @@ impl Fixture {
 
     fn try_run(&self, cmd: &mut Command) -> std::io::Result<Output> {
         #[cfg(windows)]
-        assert!(
-            cmd.get_envs().any(|(k, v)| k == "THOTH_INSTALL_USER_ENV_KEY"
-                && v == Some(std::ffi::OsStr::new(&self.env_key))),
-            "every subprocess must run with the isolated THOTH_INSTALL_USER_ENV_KEY"
-        );
+        self.assert_isolated(cmd);
         let out = cmd.output();
         self.assert_real_user_path_unchanged();
         out
@@ -361,14 +414,7 @@ impl Fixture {
     /// value it had when the fixture was made.
     fn assert_real_user_path_unchanged(&self) {
         #[cfg(windows)]
-        {
-            let now = RegSnapshot::take(REAL_ENV_KEY);
-            assert!(
-                now == self.real_path_before,
-                "{}",
-                real_path_changed(&self.real_path_before, &now)
-            );
-        }
+        self.assert_real_snapshot_unchanged(&RegSnapshot::take(REAL_ENV_KEY));
     }
 
     fn path(&self, relative: &str) -> PathBuf {
@@ -473,13 +519,32 @@ impl Fixture {
 #[track_caller]
 fn success(f: &Fixture, cmd: &mut Command) -> Output {
     let out = f.run(cmd);
+    assert_succeeded(cmd, &out);
+    out
+}
+
+#[track_caller]
+fn assert_succeeded(cmd: &Command, out: &Output) {
     assert!(
         out.status.success(),
         "{cmd:?}\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    out
+}
+
+/// `success`, also returning the isolated key's Path value read by the same
+/// powershell.exe that compares the real one after `cmd`. The read's error,
+/// if any, is left for the caller to raise where it looks at the value.
+#[cfg(windows)]
+#[track_caller]
+fn success_reading_user_path(
+    f: &Fixture,
+    cmd: &mut Command,
+) -> (Output, Result<RegSnapshot, String>) {
+    let (out, user_path) = f.run_reading_user_path(cmd);
+    assert_succeeded(cmd, &out);
+    (out, user_path)
 }
 
 #[test]
@@ -757,6 +822,41 @@ impl Fixture {
         RegSnapshot::take(&self.env_key)
     }
 
+    /// The real and the isolated Path values read at one moment (one
+    /// powershell.exe for both). The real one panics now if it cannot be
+    /// read, as `RegSnapshot::take` does; the isolated one's error is left to
+    /// the caller.
+    fn take_real_and_user_path(&self) -> (RegSnapshot, Result<RegSnapshot, String>) {
+        let [real, user] = RegSnapshot::try_take_all([REAL_ENV_KEY, &self.env_key]);
+        (real.unwrap_or_else(|e| panic!("{e}")), user)
+    }
+
+    fn assert_isolated(&self, cmd: &Command) {
+        assert!(
+            cmd.get_envs().any(|(k, v)| k == "THOTH_INSTALL_USER_ENV_KEY"
+                && v == Some(std::ffi::OsStr::new(&self.env_key))),
+            "every subprocess must run with the isolated THOTH_INSTALL_USER_ENV_KEY"
+        );
+    }
+
+    fn assert_real_snapshot_unchanged(&self, now: &RegSnapshot) {
+        assert!(
+            *now == self.real_path_before,
+            "{}",
+            real_path_changed(&self.real_path_before, now)
+        );
+    }
+
+    /// `run`, also reading the isolated key's Path value with the same
+    /// powershell.exe that compares the real one after `cmd`.
+    fn run_reading_user_path(&self, cmd: &mut Command) -> (Output, Result<RegSnapshot, String>) {
+        self.assert_isolated(cmd);
+        let out = cmd.output();
+        let (real, user_path) = self.take_real_and_user_path();
+        self.assert_real_snapshot_unchanged(&real);
+        (out.unwrap(), user_path)
+    }
+
     /// Sets the isolated Path value (`None` removes it), checks the real one,
     /// and returns the isolated value read back, which must be exactly `value`.
     fn set_user_path(&self, value: Option<(&str, &str)>) -> RegSnapshot {
@@ -768,8 +868,9 @@ impl Fixture {
                 reg(&["add", &self.env_key, "/v", "Path", "/t", kind, "/d", raw, "/f"])
             }
         };
-        self.assert_real_user_path_unchanged();
-        let now = self.user_path();
+        let (real, now) = self.take_real_and_user_path();
+        self.assert_real_snapshot_unchanged(&real);
+        let now = now.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             now.value,
             value.and_then(|(kind, raw)| reg_value(kind, raw)),
@@ -794,8 +895,19 @@ impl Fixture {
 
 #[cfg(windows)]
 #[test]
-fn windows_path_update_appends_to_the_raw_user_path_as_expand_sz() {
-    for mode in modes() {
+fn windows_path_update_appends_to_the_raw_user_path_as_expand_sz_file() {
+    path_update_appends_to_the_raw_user_path_as_expand_sz(Mode::File);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_path_update_appends_to_the_raw_user_path_as_expand_sz_iex() {
+    path_update_appends_to_the_raw_user_path_as_expand_sz(Mode::Iex);
+}
+
+#[cfg(windows)]
+fn path_update_appends_to_the_raw_user_path_as_expand_sz(mode: Mode) {
+    {
         let f = Fixture::new();
         let bin = long_spelling(&f.path("bin"));
         // Characters outside the console code page (cp950 here) and a surrogate
@@ -833,11 +945,11 @@ fn windows_path_update_appends_to_the_raw_user_path_as_expand_sz() {
             let mut cmd = f.command(mode);
             cmd.env("PATH", &process_path)
                 .env("THOTH_INSTALL_DIR", &bin);
-            let out = success(&f, &mut cmd);
+            let (out, stored) = success_reading_user_path(&f, &mut cmd);
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(stdout.contains("PATH updated"), "{mode:?} {seed:?}: {stdout}");
             assert!(!stdout.contains("Could not announce"), "{mode:?} {seed:?}: {stdout}");
-            let stored = f.user_path();
+            let stored = stored.unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(
                 stored.value,
                 reg_value("REG_EXPAND_SZ", &expected),
@@ -850,8 +962,19 @@ fn windows_path_update_appends_to_the_raw_user_path_as_expand_sz() {
 
 #[cfg(windows)]
 #[test]
-fn windows_path_holding_the_install_folder_in_another_spelling_is_left_alone() {
-    for mode in modes() {
+fn windows_path_holding_the_install_folder_in_another_spelling_is_left_alone_file() {
+    path_holding_the_install_folder_in_another_spelling_is_left_alone(Mode::File);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_path_holding_the_install_folder_in_another_spelling_is_left_alone_iex() {
+    path_holding_the_install_folder_in_another_spelling_is_left_alone(Mode::Iex);
+}
+
+#[cfg(windows)]
+fn path_holding_the_install_folder_in_another_spelling_is_left_alone(mode: Mode) {
+    {
         let f = Fixture::new();
         let root = long_spelling(f.root.path());
         let long = long_spelling(&f.path("bin"));
@@ -900,12 +1023,12 @@ fn windows_path_holding_the_install_folder_in_another_spelling_is_left_alone() {
                 cmd.env("PATH", process_path)
                     .env("THOTH_INSTALL_DIR", install_dir)
                     .env("THOTH_TEST_INSTALL_ROOT", &root);
-                let out = success(&f, &mut cmd);
+                let (out, now) = success_reading_user_path(&f, &mut cmd);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let case = format!("{mode:?} dir={install_dir} entry={entry} user={in_user_path}");
                 assert!(!stdout.contains("PATH updated"), "{case}: {stdout}");
                 // Value, kind and reg query's raw bytes, all unchanged.
-                let now = f.user_path();
+                let now = now.unwrap_or_else(|e| panic!("{e}"));
                 assert!(
                     now == saved,
                     "{case}: saved {}, now {}\n{saved:?}\n{now:?}",

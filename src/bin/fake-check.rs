@@ -13,6 +13,9 @@
 //!   and exits with code k of the list on call k (the last one past its end).
 //! - `priority`: prints the process priority class, `below_normal`, `normal`
 //!   or `other` (Windows), or `unknown` elsewhere; exit 0.
+//! - `args ...`: prints each argument after `args` on its own line, then
+//!   `file: NAME` for each file in its working directory (sorted), so a test
+//!   can tell which commit it ran on; exit 0.
 //!
 //! A mode that needs `FAKE_CHECK_DIR` without it set exits 70.
 
@@ -106,6 +109,23 @@ fn main() {
             std::process::exit(code);
         }
         Some("priority") => println!("{}", priority()),
+        Some("args") => {
+            for a in &args[1..] {
+                println!("{a}");
+            }
+            let mut files: Vec<String> = std::fs::read_dir(".")
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_file())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            files.sort();
+            for f in files {
+                println!("file: {f}");
+            }
+        }
         _ => {
             eprintln!("fake-check: unknown mode {args:?}");
             std::process::exit(64);

@@ -87,7 +87,7 @@ fn retro_groups_recorded_findings_by_category_across_tasks() {
     // category's `blocking` are new keys.
     assert_eq!(
         keys(&v),
-        sorted(&["days", "since", "reviews", "findings", "blocking_findings", "advisory_findings", "sizes", "categories"]),
+        sorted(&["days", "since", "reviews", "findings", "blocking_findings", "advisory_findings", "sizes", "categories", "provider_split"]),
         "{v}"
     );
     assert_eq!(

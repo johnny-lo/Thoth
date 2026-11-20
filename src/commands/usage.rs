@@ -2,12 +2,13 @@
 
 use crate::config::Paths;
 use crate::db::global::Profile;
+use crate::db::reports;
 use crate::ids;
 use crate::lang::Lang;
 use crate::output;
 use crate::plan_label;
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -88,13 +89,7 @@ pub(crate) struct RankedCandidate {
 /// quota event (the group an antigravity profile was parked for), or `None`
 /// when there is none or it was not recorded.
 pub(crate) fn parked_group(global: &Connection, profile_id: &str) -> Result<Option<String>> {
-    let detail: Option<String> = global
-        .query_row(
-            "SELECT detail FROM quota_events WHERE profile_id=?1 AND kind='rate_limited' ORDER BY seq DESC LIMIT 1",
-            [profile_id],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let detail: Option<String> = reports::newest_rate_limited_detail(global, profile_id)?;
     Ok(detail
         .and_then(|d| serde_json::from_str::<Value>(&d).ok())
         .and_then(|d| d.get("quota_group").and_then(Value::as_str).map(str::to_string)))
@@ -191,11 +186,7 @@ fn plan_fields(
 }
 
 pub(crate) fn registered_repos(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT repo_id FROM repos ORDER BY repo_id")?;
-    let rows = stmt
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    reports::repo_ids(conn)
 }
 
 pub(crate) fn normalize_rfc(value: &str) -> String {
@@ -224,15 +215,7 @@ fn claude_windows(paths: &Paths, profile: &str, repos: &[String]) -> Result<Vec<
             continue;
         }
         let conn = read_only(&path)?;
-        let mut stmt = conn.prepare(
-            "SELECT e.ts, e.detail FROM events e JOIN runs r ON r.run_id=e.run_id
-             WHERE r.account=?1 AND e.type='rate_limit_warning'",
-        )?;
-        let rows = stmt.query_map([profile], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (ts, detail) = row?;
+        for (ts, detail) in reports::account_rate_limit_warnings(&conn, profile)? {
             let d: Value = match serde_json::from_str(&detail) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -572,11 +555,7 @@ pub(crate) fn live_runs(paths: &Paths, profile: &str, repos: &[String]) -> Resul
             continue;
         }
         let conn = read_only(&path)?;
-        total += conn.query_row(
-            "SELECT COUNT(*) FROM runs WHERE account=?1 AND status IN ('queued','running')",
-            [profile],
-            |r| r.get::<_, i64>(0),
-        )?;
+        total += reports::live_run_count(&conn, profile)?;
     }
     Ok(total)
 }
@@ -697,11 +676,7 @@ fn resolve_task(paths: &Paths, task: &str, repos: &[String]) -> Result<String> {
             continue;
         }
         let conn = read_only(&path)?;
-        let mut stmt = conn.prepare("SELECT task_id FROM tasks")?;
-        ids.extend(
-            stmt.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        );
+        ids.extend(reports::task_ids(&conn)?);
     }
     ids.sort();
     ids.dedup();
@@ -717,7 +692,7 @@ fn task_provider(paths: &Paths, task: &str, repos: &[String]) -> Result<String> 
             continue;
         }
         let conn = read_only(&path)?;
-        let row = conn.query_row("SELECT provider, COALESCE(started_at,'') FROM runs WHERE task_id=?1 AND role='implementer' ORDER BY started_at DESC LIMIT 1", [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let row = reports::newest_implementer_provider(&conn, id.as_str())?;
         if latest
             .as_ref()
             .is_none_or(|old| row.as_ref().is_some_and(|r: &(String, String)| r.1 > old.1))
@@ -757,7 +732,7 @@ pub(crate) fn ranked_candidates(
         let (state, peak, newest) = profile_quota_state(&decision, usage_not_allowed_at.as_deref(), now);
         let mut reasons = Vec::new();
         let parked_at = if p.status == "rate_limited" {
-            global.query_row("SELECT ts FROM quota_events WHERE profile_id=?1 AND kind='rate_limited' ORDER BY seq DESC LIMIT 1", [&p.profile_id], |r| r.get::<_, String>(0)).optional()?
+            reports::newest_rate_limited_ts(&global, &p.profile_id)?
                 .and_then(|ts| OffsetDateTime::parse(&ts, &Rfc3339).ok()).map(|t| t.unix_timestamp())
         } else {
             None

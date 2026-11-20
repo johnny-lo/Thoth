@@ -12,6 +12,7 @@
 
 use crate::commands::usage;
 use crate::config::Paths;
+use crate::db::state;
 use crate::output;
 use crate::review_json::{category_blocks, CATEGORIES, FIX_SIZES};
 use anyhow::Result;
@@ -239,17 +240,157 @@ fn findings_of(review: &ReviewRow) -> Vec<(String, Item)> {
 }
 
 pub fn run(paths: &Paths, days: u32, json_output: bool) -> Result<i32> {
-    let rows = load(paths)?;
-    let retro = summarise(&rows, days, OffsetDateTime::now_utc());
-    output::emit(json_output, &to_json(&retro), &human(&retro));
+    let (rows, providers) = load(paths)?;
+    let now = OffsetDateTime::now_utc();
+    let retro = summarise(&rows, days, now);
+    let split = provider_split(&rows, &providers, days, now);
+    let mut v = to_json(&retro);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("provider_split".to_string(), split.to_json());
+    }
+    let mut text = human(&retro);
+    if retro.reviews > 0 {
+        text.push('\n');
+        text.push_str(&split.human());
+    }
+    output::emit(json_output, &v, &text);
     Ok(0)
 }
 
-/// Every review of every registered repo whose state.db exists. No global.db
-/// means nothing has been reviewed on this machine yet.
-fn load(paths: &Paths) -> Result<Vec<ReviewRow>> {
+/// MEAS-0: which side of the same-/cross-provider split a review falls on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Same,
+    Cross,
+    Unknown,
+}
+
+impl Side {
+    const ALL: [Side; 3] = [Side::Same, Side::Cross, Side::Unknown];
+
+    fn key(self) -> &'static str {
+        match self {
+            Side::Same => "same_provider",
+            Side::Cross => "cross_provider",
+            Side::Unknown => "unknown",
+        }
+    }
+
+    /// Same or cross only when both runs exist and both stored a non-blank
+    /// provider; an external review (no reviewer run) is unknown.
+    fn of(p: Option<&state::ReviewProviders>) -> Side {
+        let known = |s: &Option<String>| s.as_deref().filter(|s| !s.is_empty()).map(str::to_string);
+        match p.map(|p| (known(&p.implementer_provider), known(&p.reviewer_provider))) {
+            Some((Some(i), Some(r))) if i == r => Side::Same,
+            Some((Some(_), Some(_))) => Side::Cross,
+            _ => Side::Unknown,
+        }
+    }
+}
+
+/// MEAS-0: one side's counts, by the same rules as the top level.
+#[derive(Debug, Clone, Default)]
+struct SideCounts {
+    reviews: usize,
+    pass: usize,
+    reject: usize,
+    unverified: usize,
+    findings: usize,
+    categories: Vec<(String, usize)>,
+}
+
+impl SideCounts {
+    fn to_json(&self) -> Value {
+        json!({
+            "reviews": self.reviews,
+            "verdicts": {"PASS": self.pass, "REJECT": self.reject, "UNVERIFIED": self.unverified},
+            "findings": self.findings,
+            "categories": self.categories.iter()
+                .map(|(c, n)| json!({"category": c, "count": n}))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+struct ProviderSplit([SideCounts; 3]);
+
+impl ProviderSplit {
+    fn to_json(&self) -> Value {
+        let mut o = serde_json::Map::new();
+        for (side, counts) in Side::ALL.iter().zip(&self.0) {
+            o.insert(side.key().to_string(), counts.to_json());
+        }
+        Value::Object(o)
+    }
+
+    fn human(&self) -> String {
+        let mut lines = vec!["by provider (reviewer vs implementer):".to_string()];
+        for (side, c) in Side::ALL.iter().zip(&self.0) {
+            lines.push(format!(
+                "  {}: {} reviews (PASS {} REJECT {} UNVERIFIED {}), {} findings",
+                side.key(),
+                c.reviews,
+                c.pass,
+                c.reject,
+                c.unverified,
+                c.findings
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+/// MEAS-0: the reviews `summarise` counts, split by whether the reviewer run
+/// and the implementer run stored the same provider. The window, the skipped
+/// unreadable `created_at`, the author-check rule and the categories are
+/// `summarise`'s, so each side's counts add up to the top level's.
+fn provider_split(
+    rows: &[ReviewRow],
+    providers: &Providers,
+    days: u32,
+    now: OffsetDateTime,
+) -> ProviderSplit {
+    let since = now - Duration::days(i64::from(days));
+    let mut sides: [SideCounts; 3] = Default::default();
+    for review in rows {
+        match OffsetDateTime::parse(&review.created_at, &Rfc3339) {
+            Ok(t) if t >= since => {}
+            _ => continue,
+        }
+        let p = providers.get(&(review.repo.clone(), review.review_id.clone()));
+        let at = Side::ALL.iter().position(|s| *s == Side::of(p)).unwrap_or(2);
+        let side = &mut sides[at];
+        if author_check_copied(review).is_none() {
+            side.reviews += 1;
+            match p.map(|p| p.verdict.as_str()) {
+                Some("PASS") => side.pass += 1,
+                Some("REJECT") => side.reject += 1,
+                Some("UNVERIFIED") => side.unverified += 1,
+                _ => {}
+            }
+        }
+        for (category, _) in findings_of(review) {
+            side.findings += 1;
+            match side.categories.iter_mut().find(|(c, _)| *c == category) {
+                Some((_, n)) => *n += 1,
+                None => side.categories.push((category, 1)),
+            }
+        }
+    }
+    for side in &mut sides {
+        side.categories.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    }
+    ProviderSplit(sides)
+}
+
+type Providers = std::collections::HashMap<(String, String), state::ReviewProviders>;
+
+/// Every review of every registered repo whose state.db exists, and (MEAS-0)
+/// each review's verdict and run providers keyed by (repo root, review id).
+/// No global.db means nothing has been reviewed on this machine yet.
+fn load(paths: &Paths) -> Result<(Vec<ReviewRow>, Providers)> {
     if !paths.global_db().is_file() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Providers::new()));
     }
     let global = usage::global_read_only(paths)?;
     let mut repos = Vec::new();
@@ -267,10 +408,14 @@ fn load(paths: &Paths) -> Result<Vec<ReviewRow>> {
         }
     }
     let mut out = Vec::new();
+    let mut providers = Providers::new();
     for (root, conn) in &repos {
         out.extend(load_reviews(root, conn)?);
+        for p in state::list_review_providers(conn)? {
+            providers.insert((root.clone(), p.review_id.clone()), p);
+        }
     }
-    Ok(out)
+    Ok((out, providers))
 }
 
 fn load_reviews(repo: &str, conn: &Connection) -> Result<Vec<ReviewRow>> {

@@ -116,7 +116,7 @@ fn json_packet_has_the_specified_keys_and_shapes() {
         keys,
         vec![
             "approvals", "checks_not_run", "claims", "claims_run_id", "diffs", "evidence", "protected_changes",
-            "reviews", "risk", "runs", "spec", "status", "task_id", "title"
+            "reviews", "risk", "runs", "spec", "status", "task_id", "test_scope", "title"
         ]
     );
     // REV-3 (AC4): the spec lists no checks, so nothing is required

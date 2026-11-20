@@ -833,12 +833,15 @@ fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Resu
         extra.insert("fix_commit".into(), serde_json::json!(p.fix_commit));
         extra.insert("fix_branch".into(), serde_json::json!(p.fix_branch));
         extra.insert("fix_verify".into(), p.fix_verify.clone());
-        extra.insert("implementer_provider".into(), serde_json::json!(target.provider));
-        extra.insert(
-            "same_provider_as_implementer".into(),
-            serde_json::json!(target.provider == profile.provider),
-        );
     }
+    // MEAS-0: every review start (plain, edit, confirm, and a research task's
+    // source check) records whether the reviewer shares the implementer's
+    // provider, so `thoth retro` can count same- and cross-provider reviews.
+    extra.insert("implementer_provider".into(), serde_json::json!(target.provider));
+    extra.insert(
+        "same_provider_as_implementer".into(),
+        serde_json::json!(target.provider == profile.provider),
+    );
     if let Some(o) = started.as_object_mut() {
         o.extend(extra.clone());
     }
@@ -1812,6 +1815,7 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
                 "blocking": serde_json::Value::Null,
                 "advisory": serde_json::Value::Null,
                 "has_blocking_findings": serde_json::Value::Null,
+                "same_provider_as_implementer": serde_json::Value::Null,
             }),
             &format!("no review recorded for {task_id}; run `thoth review start {task_id} --profile <id>`"),
         );
@@ -1885,6 +1889,19 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
     // computed from what is stored, so records older than REV-1 have them
     // too; `null` for a research source check.
     let split = review_json::split_findings(&doc.findings);
+    // MEAS-0: whether the newest record's reviewer shares the implementer's
+    // provider, from the provider each run row stored when it was made; null
+    // for an external review, a missing run row or a blank provider.
+    let run_provider = |run_id: &str| -> Result<Option<String>> {
+        Ok(state::get_run(&conn, run_id)?.map(|r| r.provider).filter(|p| !p.is_empty()))
+    };
+    let same_provider = match &latest.reviewer_run_id {
+        Some(reviewer) => match (run_provider(&latest.target_run_id)?, run_provider(reviewer)?) {
+            (Some(implementer), Some(reviewer)) => Some(implementer == reviewer),
+            _ => None,
+        },
+        None => None,
+    };
     let v = serde_json::json!({
         "task_id": task_id,
         "review_count": reviews.len(),
@@ -1908,6 +1925,7 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
         "blocking": split.as_ref().map(|s| s.blocking.clone()),
         "advisory": split.as_ref().map(|s| s.advisory.clone()),
         "has_blocking_findings": split.as_ref().map(|s| !s.blocking.is_empty()),
+        "same_provider_as_implementer": same_provider,
     });
 
     let reviewer_label = match &latest.reviewer_run_id {

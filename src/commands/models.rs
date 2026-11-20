@@ -3,6 +3,7 @@
 use crate::commands::{arena, usage};
 use crate::config::Paths;
 use crate::db::global::Profile;
+use crate::db::reports;
 use crate::output;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -885,18 +886,13 @@ fn comparison_name(
             continue;
         }
         let conn = usage::read_only(&path)?;
-        let row = conn.query_row(
-            "SELECT COALESCE(e.ts,''), e.detail FROM events e JOIN runs r ON r.run_id=e.run_id WHERE r.account=?1 AND r.model=?2 AND e.type='harness_init' ORDER BY e.ts DESC, e.seq DESC LIMIT 1",
-            [&profile.profile_id, model], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)));
+        let row = reports::newest_harness_init(&conn, &profile.profile_id, model)
+            .with_context(|| format!("read harness_init from {}", path.display()))?;
         match row {
-            Ok((ts, detail)) if newest.as_ref().is_none_or(|(best, _)| ts > *best) => {
+            Some((ts, detail)) if newest.as_ref().is_none_or(|(best, _)| ts > *best) => {
                 newest = Some((ts, detail))
             }
-            Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("read harness_init from {}", path.display()))
-            }
+            _ => {}
         }
     }
     Ok(newest
@@ -968,25 +964,13 @@ fn thoth(
             continue;
         }
         let conn = usage::read_only(&path)?;
-        let values = conn.query_row(
-            "SELECT COUNT(*),
-             SUM(CASE WHEN EXISTS (SELECT 1 FROM reviews v WHERE v.target_run_id=r.run_id) THEN 1 ELSE 0 END),
-             (SELECT COUNT(*) FROM reviews v JOIN runs x ON x.run_id=v.target_run_id WHERE x.role='implementer' AND x.account=?1 AND x.model=?2 AND v.verdict='PASS'),
-             (SELECT COUNT(*) FROM reviews v JOIN runs x ON x.run_id=v.target_run_id WHERE x.role='implementer' AND x.account=?1 AND x.model=?2 AND v.verdict='REJECT')
-             FROM runs r WHERE r.role='implementer' AND r.account=?1 AND r.model=?2",
-            [profile, model],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0), r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)),
-        )?;
+        let values = reports::implementer_review_counts(&conn, profile, model)?;
         total.implementer_runs += values.0;
         total.reviewed += values.1;
         total.pass += values.2;
         total.reject += values.3;
-        let mut stmt = conn.prepare(
-            "SELECT run_id FROM runs WHERE role='implementer' AND account=?1 AND model=?2",
-        )?;
-        let ids = stmt.query_map([profile, model], |r| r.get::<_, String>(0))?;
-        for id in ids {
-            local_ids.insert(id?);
+        for id in reports::implementer_run_ids(&conn, profile, model)? {
+            local_ids.insert(id);
         }
     }
     // A remote line only knows its run's newest verdict.
@@ -1081,43 +1065,16 @@ fn thoth_breakdown(
             continue;
         }
         let conn = usage::read_only(&path)?;
-        // A repo not yet opened by a version with DT-1 is still v4: its
-        // `runs` has no token-kind columns, which then read as NULL.
-        let col = |name: &str| {
-            if crate::db::migrations::column_exists(&conn, "runs", name).unwrap_or(false) {
-                format!("r.{name}")
-            } else {
-                "NULL".to_string()
-            }
-        };
-        let mut stmt = conn.prepare(&format!(
-            "SELECT r.run_id, r.status, r.spec, r.input_tokens, r.output_tokens, t.spec,
-                    {}, {}, {}, {}
-             FROM runs r LEFT JOIN tasks t ON t.task_id=r.task_id
-             WHERE r.role='implementer' AND r.account=?1 AND r.model=?2",
-            col("cache_read_tokens"),
-            col("cache_write_tokens"),
-            col("reasoning_tokens"),
-            col("total_tokens"),
-        ))?;
-        let rows = stmt.query_map([profile, model], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                r.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                r.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                [
-                    r.get::<_, Option<i64>>(6)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(7)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(9)?.unwrap_or(0),
-                ],
-            ))
-        })?;
-        for row in rows {
-            let (run_id, status, run_spec, input, output, task_spec, kinds) = row?;
+        for row in reports::implementer_breakdown_runs(&conn, profile, model)? {
+            let reports::BreakdownRun {
+                run_id,
+                status,
+                run_spec,
+                input_tokens: input,
+                output_tokens: output,
+                task_spec,
+                kinds,
+            } = row;
             let (effort, task_type, difficulty) = parse_group_keys(&run_spec, &task_spec);
             let i = breakdown_group(&mut groups, &effort, &task_type, &difficulty);
             local_ids.insert(run_id.clone());
@@ -1133,9 +1090,7 @@ fn thoth_breakdown(
             g.cache_write_tokens += kinds[1];
             g.reasoning_tokens += kinds[2];
             g.total_tokens += kinds[3];
-            let latest: Option<String> = conn.query_row(
-                "SELECT verdict FROM reviews WHERE target_run_id=?1 ORDER BY created_at DESC, review_id DESC LIMIT 1", [&run_id],
-                |r| r.get(0)).ok();
+            let latest: Option<String> = reports::latest_verdict(&conn, &run_id);
             if latest.is_some() {
                 g.reviewed += 1;
             }
@@ -1144,9 +1099,7 @@ fn thoth_breakdown(
                 Some("REJECT") => g.reject += 1,
                 _ => {}
             }
-            let detail: Option<String> = conn.query_row(
-                "SELECT detail FROM events WHERE run_id=?1 AND type=?2 ORDER BY seq DESC LIMIT 1",
-                [&run_id, crate::model::event_type::RUN_QUOTA], |r| r.get::<_, Option<String>>(0)).ok().flatten();
+            let detail: Option<String> = reports::latest_run_quota_detail(&conn, &run_id);
             let Some(detail) =
                 detail.and_then(|d| serde_json::from_str::<Value>(&d).ok())
             else {
@@ -1259,13 +1212,8 @@ pub(crate) fn all_breakdowns(
             continue;
         }
         let conn = usage::read_only(&path)?;
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT account, model FROM runs
-             WHERE role='implementer' AND account IS NOT NULL AND model IS NOT NULL AND model <> ''",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            pairs.insert(row?);
+        for row in reports::implementer_pairs(&conn)? {
+            pairs.insert(row);
         }
     }
     for line in &shared.lines {

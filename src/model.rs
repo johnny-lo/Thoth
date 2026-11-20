@@ -241,6 +241,9 @@ pub mod event_type {
     pub const SPEC_UPDATED: &str = "spec_updated";
     /// Written by `commands::verify::run` (Task 9).
     pub const VERIFY_RAN: &str = "verify_ran";
+    /// VSCOPE-1: `thoth suite run` ran checks on a main-line commit; no task,
+    /// no run.
+    pub const SUITE_RAN: &str = "suite_ran";
     /// Written by `commands::task::close`.
     pub const TASK_CLOSED: &str = "task_closed";
     /// Written by `commands::task::accept`: a document task's delivery was

@@ -1040,6 +1040,40 @@ pub fn list_reviews_for_task(conn: &Connection, task_id: &str) -> Result<Vec<Rev
     Ok(rows)
 }
 
+/// MEAS-0: one stored review's verdict, with the provider its implementer run
+/// (`target_run_id`) and its reviewer run stored when each run was made.
+/// `None` when the review has no such run, the run row is missing, or the
+/// provider is NULL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewProviders {
+    pub review_id: String,
+    pub verdict: String,
+    pub implementer_provider: Option<String>,
+    pub reviewer_provider: Option<String>,
+}
+
+/// MEAS-0: every review in this repo's state.db with its verdict and the two
+/// runs' providers, for `thoth retro`'s same-/cross-provider split.
+pub fn list_review_providers(conn: &Connection) -> Result<Vec<ReviewProviders>> {
+    let mut stmt = conn.prepare(
+        "SELECT v.review_id, COALESCE(v.verdict, ''), i.provider, r.provider
+         FROM reviews v
+         LEFT JOIN runs i ON i.run_id = v.target_run_id
+         LEFT JOIN runs r ON r.run_id = v.reviewer_run_id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ReviewProviders {
+                review_id: r.get(0)?,
+                verdict: r.get(1)?,
+                implementer_provider: r.get(2)?,
+                reviewer_provider: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

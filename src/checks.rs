@@ -77,7 +77,17 @@ pub struct Check {
     /// How the `exe=` line pins the program: `hash` (its resolved path and
     /// its bytes, the default) or `path` (its resolved absolute path only).
     pub exe_pin: String,
+    /// VSCOPE-1: `Some("cargo-test-targets")` for a `cargo test` check that
+    /// `verify` narrows to the task's test targets; `None` for every other
+    /// check. Part of the approval: a scoped check's fingerprint has one more
+    /// `scope=` line, an unscoped one's is unchanged.
+    pub scope: Option<String>,
 }
+
+/// VSCOPE-1: the values `checks add --scope` accepts.
+pub const SCOPES: [&str; 1] = [SCOPE_CARGO_TEST_TARGETS];
+/// VSCOPE-1: verify appends `--test NAME` per target (or `--tests`).
+pub const SCOPE_CARGO_TEST_TARGETS: &str = "cargo-test-targets";
 
 pub struct Fingerprint {
     pub hex: String,
@@ -572,7 +582,25 @@ fn file_sha(p: &Path) -> Option<String> {
 /// The fixed-order text that is hashed. Built from the `detail` document so
 /// that the lines of an old approval can be rebuilt from what was stored.
 fn lines_from(shell: &str, cmd: &str, cwd: &str, detail: &Value) -> Vec<String> {
+    lines_from_scoped(shell, cmd, cwd, None, detail)
+}
+
+/// The lines of `check` (its shell, cmd, cwd and scope) with `detail`.
+fn check_lines(check: &Check, detail: &Value) -> Vec<String> {
+    match check.scope.as_deref() {
+        None => lines_from(&check.shell, &check.cmd, &check.cwd, detail),
+        scope => lines_from_scoped(&check.shell, &check.cmd, &check.cwd, scope, detail),
+    }
+}
+
+/// `lines_from` plus VSCOPE-1's `scope=` line, right after `cwd=`, for a
+/// scoped check. Without a scope the lines are exactly `lines_from`'s, so
+/// every existing approval keeps matching.
+fn lines_from_scoped(shell: &str, cmd: &str, cwd: &str, scope: Option<&str>, detail: &Value) -> Vec<String> {
     let mut lines = vec![format!("shell={shell}"), format!("cmd={cmd}"), format!("cwd={cwd}")];
+    if let Some(scope) = scope {
+        lines.push(format!("scope={scope}"));
+    }
     let exe_path = detail["exe"]["path"].as_str().unwrap_or("");
     // A check added with `--exe-pin path` pins the path alone; the marker is
     // part of the line, so switching it needs a new approval.
@@ -637,7 +665,7 @@ pub fn fingerprint(check: &Check, tree_root: &Path) -> Result<Fingerprint> {
         .map(|p| json!({"path": p, "sha256": file_sha(&tree_root.join(p))}))
         .collect();
     let detail = json!({"exe": exe, "inputs": inputs});
-    let lines = lines_from(&check.shell, &check.cmd, &check.cwd, &detail);
+    let lines = check_lines(check, &detail);
     let mut text = lines.join("\n");
     text.push('\n');
     Ok(Fingerprint {
@@ -661,8 +689,8 @@ fn approval_detail(approval: &Approval) -> Value {
 /// approval's lines and the current ones, e.g. `input=Cargo.toml`.
 pub fn changed_lines(check: &Check, approval: &Approval, now: &Fingerprint) -> Vec<String> {
     let detail = approval_detail(approval);
-    let old = lines_from(&check.shell, &check.cmd, &check.cwd, &detail);
-    let key = |l: &String| l.split('|').next().unwrap_or("").to_string();
+    let old = check_lines(check, &detail);
+    let key =|l: &String| l.split('|').next().unwrap_or("").to_string();
     let mut out: Vec<String> = old
         .iter()
         .filter(|l| !now.lines.contains(l))
@@ -725,7 +753,7 @@ pub fn fingerprint_mismatch(
 fn at_base_hex(check: &Check, approval: &Approval, now: &Fingerprint) -> String {
     let approved = approval_detail(approval);
     let detail = json!({"exe": now.detail["exe"].clone(), "inputs": approved["inputs"].clone()});
-    hash_lines(&lines_from(&check.shell, &check.cmd, &check.cwd, &detail))
+    hash_lines(&check_lines(check, &detail))
 }
 
 /// The fingerprint hex of a set of lines: joined with `\n`, one more `\n`.
@@ -952,7 +980,7 @@ fn package_info_match(
 ) -> Option<Vec<PackageLine>> {
     approval.detail.as_ref()?;
     let detail = approval_detail(approval);
-    let old = lines_from(&check.shell, &check.cmd, &check.cwd, &detail);
+    let old = check_lines(check, &detail);
     // The approval's own hash must still fit the check as defined now.
     if hash_lines(&old) != approval.fingerprint {
         return None;
@@ -1132,6 +1160,7 @@ mod tests {
             approved_detail: None,
             approved_commit: None,
             exe_pin: "hash".into(),
+            scope: None,
         }
     }
 

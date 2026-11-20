@@ -29,6 +29,7 @@ use crate::model::event_type;
 use crate::output;
 use crate::process;
 use crate::result_json::VerificationRequest;
+use crate::test_scope::{self, ScopePlan};
 use crate::worktree;
 use anyhow::{bail, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -138,9 +139,9 @@ pub fn requests_for_run(
 /// The temporary checkout `--at-base` runs in. Dropping it removes the
 /// worktree, so a failed or timed-out request (or an early `?`) cannot leave
 /// one behind.
-struct BaseWorktree {
-    root: PathBuf,
-    path: PathBuf,
+pub(crate) struct BaseWorktree {
+    pub(crate) root: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 impl Drop for BaseWorktree {
@@ -179,25 +180,25 @@ fn spec_check_ids(task_spec: &str) -> Vec<String> {
 
 /// What `refusal_for` found out besides the refusal itself.
 #[derive(Default)]
-struct Compared {
+pub(crate) struct Compared {
     /// AC10 (1): `false` unless the fingerprint was compared and matched -
     /// never null, including for a check refused before any comparison.
-    fingerprint_ok: bool,
+    pub(crate) fingerprint_ok: bool,
     /// Whether the `input=` lines took part in a comparison that happened.
     inputs_checked: bool,
     /// AC10 (2), AC14 (b): the absolute path of the file the fingerprint
     /// resolved - the one that is executed, whatever the shell.
-    program: Option<PathBuf>,
+    pub(crate) program: Option<PathBuf>,
     /// The approval the fingerprint matched, and how (`exact` or
     /// `package_info_only`).
-    approval: Option<(checks::Approval, &'static str)>,
+    pub(crate) approval: Option<(checks::Approval, &'static str)>,
     /// The lines package-info auto-accept let through.
     package_lines: Vec<checks::PackageLine>,
 }
 
 impl Compared {
     /// `results[].approval` and the evidence detail's `approval`.
-    fn approval_json(&self) -> serde_json::Value {
+    pub(crate) fn approval_json(&self) -> serde_json::Value {
         match &self.approval {
             None => serde_json::Value::Null,
             Some((a, kind)) => serde_json::json!({
@@ -208,7 +209,7 @@ impl Compared {
     }
 
     /// `results[].package_info_lines` and the evidence detail's.
-    fn package_lines_json(&self) -> serde_json::Value {
+    pub(crate) fn package_lines_json(&self) -> serde_json::Value {
         self.package_lines
             .iter()
             .map(|l| serde_json::json!({"path": l.path, "line": l.line, "approved": l.approved, "now": l.now}))
@@ -218,14 +219,14 @@ impl Compared {
 
 /// What `refusal_for` reads besides the check: the run's state.db, and the
 /// blob store that holds the approved copies of package files.
-struct Store<'a> {
-    conn: &'a Connection,
-    blobs_dir: &'a Path,
+pub(crate) struct Store<'a> {
+    pub(crate) conn: &'a Connection,
+    pub(crate) blobs_dir: &'a Path,
 }
 
 /// Why an existing, approved check must not run here, or `None`.
 #[allow(clippy::too_many_arguments)]
-fn refusal_for(
+pub(crate) fn refusal_for(
     store: &Store<'_>,
     c: &Check,
     shell: Option<process::Shell>,
@@ -233,7 +234,8 @@ fn refusal_for(
     dir: &Path,
     tree_exists: bool,
     at_base: bool,
-    run_id: &str,
+    // `None` for `suite run`, which has no run to approve from.
+    run_id: Option<&str>,
     out: &mut Compared,
 ) -> Result<Option<String>> {
     let id = &c.check_id;
@@ -302,9 +304,10 @@ fn refusal_for(
             }
             checks::ApprovalMatch::NoMatch { changed, note } => {
                 let note = note.map(|n| format!("; {n}")).unwrap_or_default();
+                let from_run = run_id.map(|r| format!("--run {r} ")).unwrap_or_default();
                 return Ok(Some(format!(
                     "fingerprint mismatch for check {id}: {}{note}; if this change is intended, \
-                     approve it with: thoth checks approve --run {run_id} --reason \"WHY\"",
+                     approve it with: thoth checks approve {from_run}--reason \"WHY\"",
                     changed.join(", ")
                 )));
             }
@@ -475,6 +478,19 @@ pub fn run(
         run_worktree.clone()
     };
 
+    // VSCOPE-1: the test targets a scoped check runs, from the task's own
+    // spec and the diff from the task's base to the commit under
+    // verification - never from anything the worker wrote. Worked out only
+    // when a check to run has a scope.
+    let scope_plan: Option<ScopePlan> = catalogue.iter().flatten().any(|c| c.scope.is_some()).then(|| {
+        let candidate = if run_worktree.is_dir() {
+            worktree::rev_parse_head(&run_worktree).ok()
+        } else {
+            run.candidate_commit.clone()
+        };
+        scope_plan_for(&root, &task.spec, &task.base_commit, candidate.as_deref(), at_commit.as_deref())
+    });
+
     // RFIX-1: the commit the checks ran on, and whether they left it alone:
     // HEAD before and after, and no project file changed (`.agent/` and
     // `.agents/` are Thoth's; ignored files such as build output do not
@@ -514,6 +530,12 @@ pub fn run(
         let shell = shell_name.as_deref().and_then(process::Shell::parse);
         let exe_pin = row.as_ref().map(|c| c.exe_pin.clone());
         let dir = worktree.join(&check_cwd);
+        // VSCOPE-1: a scoped check's row carries its plan, and runs the
+        // approved command with the plan's arguments appended. The approval
+        // and the fingerprint only ever see the approved command.
+        let plan = row.as_ref().filter(|c| c.scope.is_some()).and(scope_plan.as_ref());
+        let scope_json: Option<serde_json::Value> = plan.map(ScopePlan::to_json);
+        let run_cmd = with_appended(&cmd, &plan.map(ScopePlan::appended_args).unwrap_or_default());
 
         let mut compared = Compared::default();
         let refusal: Option<String> = match row {
@@ -526,7 +548,7 @@ pub fn run(
                 &dir,
                 tree_exists,
                 at_base,
-                &run.run_id,
+                Some(&run.run_id),
                 &mut compared,
             )?,
         };
@@ -550,6 +572,9 @@ pub fn run(
             });
             if let Some(reason) = &refusal {
                 r["reason"] = serde_json::json!(reason);
+            }
+            if let Some(scope) = &scope_json {
+                r["scope"] = scope.clone();
             }
             results.push(r);
             refused.push(refusal.is_some());
@@ -585,8 +610,11 @@ pub fn run(
         if shell == Some(process::Shell::PowerShell) {
             extra.insert(
                 "script".into(),
-                serde_json::json!(process::powershell_script(process::shell_args_text(&cmd))),
+                serde_json::json!(process::powershell_script(process::shell_args_text(&run_cmd))),
             );
+        }
+        if let Some(scope) = &scope_json {
+            extra.insert("scope".into(), scope.clone());
         }
 
         // Every refusal is recorded as data and none aborts the batch, so
@@ -610,13 +638,13 @@ pub fn run(
                 at_commit.as_deref(),
                 &extra,
             )?;
-            results.push(serde_json::json!({
+            results.push(with_scope(serde_json::json!({
                 "index": i + 1, "check_id": id, "shell": shell_name, "cmd": cmd,
                 "cwd": dir.display().to_string(),
                 "exit_code": None::<i64>, "evidence": code, "error": reason,
                 "exe_pin": exe_pin, "approval": approval,
                 "package_info_lines": package_info_lines,
-            }));
+            }), &scope_json));
             refused.push(true);
             continue;
         }
@@ -627,13 +655,13 @@ pub fn run(
         // tears down the rest of the batch. A check that got this far always
         // has its fingerprint's program (`refusal_for`).
         let program = compared.program.clone().unwrap_or_default();
-        let ran = process::run_shell(shell, &program, &cmd, &dir, timeout);
+        let ran = process::run_shell(shell, &program, &run_cmd, &dir, timeout);
         let out = match ran {
             Ok(out) => out,
             Err(e) => {
                 failures += 1;
                 let reason = format!("failed to run: {e:#}");
-                let argv = process::shell_argv(shell, &program, &cmd);
+                let argv = process::shell_argv(shell, &program, &run_cmd);
                 let code = evidence::record_control_plane_command(
                     &conn,
                     &ctx,
@@ -650,13 +678,13 @@ pub fn run(
                     at_commit.as_deref(),
                     &extra,
                 )?;
-                results.push(serde_json::json!({
+                results.push(with_scope(serde_json::json!({
                     "index": i + 1, "check_id": id, "shell": shell_name, "cmd": cmd,
                     "cwd": dir.display().to_string(),
                     "exit_code": None::<i64>, "evidence": code, "error": reason,
                     "exe_pin": exe_pin, "approval": approval,
                     "package_info_lines": package_info_lines,
-                }));
+                }), &scope_json));
                 continue;
             }
         };
@@ -709,7 +737,7 @@ pub fn run(
             at_commit.as_deref(),
             &extra,
         )?;
-        results.push(serde_json::json!({
+        results.push(with_scope(serde_json::json!({
             "index": i + 1,
             "check_id": id,
             "shell": shell_name,
@@ -729,7 +757,7 @@ pub fn run(
             "exe_pin": exe_pin,
             "approval": approval,
             "package_info_lines": package_info_lines,
-        }));
+        }), &scope_json));
     }
 
     let (head_after, clean_after) = if dry_run { (None, false) } else { tree_state(&worktree) };
@@ -842,6 +870,9 @@ pub fn run(
                     package_lines_text(&r["package_info_lines"])
                 ));
             }
+            if let Some(scope) = r.get("scope") {
+                lines.push(format!("        scope: {}", scope_text(scope)));
+            }
         }
         push_worker_declared(&mut lines, &worker_declared);
         if failures > 0 {
@@ -877,6 +908,91 @@ pub fn run(
     // Non-zero when a check failed (or was refused/timed out), so a script
     // notices. The task's status is deliberately untouched (brief §10).
     Ok(if failures > 0 { 1 } else { 0 })
+}
+
+/// VSCOPE-1: the plan for the task's scoped checks. `candidate` is the
+/// commit under verification; a diff that cannot be read (or an unknown
+/// candidate) falls back to every test target. `at_base`: the base commit a
+/// `--at-base` run checks out; targets whose file is not there are dropped.
+fn scope_plan_for(
+    root: &Path,
+    task_spec: &str,
+    base: &str,
+    candidate: Option<&str>,
+    at_base: Option<&str>,
+) -> ScopePlan {
+    let plan = match candidate {
+        None => ScopePlan::all_tests_because_of("(diff unavailable: the commit under verification is unknown)"),
+        Some(c) => match worktree::diff_name_status(root, base, c) {
+            Ok(name_status) => test_scope::scope_targets(task_spec, &name_status),
+            Err(e) => ScopePlan::all_tests_because_of(&format!("(diff unavailable: {e:#})")),
+        },
+    };
+    match at_base {
+        None => plan,
+        Some(commit) => plan.without_missing(|t| {
+            let candidates = match &t.path {
+                Some(p) => vec![p.clone()],
+                None => vec![format!("tests/{}.rs", t.name), format!("tests/{}/main.rs", t.name)],
+            };
+            candidates.iter().any(|p| worktree::blob_at(root, commit, p).is_ok())
+        }),
+    }
+}
+
+/// The approved command line with `args` appended (each a plain word; see
+/// `test_scope`), or the command itself when there are none.
+pub(crate) fn with_appended(cmd: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{cmd} {}", args.join(" "))
+    }
+}
+
+/// `row` with the `scope` key when the check has one.
+fn with_scope(mut row: serde_json::Value, scope: &Option<serde_json::Value>) -> serde_json::Value {
+    if let Some(s) = scope {
+        row["scope"] = s.clone();
+    }
+    row
+}
+
+/// One line about a `scope` object: `targets a (spec), b (diff_added)`,
+/// `targets (none)` or `all tests (PATHS)`, plus what was dropped.
+pub(crate) fn scope_text(scope: &serde_json::Value) -> String {
+    let list = |key: &str| -> Vec<String> {
+        scope[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                let sources: Vec<&str> =
+                    t["sources"].as_array().into_iter().flatten().filter_map(|s| s.as_str()).collect();
+                match t["reason"].as_str() {
+                    Some(reason) => format!("{} ({reason})", t["name"].as_str().unwrap_or("")),
+                    None => format!("{} ({})", t["name"].as_str().unwrap_or(""), sources.join(", ")),
+                }
+            })
+            .collect()
+    };
+    let mut text = if scope["mode"] == test_scope::MODE_ALL_TESTS {
+        let paths: Vec<&str> =
+            scope["all_tests_because"].as_array().into_iter().flatten().filter_map(|s| s.as_str()).collect();
+        format!("all tests ({})", paths.join(", "))
+    } else {
+        let targets = list("targets");
+        if targets.is_empty() {
+            "targets (none)".to_string()
+        } else {
+            format!("targets {}", targets.join(", "))
+        }
+    };
+    let dropped = list("dropped");
+    if !dropped.is_empty() {
+        text.push_str(&format!("; dropped {}", dropped.join(", ")));
+    }
+    text
 }
 
 /// CK-1: the `previous_verify` object (null when there is no earlier verify;

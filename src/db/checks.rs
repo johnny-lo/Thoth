@@ -23,6 +23,17 @@ fn row_to_check(r: &rusqlite::Row<'_>) -> rusqlite::Result<Check> {
         approved_detail: r.get(8)?,
         approved_commit: r.get(9)?,
         exe_pin: r.get(10)?,
+        scope: r.get(11)?,
+    })
+}
+
+/// The `scope` column, or a literal NULL on a table older than v7 that has
+/// not been migrated yet (`thoth doctor` reads state.db without migrating).
+fn scope_col(conn: &Connection) -> Result<&'static str> {
+    Ok(if crate::db::migrations::column_exists(conn, "checks", "scope")? {
+        "scope"
+    } else {
+        "NULL"
     })
 }
 
@@ -39,13 +50,15 @@ fn exe_pin_col(conn: &Connection) -> Result<&'static str> {
 
 pub fn get_check(conn: &Connection, id: &str) -> Result<Option<Check>> {
     let pin = exe_pin_col(conn)?;
-    let sql = format!("SELECT {COLS}, {pin} FROM checks WHERE check_id = ?1");
+    let scope = scope_col(conn)?;
+    let sql = format!("SELECT {COLS}, {pin}, {scope} FROM checks WHERE check_id = ?1");
     Ok(conn.query_row(&sql, [id], row_to_check).optional()?)
 }
 
 pub fn list_checks(conn: &Connection) -> Result<Vec<Check>> {
     let pin = exe_pin_col(conn)?;
-    let sql = format!("SELECT {COLS}, {pin} FROM checks ORDER BY check_id");
+    let scope = scope_col(conn)?;
+    let sql = format!("SELECT {COLS}, {pin}, {scope} FROM checks ORDER BY check_id");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map([], row_to_check)?
@@ -141,8 +154,8 @@ fn clear_approvals(conn: &Connection, check_id: &str) -> Result<()> {
 pub fn put_check(conn: &Connection, c: &Check) -> Result<()> {
     clear_approvals(conn, &c.check_id)?;
     conn.execute(
-        "INSERT OR REPLACE INTO checks (check_id, shell, cmd, cwd, inputs, created_at, exe_pin) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO checks (check_id, shell, cmd, cwd, inputs, created_at, exe_pin, scope) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             c.check_id,
             c.shell,
@@ -150,7 +163,8 @@ pub fn put_check(conn: &Connection, c: &Check) -> Result<()> {
             c.cwd,
             serde_json::to_string(&c.inputs)?,
             c.created_at,
-            c.exe_pin
+            c.exe_pin,
+            c.scope
         ],
     )?;
     Ok(())

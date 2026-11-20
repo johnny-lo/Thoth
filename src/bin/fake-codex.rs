@@ -121,6 +121,10 @@
 //! CLI does, outside the sandbox. A schema the OpenAI API would refuse for
 //! structured output (an object without `additionalProperties: false` or
 //! with a property missing from `required`) fails the turn with a 400.
+//! `FAKE_REVIEW_GATE` holds `review_pass`, `review_reject`, `review_bad` and
+//! `review_uncited` before the final message, as fake-claude's review
+//! scenarios do: the run stays `running` and nothing is recorded until the
+//! test creates the file.
 
 // Source-check scenarios: `source_check` checks file:// pages from the prompt;
 // `source_check_bad` returns {not json. Both require --output-schema and -o.
@@ -769,6 +773,10 @@ fn review(scenario: &str, args: &[String], prompt: &str, thread_id: &str) -> ! {
     } else {
         doc.to_string()
     };
+    // A test stages "the task moved while the review was in flight" with
+    // this gate; without it the review can be recorded (and a PASS task's
+    // worktree swept) before the test gets to move anything.
+    source_check::wait_gate();
     emit(&agent_message(8, &last));
     // The codex CLI itself writes the final message to -o, outside the sandbox.
     if let Err(e) = std::fs::write(&out_path, &last) {

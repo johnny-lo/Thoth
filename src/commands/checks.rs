@@ -75,6 +75,8 @@ pub struct AddArgs<'a> {
     pub inputs: &'a [String],
     /// `hash` (the default) or `path`.
     pub exe_pin: &'a str,
+    /// VSCOPE-1: `Some("cargo-test-targets")`, or `None` for an unscoped check.
+    pub scope: Option<&'a str>,
     pub json: bool,
 }
 
@@ -91,16 +93,21 @@ pub fn add(paths: &Paths, cwd: &Path, args: AddArgs<'_>) -> Result<i32> {
         "inputs": check.inputs,
         "status": "pending",
         "exe_pin": check.exe_pin,
+        "scope": check.scope,
         "hints": hints,
     });
     let mut human = format!(
-        "{}  pending  [{}] {}  (cwd {}, {} input file(s){})\nnot approved yet; approve it with: thoth checks approve --reason \"WHY\"",
+        "{}  pending  [{}] {}  (cwd {}, {} input file(s){}{})\nnot approved yet; approve it with: thoth checks approve --reason \"WHY\"",
         check.check_id,
         check.shell,
         check.cmd,
         check.cwd,
         check.inputs.len(),
-        if check.exe_pin == "path" { ", program pinned by path only" } else { "" }
+        if check.exe_pin == "path" { ", program pinned by path only" } else { "" },
+        match &check.scope {
+            Some(s) => format!(", scope {s}"),
+            None => String::new(),
+        }
     );
     for h in &hints {
         human.push_str(&format!("\nhint: {h}"));
@@ -152,6 +159,11 @@ pub(crate) fn add_check(paths: &Paths, cwd: &Path, args: &AddArgs<'_>) -> Result
     if !matches!(args.exe_pin, "hash" | "path") {
         bail!("--exe-pin must be hash or path, got '{}'", args.exe_pin);
     }
+    if let Some(scope) = args.scope {
+        if !checks::SCOPES.contains(&scope) {
+            bail!("--scope must be {}, got '{scope}'", checks::SCOPES.join(" or "));
+        }
+    }
     if args.shell == "argv" && args.cmd.trim().is_empty() {
         bail!("--cmd must not be blank");
     }
@@ -198,6 +210,7 @@ pub(crate) fn add_check(paths: &Paths, cwd: &Path, args: &AddArgs<'_>) -> Result
         approved_detail: None,
         approved_commit: None,
         exe_pin: args.exe_pin.to_string(),
+        scope: args.scope.map(str::to_string),
     };
     if check.exe_pin == "path" {
         let fp = checks::fingerprint(&check, &root)?;
@@ -221,6 +234,7 @@ pub(crate) fn add_check(paths: &Paths, cwd: &Path, args: &AddArgs<'_>) -> Result
                 "inputs": check.inputs,
                 "replaced": replaced,
                 "exe_pin": check.exe_pin,
+                "scope": check.scope,
             }),
         },
     )?;
@@ -646,6 +660,9 @@ pub fn list(paths: &Paths, cwd: &Path, json: bool) -> Result<i32> {
         if c.exe_pin == "path" {
             line.push_str("  exe pinned by path only");
         }
+        if let Some(scope) = &c.scope {
+            line.push_str(&format!("  scope {scope}"));
+        }
         if other_approvals > 0 {
             line.push_str(&format!("  (+{other_approvals} earlier approvals)"));
         }
@@ -675,6 +692,7 @@ pub fn list(paths: &Paths, cwd: &Path, json: bool) -> Result<i32> {
             "approved_fingerprint": c.approved_fingerprint,
             "changed": changed,
             "exe_pin": c.exe_pin,
+            "scope": c.scope,
             "other_approvals": other_approvals,
             "match": matched.as_ref().map(|(_, kind)| *kind),
             "matched_approval": matched.as_ref().map(|(a, _)| serde_json::json!({

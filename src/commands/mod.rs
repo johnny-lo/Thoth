@@ -49,6 +49,7 @@ pub mod spec_lint;
 pub mod spec_review;
 pub mod status;
 pub mod submit;
+pub mod suite;
 pub mod tables;
 pub mod task;
 pub mod task_history;

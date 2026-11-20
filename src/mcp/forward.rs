@@ -409,7 +409,7 @@ fn handshake(
     init: Option<&(Value, Value)>,
     meta: Option<Value>,
 ) -> Result<(Vec<Value>, Option<String>), String> {
-    let deadline = Instant::now() + HANDSHAKE;
+    let deadline = Instant::now() + handshake_limit();
     let mut version = None;
     if let Some((params, expected)) = init {
         let v = live.ask("thoth-handshake-initialize", "initialize", params.clone(), deadline)?;
@@ -440,6 +440,30 @@ fn handshake(
             .map(str::to_owned);
     }
     Ok((tools.clone(), version))
+}
+
+/// The time the whole handshake may take: `HANDSHAKE`, unless a debug build
+/// was given the test seam below.
+fn handshake_limit() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = test_handshake() {
+        return limit;
+    }
+    HANDSHAKE
+}
+
+/// Test seam, for tests/mcp_replaced.rs only; debug builds only, so a
+/// release build always waits `HANDSHAKE`. `THOTH_TEST_MCP_HANDSHAKE_MS`, when
+/// it is a positive whole number, replaces `HANDSHAKE` as the limit on the
+/// whole handshake, so the test of a new executable that never answers does
+/// not wait 30 seconds; unset, not a number or 0 keeps `HANDSHAKE`.
+#[cfg(debug_assertions)]
+fn test_handshake() -> Option<Duration> {
+    std::env::var("THOTH_TEST_MCP_HANDSHAKE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
 }
 
 impl Live {

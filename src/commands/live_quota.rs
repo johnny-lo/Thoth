@@ -4,7 +4,7 @@
 //! files or talks to provider endpoints. The agy signed-out marker is based
 //! on `agy models`; real `/usage` signed-out output has not yet been verified.
 
-use crate::{commands::usage::Window, config::Paths, db::global::Profile};
+use crate::{commands::usage::Window, config::Paths, db::{global::Profile, reports}};
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::Value;
@@ -260,13 +260,10 @@ fn collected(receiver: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Option<Ve
 }
 
 pub(crate) fn read_agy_windows(conn: &Connection, profile_id: &str) -> Result<Vec<Window>> {
-    let mut statement = conn.prepare("SELECT ts, detail FROM quota_events WHERE profile_id=?1 AND kind='live_quota' ORDER BY seq DESC")?;
-    let rows = statement.query_map([profile_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (observed_at, text) = row?;
-        let Ok(detail) = serde_json::from_str::<Value>(&text) else { continue };
-        if detail.get("source").and_then(Value::as_str) != Some("agy_usage") { continue }
-        let Some(raw_windows) = detail.get("windows").and_then(Value::as_array) else { continue };
+    let newest = reports::newest_live_quota(conn, profile_id, |observed_at, text| {
+        let Ok(detail) = serde_json::from_str::<Value>(&text) else { return None };
+        if detail.get("source").and_then(Value::as_str) != Some("agy_usage") { return None }
+        let raw_windows = detail.get("windows").and_then(Value::as_array)?;
         let mut windows = Vec::new(); let mut valid = true;
         for raw in raw_windows {
             let (Some(name), Some(used), Some(group), Some(description)) = (raw.get("name").and_then(Value::as_str),
@@ -280,9 +277,9 @@ pub(crate) fn read_agy_windows(conn: &Connection, profile_id: &str) -> Result<Ve
             windows.push(Window { name:name.into(), used, resets_at, observed_at:observed_at.clone(), source:"agy_usage",
                 group:Some(group.into()), group_description:Some(description.into()) });
         }
-        if valid && !windows.is_empty() { return Ok(windows) }
-    }
-    Ok(Vec::new())
+        (valid && !windows.is_empty()).then_some(windows)
+    })?;
+    Ok(newest.unwrap_or_default())
 }
 
 /// codex's answer to `account/rateLimits/read`, parsed, or a reading stored
@@ -484,18 +481,15 @@ fn end_child(child: &mut Child) {
 /// The newest well-formed codex live reading of a profile; rows that are not
 /// JSON or have the wrong shape are skipped.
 pub(crate) fn read_codex_live(conn: &Connection, profile_id: &str) -> Result<Option<CodexLive>> {
-    let mut statement = conn.prepare("SELECT ts, detail FROM quota_events WHERE profile_id=?1 AND kind='live_quota' ORDER BY seq DESC")?;
-    let rows = statement.query_map([profile_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (observed_at, text) = row?;
-        let Ok(detail) = serde_json::from_str::<Value>(&text) else { continue };
-        if detail.get("source").and_then(Value::as_str) != Some(CODEX_SOURCE) { continue }
+    reports::newest_live_quota(conn, profile_id, |observed_at, text| {
+        let Ok(detail) = serde_json::from_str::<Value>(&text) else { return None };
+        if detail.get("source").and_then(Value::as_str) != Some(CODEX_SOURCE) { return None }
         let ordinary_usage_allowed = match detail.get("ordinary_usage_allowed") {
             None | Some(Value::Null) => None,
             Some(Value::Bool(value)) => Some(*value),
-            _ => continue,
+            _ => return None,
         };
-        let Some(raw_windows) = detail.get("windows").and_then(Value::as_array) else { continue };
+        let raw_windows = detail.get("windows").and_then(Value::as_array)?;
         let mut windows = Vec::new(); let mut valid = true;
         for raw in raw_windows {
             let (Some(name), Some(used)) = (raw.get("name").and_then(Value::as_str), raw.get("used_percent").and_then(Value::as_f64))
@@ -509,10 +503,10 @@ pub(crate) fn read_codex_live(conn: &Connection, profile_id: &str) -> Result<Opt
                 group:None, group_description:None });
         }
         if valid && (!windows.is_empty() || ordinary_usage_allowed == Some(false)) {
-            return Ok(Some(CodexLive { windows, ordinary_usage_allowed, observed_at }))
+            return Some(CodexLive { windows, ordinary_usage_allowed, observed_at })
         }
-    }
-    Ok(None)
+        None
+    })
 }
 
 const CLAUDE_SOURCE: &str = "claude_usage";
@@ -680,13 +674,10 @@ fn refresh_claude(paths: &Paths, conn: &Connection, profile: &Profile, repos: &[
 /// The newest well-formed Claude live reading of a profile with its `ts`;
 /// a row with any window of the wrong shape is skipped as a whole.
 pub(crate) fn read_claude_live(conn: &Connection, profile_id: &str) -> Result<Option<(String, Vec<Window>)>> {
-    let mut statement = conn.prepare("SELECT ts, detail FROM quota_events WHERE profile_id=?1 AND kind='live_quota' ORDER BY seq DESC")?;
-    let rows = statement.query_map([profile_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (observed_at, text) = row?;
-        let Ok(detail) = serde_json::from_str::<Value>(&text) else { continue };
-        if !detail.is_object() || detail.get("source").and_then(Value::as_str) != Some(CLAUDE_SOURCE) { continue }
-        let Some(raw_windows) = detail.get("windows").and_then(Value::as_array) else { continue };
+    reports::newest_live_quota(conn, profile_id, |observed_at, text| {
+        let Ok(detail) = serde_json::from_str::<Value>(&text) else { return None };
+        if !detail.is_object() || detail.get("source").and_then(Value::as_str) != Some(CLAUDE_SOURCE) { return None }
+        let raw_windows = detail.get("windows").and_then(Value::as_array)?;
         let mut windows = Vec::new(); let mut valid = true;
         for raw in raw_windows {
             let (Some(name), Some(used)) = (raw.get("name").and_then(Value::as_str), raw.get("used_percent").and_then(Value::as_f64))
@@ -699,9 +690,8 @@ pub(crate) fn read_claude_live(conn: &Connection, profile_id: &str) -> Result<Op
             windows.push(Window { name:name.into(), used, resets_at, observed_at:observed_at.clone(), source:CLAUDE_SOURCE,
                 group:None, group_description:None });
         }
-        if valid && !windows.is_empty() { return Ok(Some((observed_at, windows))) }
-    }
-    Ok(None)
+        (valid && !windows.is_empty()).then_some((observed_at, windows))
+    })
 }
 
 pub(crate) fn matching_groups(windows: &[Window], model: &str) -> Vec<String> {

@@ -11,7 +11,9 @@ pub const GLOBAL_SCHEMA_VERSION: i64 = 5;
 /// `runs.harness_bin`, and the evidence/review indexes. v3 adds the approved
 /// `checks` catalogue. v4 adds `checks.exe_pin` (`hash` or `path`). v5 adds
 /// the four token columns of `runs` (DT-1). v6 adds `check_approvals`: every
-/// approval a check was given, not only the latest (LESS-1).
+/// approval a check was given, not only the latest (LESS-1). `checks.scope`
+/// (VSCOPE-1) is added to any state.db without a version of its own: see
+/// `ensure_check_scope`.
 pub const STATE_SCHEMA_VERSION: i64 = 6;
 
 /// v3: the per-repo catalogue of approved checks. Lives in state.db, not in the
@@ -302,10 +304,20 @@ pub fn migrate_state_v5_to_v6(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// VSCOPE-1: a check's scope. Existing rows stay NULL - unscoped - so their
+/// fingerprints, and so their approvals, are unchanged. Added on every open,
+/// up-to-date database included, rather than as a v7 step: it is one
+/// nullable column that every reader already does without (`thoth doctor`
+/// reads it as NULL when it is missing), and replaying it costs one pragma.
+pub fn ensure_check_scope(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "checks", "scope", "TEXT")?;
+    Ok(())
+}
+
 pub fn migrate_state(conn: &Connection) -> Result<()> {
     let from = current_version(conn)?;
     if from >= STATE_SCHEMA_VERSION {
-        return Ok(());
+        return ensure_check_scope(conn);
     }
     // A brand-new database needs the v1 tables first; a Phase 1 database
     // already has them and only needs the delta.
@@ -317,6 +329,7 @@ pub fn migrate_state(conn: &Connection) -> Result<()> {
     migrate_state_v3_to_v4(conn)?;
     migrate_state_v4_to_v5(conn)?;
     migrate_state_v5_to_v6(conn)?;
+    ensure_check_scope(conn)?;
     // `current_version` is MAX(version), so leaving the old `1` row in place
     // is harmless and keeps the row history.
     conn.execute(

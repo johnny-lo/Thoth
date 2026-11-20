@@ -133,7 +133,11 @@ fn packet_section(markdown: &str) -> String {
     let start = markdown.find("## Required checks not run\n").unwrap_or_else(|| panic!("no section in:\n{markdown}"));
     let end = markdown.find("## Diffs\n").unwrap_or_else(|| panic!("no ## Diffs in:\n{markdown}"));
     assert!(start < end, "the section is not before ## Diffs:\n{markdown}");
-    markdown[start..end].to_string()
+    // VSCOPE-1: `## Test scope` now sits between this section and `## Diffs`;
+    // the section ends at the next heading.
+    let body = start + "## Required checks not run\n".len();
+    let next = markdown[body..].find("\n## ").map(|i| body + i + 1).unwrap_or(end);
+    markdown[start..next.min(end)].to_string()
 }
 
 fn met(id: &str) -> Value {

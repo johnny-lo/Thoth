@@ -355,6 +355,7 @@ fn probe_check(id: &str, cmd: &str) -> Check {
         approved_detail: None,
         approved_commit: None,
         exe_pin: "hash".to_string(),
+        scope: None,
     }
 }
 
@@ -426,7 +427,7 @@ fn checks_actions(s: &mut Session, paths: &Paths, cwd: &Path, root: &Path, state
         if s.ask(&q, true) {
             acted = true;
             for (id, cmd) in &proposals {
-                let args = AddArgs { id, cmd, shell: "argv", cwd: ".", inputs: &[], exe_pin: "hash", json: false };
+                let args = AddArgs { id, cmd, shell: "argv", cwd: ".", inputs: &[], exe_pin: "hash", scope: None, json: false };
                 add_check(paths, cwd, &args)?;
             }
         }

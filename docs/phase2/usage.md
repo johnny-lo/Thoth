@@ -481,6 +481,18 @@ reviewer run's model and effort for whatever you leave out (see "Automatic
 dispatch"). Review with a profile of another provider when you can; choosing
 the model is yours.
 
+(MEAS-0) Every review start records whether the reviewer shares the
+implementer's provider: `review start --json` and the `review_started` event
+carry `implementer_provider` (the provider of the implementer run under
+review) and `same_provider_as_implementer`, in every mode (plain, `--edit`,
+`review confirm`) and for a research task's source check. Events written
+before MEAS-0 have the two keys only for a confirm. `review show --json` has
+`same_provider_as_implementer` for the newest record, worked out from the
+providers stored on its implementer and reviewer runs (so older reviews have
+it too); it is `null` without a review, for an external review (`review
+record`), or when a run or its provider is missing. `thoth retro` counts
+same- and cross-provider reviews separately (see "Repeated findings").
+
 The reviewer writes `.agent/review.json`:
 
 ```json
@@ -920,6 +932,15 @@ Sections, in order:
    (REASON)` each, `REASON` being `no_verify_row` or `did_not_complete`, or
    `(none)`; `--json` has the top-level `checks_not_run`
    (`[{"check_id","reason"}]`, `[]` when there is no claims run);
+   then (VSCOPE-1) `## Test scope`: what the scoped checks (see "The suite
+   before pushing") ran in the newest verify of that run that is not a
+   `--at-base` one. A paragraph says existing tests outside the scope run
+   only in the whole suite; then one line per scoped check, `CHECK_ID:
+   targets NAME (SOURCES), ...` (`targets (none)` without targets) or
+   `CHECK_ID: all tests (PATHS)`, followed by `; dropped NAME (REASON)` for
+   what was dropped, or `(none)`; `--json` has the top-level `test_scope`
+   (`[{"check_id","mode","targets","all_tests_because","dropped",
+   "appended_args"}]`, `[]` when there is no claims run or no scoped row);
 4. every `diff` row in full (all attempts, not cut at `evidence show`'s
    4000-byte default), each headed by its code, run id and `blob_verified`;
    (SMALL-9c) under each heading one line gives the start and end commits as
@@ -1008,6 +1029,18 @@ count, and each group line ends with `(blocking)` or `(advisory)`.
 Groups are listed with the most findings first, ties by name. With no finding
 it prints `retro: no review findings in the last N days`. `--json` keys are in
 `docs/adapter-usage.md`.
+(MEAS-0) The same reviews are also split by whether the reviewer and the
+implementer share a provider: `same_provider`, `cross_provider`, and `unknown`
+for an external review (`review record`) or a run whose provider is missing.
+The providers are the ones stored on the implementer run and the reviewer run
+when each was made, so reviews from before MEAS-0 are split too. Each part
+counts its reviews, their verdicts (`PASS`, `REJECT`, `UNVERIFIED`), its
+findings and its categories by the rules above (a confirmer's record is not a
+review of its own; the extra findings it added count in its part), so the
+three parts add up to the totals. `--json` has them under `provider_split`;
+when there is at least one review, the human output ends with a line `by
+provider (reviewer vs implementer):` and one line per part, for example
+`  cross_provider: 2 reviews (PASS 1 REJECT 1 UNVERIFIED 0), 3 findings`.
 
 ## Spec lint
 
@@ -2192,6 +2225,41 @@ This is what it means for a High Risk claim to need `control_plane`
 evidence: run `verify`, then have the worker (or `thoth submit`) cite the new
 code.
 
+**Scoped checks (VSCOPE-1).** A check added with `--scope cargo-test-targets`
+(see "Approved checks") runs the approved command with the task's test
+targets appended: `--test NAME` for each target, in name order; `--tests`
+when the task changed something every test may depend on; nothing when there
+is no target (the approved command alone, which still runs the unit tests it
+names). Thoth works the targets out from two inputs only: the task's current
+spec, and the diff from the task's base commit to the commit under
+verification. Nothing the worker wrote is read, so a worker cannot narrow the
+list.
+
+- A target is a first-level `tests/NAME.rs` file or a `tests/NAME/main.rs`
+  file. The spec names one by writing its path, or `cargo test --test NAME`,
+  in any field (source `spec`); the diff adds (`diff_added`) or modifies
+  (`diff_modified`) one. Each target lists every source it has.
+- A file the diff deletes is not run; one the spec names and the diff deletes
+  is listed under `dropped`. A file the spec names that does not exist and
+  was not deleted is still run, so cargo fails and verify shows it (the
+  conservative choice).
+- When the diff touches a shared test file (anything in a subfolder of
+  `tests/` other than its `main.rs`, such as `tests/common/mod.rs` or
+  fixtures), anything under `src/bin/` (the test doubles), `Cargo.toml`,
+  `Cargo.lock` or `build.rs`, the mode is `all_tests` and every test target
+  runs (`--tests`); the triggering paths are listed. This list is
+  conservative.
+- `verify --json` puts the plan on the check's row as `scope` (`mode`,
+  `targets`, `all_tests_because`, `dropped`, `appended_args`), also on
+  `--dry-run` and refused rows; the evidence row's `argv` shows what actually
+  ran. The approval and fingerprint only ever see the approved command.
+- `--at-base` uses the same list without the targets whose file is not in
+  the base commit (listed as `dropped`, reason `missing_at_base`;
+  provisional).
+- A spec without `checks` still runs every check, the full `test` included;
+  nothing is narrowed automatically (conservative). A scoped check counts only
+  for its own id in "Required checks", never for `test`.
+
 ## Approved checks
 
 A repo can have a catalogue of approved checks. The commander approves them
@@ -2224,6 +2292,17 @@ thoth checks remove py
   `--json`): cargo stops at the first failing test target, so a later target's
   new tests never run and a reviewer cannot see whether they pass. It is only a
   reminder; the check is stored, pending, either way.
+- (VSCOPE-1) `add --scope cargo-test-targets` marks a `cargo test` check as
+  scoped: `verify` runs it with the task's test targets appended (see "Scoped
+  checks" under "Selective verification" and "The suite before pushing").
+  It is the only value; anything else exits 1 and changes nothing. The scope
+  is part of the approval: a scoped check's fingerprint has one more line,
+  `scope=cargo-test-targets`, so adding or removing a scope needs a new
+  approval, while a check without one fingerprints exactly as before and its
+  approvals stay valid. `list` shows `scope` (string or `null` in `--json`).
+  The appended arguments never enter the fingerprint. Do not put a lone `--`
+  in a scoped command: the targets are appended at the end, so they would go
+  to the test binaries instead of cargo.
 - `add --exe-pin hash|path` chooses how the program is pinned. The default,
   `hash`, pins its resolved path and the sha256 of the file. `path` pins its
   resolved absolute path only (the `exe=` line is `exe=<path>|path-only`); it is
@@ -2360,6 +2439,67 @@ command) and the allowlist, so a worker that changes the allowlist has
 touched a protected file and the change needs the commander's approval; the
 counts can only be lowered, and a rise means a new violation to remove, not
 an entry to add.
+
+### The process test group
+
+In this repo the test suite runs as two groups (TEST-1). The process group is
+the thoth unit tests whose libtest name starts with `process::`, that is,
+every inline test under `src/process/`. Some of them start real processes and
+assert deadlines and time limits (for example
+`spawn_detached_returns_quickly_while_child_keeps_running` and
+`run_shell_kills_the_child_tree_on_timeout_and_reports_it` in
+`src/process/windows.rs`); run at the same time as the rest of the suite they
+turn falsely red. The group also holds tests that start no process (for
+example `process::resolve::tests`); the whole group runs one test at a time
+all the same. No time limit is raised for this, and no test is changed,
+ignored or skipped.
+
+This repo's check catalogue has two test checks:
+
+- `test` runs the main group: `cargo test --no-fail-fast -- --skip process::`
+  (every test target, in parallel, except tests whose name contains
+  `process::`).
+- `test-process` runs the process group:
+  `cargo test --no-fail-fast --bin thoth -- process:: --test-threads=1`.
+
+Together they run exactly the tests of `cargo test --no-fail-fast`, with no
+overlap: libtest's name filter and `--skip` both match "the name contains this
+text", and only the thoth unit tests have names containing `process::` (the
+three tests in `tests/process.rs` are top-level functions, so they stay in
+the main group). To check that, run in Git Bash at the repo root
+
+```
+cargo test --no-fail-fast --test '*' --bin 'fake-*' -- --list process::
+```
+
+which lists every test target other than the thoth unit tests, filtered by
+`process::`: no output line may end in `: test`.
+
+The commander does this once on each machine (a worker cannot add checks
+inside a run):
+
+```
+thoth checks add test --cmd "cargo test --no-fail-fast -- --skip process::"
+thoth checks add test-process --cmd "cargo test --no-fail-fast --bin thoth -- process:: --test-threads=1"
+thoth checks approve --reason "..."
+```
+
+`add` with an id that already exists replaces the whole row and forgets all
+its approvals, so `test` has to be approved again; the one `approve` covers
+both.
+
+`thoth verify` runs only the check ids the spec's `checks` lists, one after
+another in the spec's order, and the whole catalogue when the spec lists
+none. So a spec that lists `test` must list `test-process` too, or verify does
+not run the process group. On a machine where `test-process` is not
+registered yet, a spec that lists it gets `unknown_check` from
+`thoth spec lint`, and verify records that check as refused: its entry in
+`results` has `exit_code` null and an `error` saying it is not in the
+catalogue.
+
+The public repo's CI (`.github/workflows/ci.yml`) runs the same two groups:
+the process group runs after the main group whenever the main group ran, red
+or green.
 
 ### Package-info auto-accept
 
@@ -2625,6 +2765,84 @@ New (AUTO-1a), all on the pipeline's task: `pipeline_started` (detail:
 and `update_spec` and the fields `entry_index`, `skipped`, `attempt`,
 `reason`, `warning`, `implementer_index`, `reviewer_index` and
 `attempts_used`; `pipeline_stopped` also has the last three.
+
+(VSCOPE-1) `suite_ran`, written by `thoth suite run`, names no task and no
+run; its detail is that command's `--json` output: `commit`, `full`,
+`checks`, `tests`, `failures`, `results` (each row with `argv`, the output
+blob's `sha256` and `blob_path`) and `ok`. See "The suite before pushing".
+A `verify_ran` row of a scoped check also carries `scope`.
+
+## The suite before pushing
+
+(VSCOPE-1, from the 2026-11-17 decision.) A single task's verify runs only
+that task's tests and the cheap checks; the whole suite runs once on the main
+line, after one or more tasks are merged into the local main line and before
+it is pushed. A green whole suite on HEAD stays a requirement for pushing
+the main line.
+
+```
+thoth suite run [--commit REV] [--check ID]... [--test NAME]... [--timeout 120m] [--json]
+thoth suite show [--json]
+```
+
+**Setup (once, by the commander, after this feature is merged).** Register a
+scoped check next to the full `test` check, which stays in the catalogue and
+can still be approved and run:
+
+```
+thoth checks add test-scope --cmd "cargo test --no-fail-fast --bin thoth" --scope cargo-test-targets
+thoth checks approve --reason "VSCOPE-1: scoped tests for single-task verify"
+```
+
+A spec that wants scoped verification lists `test-scope` and the cheap checks
+(`clippy`, `tests-no-db`, `public-tree`, ...) under `checks`, and not `test`.
+A spec that lists `test`, or lists no `checks` at all, still gets the full
+`test` on its verify.
+
+**When.** The commander runs `thoth suite run` after a task (or a few) is
+merged into the local main line and before pushing it. `suite run` checks
+out the commit (HEAD of the main worktree by default) in a temporary
+worktree, runs every check that has no scope (or the `--check` ones, in the
+order given), records a `suite_ran` event and exits 1 when any check failed
+or was refused. Before pushing the main line, `thoth suite show --json` must
+say `head_green: true`: the newest whole-suite run (no `--check`, no
+`--test`) that passed is on HEAD itself. Pushing a `wip/` branch when work
+stops is not pushing the main line and needs no suite. Thoth does not block
+the push itself; the commander checks. Runs follow the usual rule: one whole
+suite at a time, scheduled by the commander; `suite run` takes no pipeline
+verify slot and never starts by itself.
+
+**Red: finding the task.** Read the failing row's output (`blob_path` in
+`suite run --json`, or `last.results[]` of `suite show --json`) and note the
+failing test target NAME (the `tests/NAME.rs` that cargo reports). Then, for
+each commit M in `merges_since_green` from oldest to newest, run:
+
+```
+thoth suite run --commit M --check test-scope --test NAME --json
+```
+
+The first M that exits non-zero is the merge that broke it; its subject names
+the task. When every merge is green, look at the direct commits after the
+last merge. These runs are partial (`full: false`) and never make HEAD green.
+
+**Risk, and what to do about it.** With only the scoped tests run per task, a
+task can break an existing test it did not touch and its spec did not name
+(as on 2026-11-16, when one task broke `tests/protected.rs` and that task's
+own whole-suite verify caught it). Its verify and review pass; the break
+shows only in the whole suite after the merge. The commander handles it:
+
+1. Do not push the main line.
+2. Find the merge as above.
+3. Undo it on the local main line with `git revert -m 1 M` (conservative;
+   fixing it on the spot is also allowed, at the commander's call).
+4. Run `thoth suite run` again until `head_green` is true, then push.
+5. Redo that task's change as a new task whose spec names the broken test
+   file, so it is in that task's scope, and review it as usual.
+
+So a broken test outside every task's scope is found later than before, and
+the cost is reverting and redoing one task. The `all_tests` fallback and
+naming known-related tests in the spec keep those tests in the single-task
+run.
 
 ## `thoth hook` (internal)
 

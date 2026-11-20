@@ -425,10 +425,20 @@ fn profile_usage_reads_newest_codex_rollout_file_and_names_windows_by_minutes() 
     let cfg = f.add_codex_profile("codex-a");
     let sessions = cfg.join("sessions").join("2026");
     fs::create_dir_all(&sessions).unwrap();
+    let old = sessions.join("z-old.jsonl");
     fs::write(
-        sessions.join("z-old.jsonl"),
+        &old,
         "{bad\n{\"timestamp\":\"2026-09-28T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"primary\":{\"used_percent\":12,\"window_minutes\":300},\"secondary\":null}}}\n",
     ).unwrap();
+    // Two files written back to back can get the same modification time on a
+    // coarse-grained file system, and then the reader's order is the
+    // directory listing's; an hour back makes "newest" unambiguous.
+    fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
     let newest = sessions.join("a-new.jsonl");
     fs::write(
         &newest,

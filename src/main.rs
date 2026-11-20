@@ -41,6 +41,7 @@ mod spec;
 mod spec_edits;
 mod spec_review_json;
 mod spec_review_prompt;
+mod test_scope;
 mod user_shell;
 mod worktree;
 
@@ -155,6 +156,10 @@ fn main() {
             cli::ChecksAction::Remove { json, .. } => *json,
             cli::ChecksAction::Protect { json, .. } => *json,
             cli::ChecksAction::Unprotect { json, .. } => *json,
+        },
+        cli::Command::Suite { action } => match action {
+            cli::SuiteAction::Run { json, .. } => *json,
+            cli::SuiteAction::Show { json } => *json,
         },
         cli::Command::Worktrees { action } => match action {
             cli::WorktreesAction::Prune { json } => *json,
@@ -670,6 +675,7 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                     shell,
                     cwd: check_cwd,
                     exe_pin,
+                    scope,
                     input,
                     json,
                 } => commands::checks::add(
@@ -682,6 +688,7 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                         cwd: &check_cwd,
                         inputs: &input,
                         exe_pin: &exe_pin,
+                        scope: scope.as_deref(),
                         json,
                     },
                 ),
@@ -698,6 +705,24 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                 cli::ChecksAction::Unprotect { pattern, json } => {
                     commands::checks::unprotect(&paths, &cwd, &pattern, json)
                 }
+            }
+        }
+        cli::Command::Suite { action } => {
+            let paths = config::Paths::from_env()?;
+            let cwd = std::env::current_dir()?;
+            match action {
+                cli::SuiteAction::Run { commit, check, test, timeout, json } => commands::suite::run(
+                    &paths,
+                    &cwd,
+                    commands::suite::RunArgs {
+                        commit: commit.as_deref(),
+                        checks: &check,
+                        tests: &test,
+                        timeout_secs: timeout,
+                        json,
+                    },
+                ),
+                cli::SuiteAction::Show { json } => commands::suite::show(&paths, &cwd, json),
             }
         }
         cli::Command::Worktrees { action } => {

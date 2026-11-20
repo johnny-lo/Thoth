@@ -286,6 +286,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ChecksAction,
     },
+    /// Run the whole suite of approved checks on a main-line commit, and show whether HEAD has a green one.
+    Suite {
+        #[command(subcommand)]
+        action: SuiteAction,
+    },
     /// Remove the worktrees of finished tasks (pass, cancelled or accepted) that are clean; keep and list the rest.
     Worktrees {
         #[command(subcommand)]
@@ -404,6 +409,32 @@ pub enum RecordsAction {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum SuiteAction {
+    /// Run the approved checks in a temporary checkout of a commit and record a suite_ran event.
+    Run {
+        /// The commit to run on; left out, the main worktree's HEAD.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Run only this check (repeatable, in the order given); left out, every check without a scope.
+        #[arg(long = "check")]
+        check: Vec<String>,
+        /// With exactly one --check that has a scope: append --test NAME for each (repeatable).
+        #[arg(long = "test")]
+        test: Vec<String>,
+        /// Per-check deadline; a check still running then is killed and recorded as a failure.
+        #[arg(long, value_parser = parse_duration_secs, default_value = "120m")]
+        timeout: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Whether the main worktree's HEAD has a green whole-suite run, and the merges since the last one.
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ChecksAction {
     /// Propose a check (or replace one, clearing its approval).
     Add {
@@ -420,6 +451,9 @@ pub enum ChecksAction {
         /// hash: pin the program's resolved path and its bytes (default); path: pin its resolved path only, for a program outside the repository that updates itself
         #[arg(long = "exe-pin", default_value = "hash")]
         exe_pin: String,
+        /// cargo-test-targets: a cargo test check that verify narrows to the task's test targets (--test NAME per target, or --tests); part of the approval
+        #[arg(long)]
+        scope: Option<String>,
         /// An input file the check depends on (repeatable); more are inferred.
         #[arg(long = "input")]
         input: Vec<String>,

@@ -2,8 +2,10 @@
 //! disk hands later calls to the new executable, and falls back to its own
 //! tools with a warning when it cannot.
 //!
-//! Every test holds `LOCK` the whole time: on Linux a freshly written
+//! On Linux every test holds `LOCK` the whole time: there a freshly written
 //! executable can fail to start with ETXTBSY while another test thread forks.
+//! Windows has no such failure, so there `lock` takes nothing and libtest
+//! runs these tests side by side.
 
 mod common;
 
@@ -12,9 +14,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+#[cfg(not(windows))]
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 static LOCK: Mutex<()> = Mutex::new(());
 
 const THOTH: &str = env!("CARGO_BIN_EXE_thoth");
@@ -27,8 +31,18 @@ const NOTICE: &str = "notice: the thoth executable at ";
 const WARNING: &str = "warning: the thoth executable this MCP server was started from";
 const MAY_HAVE_RUN: &str = "may already have run this call";
 
+#[cfg(not(windows))]
 fn lock() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Windows: nothing to hold (see the module comment).
+#[cfg(windows)]
+struct NoLock;
+
+#[cfg(windows)]
+fn lock() -> NoLock {
+    NoLock
 }
 
 // ---- copied from tests/mcp_jobs.rs ----
@@ -724,12 +738,19 @@ fn mcp_replaced_does_not_rerun_a_call_the_new_server_may_have_run() {
     assert_local(&s.guide(2), "exited");
 }
 
+/// The server is started with the debug-build seam
+/// `THOTH_TEST_MCP_HANDSHAKE_MS` (src/mcp/forward.rs), which shortens the
+/// handshake limit from 30 seconds to 2 so the test does not wait the full
+/// limit. What it checks is the same: a new executable that never answers
+/// only counts as a failed handshake once the limit has passed. A release
+/// build ignores the seam and the test passes after the 30 seconds.
 #[test]
 fn mcp_replaced_gives_up_on_a_silent_server() {
     let _g = lock();
     let f = common::fixture();
     let mut bin = Bin::new();
-    let mut s = Server::start(&f, &bin, &[]);
+    let limit = [("THOTH_TEST_MCP_HANDSHAKE_MS", "2000")];
+    let mut s = Server::start_env(&f, &bin, &[], false, &limit);
     bin.mode("silent");
     bin.replace(FAKE, false);
     s.send(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"thoth_guide","arguments":{}}}));

@@ -1517,6 +1517,7 @@ mod tests {
             approved_detail: None,
             approved_commit: None,
             exe_pin: "hash".into(),
+            scope: None,
         }
     }
 

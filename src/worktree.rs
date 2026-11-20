@@ -679,6 +679,22 @@ pub fn merges_between(repo_root: &Path, base: &str, branch: &str) -> Result<Vec<
         .collect())
 }
 
+/// VSCOPE-1: the merge commits on the first-parent line of `from..to`,
+/// oldest first, each with its subject.
+pub fn first_parent_merges(repo_root: &Path, from: &str, to: &str) -> Result<Vec<(String, String)>> {
+    let range = format!("{from}..{to}");
+    Ok(git_capture(
+        repo_root,
+        &["log", "--first-parent", "--merges", "--reverse", "--format=%H%x09%s", &range],
+    )?
+    .lines()
+    .filter_map(|l| {
+        let (sha, subject) = l.split_once('\t')?;
+        Some((sha.trim().to_string(), subject.trim_end().to_string()))
+    })
+    .collect())
+}
+
 /// `git cherry BASE BRANCH` verbatim: one line per commit of `BASE..BRANCH`,
 /// `-` when an equivalent change is already in `BASE`, `+` when not.
 pub fn cherry(repo_root: &Path, base: &str, branch: &str) -> Result<String> {

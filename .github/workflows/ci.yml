@@ -61,8 +61,19 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       # --no-fail-fast: one red test binary must not hide the reds of the rest.
+      # The suite runs as two groups that together are the whole suite: every
+      # test whose name does not contain `process::` in parallel, then the
+      # `process::` unit tests one at a time (they start real processes and
+      # assert deadlines, and turn falsely red when run next to the rest).
       - name: test
-        run: cargo test --locked --no-fail-fast
+        id: test
+        run: cargo test --locked --no-fail-fast -- --skip process::
+
+      # Runs whenever `test` ran, red or green, so one group's red does not
+      # hide the other's result; not when `test` was skipped or cancelled.
+      - name: test-process
+        if: ${{ !cancelled() && (steps.test.outcome == 'success' || steps.test.outcome == 'failure') }}
+        run: cargo test --locked --no-fail-fast --bin thoth -- process:: --test-threads=1
 
   linux:
     if: github.repository == 'johnny-lo/Thoth'
@@ -234,9 +245,17 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # Two groups, as in the Windows job: everything whose name does not
+      # contain `process::` in parallel, then the `process::` unit tests one at
+      # a time. `test-process` runs whenever `test-full` ran, red or green.
       - name: test-full
+        id: test-full
         if: steps.probe.outputs.ok == 'true'
-        run: cargo test --locked --no-fail-fast
+        run: cargo test --locked --no-fail-fast -- --skip process::
+
+      - name: test-process
+        if: ${{ !cancelled() && steps.probe.outputs.ok == 'true' && (steps.test-full.outcome == 'success' || steps.test-full.outcome == 'failure') }}
+        run: cargo test --locked --no-fail-fast --bin thoth -- process:: --test-threads=1
 
       # No usable user manager: run everything that does not start a runner.
       # Any red here is still a code problem.
@@ -293,17 +312,21 @@ jobs:
             echo
             echo "Environment, not code. Failed probe checks: ${PROBE_REASON:-unknown}."
             echo
-            echo "Ran: every test target built (\`--no-run\`); unit tests except \`process::linux::\`;"
+            echo "Ran: every test target built (\`--no-run\`); unit tests except \`process::linux::\`"
+            echo "(the other \`process::\` unit tests as their own group, one at a time);"
             echo "integration tests that never start a runner: ${tests[*]}."
             echo
             echo "Skipped: the \`process::linux::\` unit tests and every other integration test file."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::warning::environment, not code: no usable systemd user manager (${PROBE_REASON:-unknown}); runner tests skipped, see the job summary"
           cargo test --locked --no-run
-          # Both test commands run even when the first one fails; the step
-          # fails afterwards if either did.
+          # All three test commands run even when an earlier one fails; the
+          # step fails afterwards if any did. The unit tests run as two groups:
+          # those whose name does not contain `process::` in parallel, then the
+          # `process::` ones except `process::linux::` one at a time.
           failed=0
-          cargo test --locked --no-fail-fast --bin thoth -- --skip process::linux:: || failed=1
+          cargo test --locked --no-fail-fast --bin thoth -- --skip process:: || failed=1
+          cargo test --locked --no-fail-fast --bin thoth -- process:: --skip process::linux:: --test-threads=1 || failed=1
           args=()
           for t in "${tests[@]}"; do args+=(--test "$t"); done
           cargo test --locked --no-fail-fast "${args[@]}" || failed=1

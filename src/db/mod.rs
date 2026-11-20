@@ -1,6 +1,7 @@
 pub mod checks;
 pub mod global;
 pub mod migrations;
+pub mod reports;
 pub mod state;
 
 use anyhow::{Context, Result};
