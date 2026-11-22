@@ -7,6 +7,7 @@ macro_rules! masked_eprintln {
 }
 
 mod adapter;
+mod baseline_hold;
 mod blobs;
 mod brief;
 mod checks;
@@ -27,6 +28,7 @@ mod model_list;
 mod output;
 mod plan_label;
 mod plugin_check;
+mod prior_rejection;
 mod process;
 mod protected;
 mod records;
@@ -43,6 +45,7 @@ mod spec_review_json;
 mod spec_review_prompt;
 mod test_scope;
 mod user_shell;
+mod verify_hold;
 mod worktree;
 
 #[cfg(test)]
@@ -166,8 +169,14 @@ fn main() {
         },
         cli::Command::Pipeline { action } => match action {
             cli::PipelineAction::Start { json, .. } => *json,
+            cli::PipelineAction::New { json, .. } => *json,
             cli::PipelineAction::Show { json, .. } => *json,
             cli::PipelineAction::Stop { json, .. } => *json,
+            cli::PipelineAction::Defaults { action } => match action {
+                cli::PipelineDefaultsAction::Set { json, .. } => *json,
+                cli::PipelineDefaultsAction::Show { json } => *json,
+                cli::PipelineDefaultsAction::Clear { json, .. } => *json,
+            },
         },
         cli::Command::PipelineRun { .. } => false,
     };
@@ -207,6 +216,7 @@ fn refreshing(paths: &config::Paths, result: anyhow::Result<i32>) -> anyhow::Res
 fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
     match parsed.command {
         cli::Command::Config { action } => {
+            commands::settings::command_reports_the_file();
             let paths = config::Paths::from_env()?;
             match action {
                 cli::ConfigAction::List { json } => {
@@ -242,6 +252,7 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
         // No `Paths::from_env()`: doctor reports the old-directory case that
         // it would refuse (see `config::probe_state_dir`).
         cli::Command::Doctor { shell, json } => {
+            commands::settings::command_reports_the_file();
             let cwd = std::env::current_dir()?;
             commands::doctor::run(&cwd, shell.as_deref(), json)
         }
@@ -770,12 +781,64 @@ fn run(parsed: cli::Cli) -> anyhow::Result<i32> {
                         },
                     ),
                 ),
+                cli::PipelineAction::New {
+                    file,
+                    title,
+                    base,
+                    implementers,
+                    reviewers,
+                    quota_threshold,
+                    fold_on_reject,
+                    max_attempts,
+                    timeout,
+                    review_timeout,
+                    verify_timeout,
+                    verify_wait,
+                    reason,
+                    wait,
+                    json,
+                } => refreshing(
+                    &paths,
+                    commands::pipeline::new(
+                        &paths,
+                        &cwd,
+                        commands::pipeline::NewArgs {
+                            file: &file,
+                            title: title.as_deref(),
+                            base: base.as_deref(),
+                            wait: wait.as_deref(),
+                            start: commands::pipeline::StartArgs {
+                                task: "",
+                                implementers: &implementers,
+                                reviewers: &reviewers,
+                                max_attempts: max_attempts.as_deref(),
+                                timeout: timeout.as_deref(),
+                                review_timeout: review_timeout.as_deref(),
+                                verify_timeout: verify_timeout.as_deref(),
+                                verify_wait: verify_wait.as_deref(),
+                                reason: reason.as_deref(),
+                                quota_threshold: quota_threshold.as_deref(),
+                                fold_on_reject,
+                                json,
+                            },
+                        },
+                    ),
+                ),
                 cli::PipelineAction::Show { task, wait, json } => {
                     commands::pipeline::show(&paths, &cwd, &task, wait.as_deref(), json)
                 }
                 cli::PipelineAction::Stop { task, json } => {
                     refreshing(&paths, commands::pipeline::stop(&paths, &cwd, &task, json))
                 }
+                cli::PipelineAction::Defaults { action } => match action {
+                    cli::PipelineDefaultsAction::Set { implementers, reviewers, reason, json } => {
+                        commands::pipeline_defaults::set(&paths, &implementers, &reviewers, reason.as_deref(), json)
+                    }
+                    cli::PipelineDefaultsAction::Show { json } => commands::pipeline_defaults::show(&paths, json),
+                    cli::PipelineDefaultsAction::Clear { only, json } => {
+                        commands::pipeline_defaults::clear(&paths, only.as_deref(), json)
+                    }
+                },
             }
         }
         cli::Command::PipelineRun { pipeline, supervised } => {

@@ -535,7 +535,12 @@ fn recommend_lists_account_facts_only() {
                 for m in c["models"].as_array().unwrap() {
                     let mut keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
                     keys.sort_unstable();
-                    assert_eq!(keys, ["agent_arena", "ai_stupid_level", "artificial_analysis", "model", "names", "usage"], "{c}");
+                    // AGY-1 AC5: `no_effort` joins the model row
+                    assert_eq!(
+                        keys,
+                        ["agent_arena", "ai_stupid_level", "artificial_analysis", "model", "names", "no_effort", "usage"],
+                        "{c}"
+                    );
                 }
                 assert!(c.get("held").is_none(), "{c}");
                 assert!(c.get("eligible").is_some(), "{c}");

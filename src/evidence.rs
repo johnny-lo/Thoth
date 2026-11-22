@@ -57,10 +57,7 @@ pub fn parse_code_number(code: &str) -> Option<i64> {
 /// Production caller: `insert_row`, below (Task 3). Also read directly by
 /// `next_code_starts_at_e001_and_counts_per_task` and its sibling tests.
 pub fn next_code(conn: &Connection, task_id: &str) -> Result<String> {
-    let mut stmt = conn.prepare("SELECT code FROM evidence WHERE task_id = ?1")?;
-    let codes = stmt
-        .query_map([task_id], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
+    let codes = state::evidence_codes_of_task(conn, task_id)?;
     let max = codes
         .iter()
         .filter_map(|c| parse_code_number(c))
@@ -935,6 +932,9 @@ pub fn short_sha(sha: &str) -> String {
 ///
 /// `git_dir` may be the run's worktree: a linked worktree shares the main
 /// tree's object store, so both commits resolve there.
+// RES-1b: `review record` now prepares its diff (`prepare_diff_attributed`)
+// and only the unit tests below call this plain form.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn record_diff(
     conn: &Connection,
     ctx: &EvidenceContext<'_>,
@@ -998,6 +998,52 @@ pub fn record_review_fix_commit(
     record_commit_labelled(conn, ctx, git_dir, sha, REVIEW_FIX_LABEL_PREFIX)
 }
 
+/// RES-1b: an evidence row whose git work is done and whose blob is stored,
+/// not yet inserted (`insert_prepared`). A caller that must not hold the
+/// write lock while git runs prepares first and inserts under the lock.
+pub struct PreparedRow {
+    kind: &'static str,
+    label: String,
+    sha256: String,
+    bytes: i64,
+    blob_path: PathBuf,
+    detail: serde_json::Value,
+}
+
+impl PreparedRow {
+    /// `diff` or `commit`.
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+}
+
+/// RES-1b: inserts a prepared row (`insert_row`); inside the caller's
+/// transaction when it holds one.
+pub fn insert_prepared(conn: &Connection, ctx: &EvidenceContext<'_>, row: PreparedRow) -> Result<String> {
+    insert_row(
+        conn,
+        ctx,
+        row.kind,
+        &row.label,
+        Some(row.sha256),
+        Some(row.bytes),
+        Some(row.blob_path),
+        row.detail,
+    )
+}
+
+/// RES-1b: `record_diff_attributed`'s git work and blob, without the insert.
+pub fn prepare_diff_attributed(
+    conn: &Connection,
+    ctx: &EvidenceContext<'_>,
+    git_dir: &Path,
+    from: &str,
+    to: &str,
+    attribution: Option<&Attribution<'_>>,
+) -> Result<PreparedRow> {
+    prepare_diff_labelled(conn, ctx, git_dir, from, to, attribution, "")
+}
+
 fn record_diff_labelled(
     conn: &Connection,
     ctx: &EvidenceContext<'_>,
@@ -1007,6 +1053,19 @@ fn record_diff_labelled(
     attribution: Option<&Attribution<'_>>,
     label_prefix: &str,
 ) -> Result<String> {
+    let row = prepare_diff_labelled(conn, ctx, git_dir, from, to, attribution, label_prefix)?;
+    insert_prepared(conn, ctx, row)
+}
+
+fn prepare_diff_labelled(
+    conn: &Connection,
+    ctx: &EvidenceContext<'_>,
+    git_dir: &Path,
+    from: &str,
+    to: &str,
+    attribution: Option<&Attribution<'_>>,
+    label_prefix: &str,
+) -> Result<PreparedRow> {
     // P7-2: the existing test files and check inputs this diff modified or
     // deleted (and the added files named like a check word), worked out here
     // by the control plane so neither the worker nor the reviewer has to be
@@ -1028,7 +1087,7 @@ fn record_diff_labelled(
         })
         .map(|(tip, _)| tip);
     // `--no-renames`: with rename detection a moved test's old path would not
-    // be in the set, and rule 6 would not see the deletion.
+    // be in the set, and the protected list would not show the deletion.
     let keep: Option<Vec<String>> = match tip_used
         .map(|tip| crate::worktree::diff_name_status(git_dir, tip, to))
     {
@@ -1088,16 +1147,7 @@ fn record_diff_labelled(
         short_sha(&view.start),
         short_sha(to)
     );
-    insert_row(
-        conn,
-        ctx,
-        "diff",
-        &label,
-        Some(sha),
-        Some(bytes as i64),
-        Some(path),
-        detail,
-    )
+    Ok(PreparedRow { kind: "diff", label, sha256: sha, bytes: bytes as i64, blob_path: path, detail })
 }
 
 /// SMALL-9c: `diff_from_rule` when the diff starts at the merge base of the
@@ -1235,6 +1285,11 @@ pub fn record_commit(
     record_commit_labelled(conn, ctx, git_dir, sha, "")
 }
 
+/// RES-1b: `record_commit`'s git work and blob, without the insert.
+pub fn prepare_commit(ctx: &EvidenceContext<'_>, git_dir: &Path, sha: &str) -> Result<PreparedRow> {
+    prepare_commit_labelled(ctx, git_dir, sha, "")
+}
+
 fn record_commit_labelled(
     conn: &Connection,
     ctx: &EvidenceContext<'_>,
@@ -1242,6 +1297,16 @@ fn record_commit_labelled(
     sha: &str,
     label_prefix: &str,
 ) -> Result<String> {
+    let row = prepare_commit_labelled(ctx, git_dir, sha, label_prefix)?;
+    insert_prepared(conn, ctx, row)
+}
+
+fn prepare_commit_labelled(
+    ctx: &EvidenceContext<'_>,
+    git_dir: &Path,
+    sha: &str,
+    label_prefix: &str,
+) -> Result<PreparedRow> {
     let (subject, author_date) = crate::worktree::commit_meta(git_dir, sha)?;
     let stat = crate::worktree::show_stat(git_dir, sha)?;
     let (blob_sha, bytes, path) = crate::blobs::put_bytes(ctx.paths, ctx.repo_id, &stat)?;
@@ -1259,16 +1324,7 @@ fn record_commit_labelled(
         short_sha(sha),
         label_from_command(&subject)
     );
-    insert_row(
-        conn,
-        ctx,
-        "commit",
-        &label,
-        Some(blob_sha),
-        Some(bytes as i64),
-        Some(path),
-        detail,
-    )
+    Ok(PreparedRow { kind: "commit", label, sha256: blob_sha, bytes: bytes as i64, blob_path: path, detail })
 }
 
 #[cfg(test)]

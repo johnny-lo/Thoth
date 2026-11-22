@@ -77,9 +77,10 @@ pub const CHECKS_NOTE: &str = "Run the tests the spec names before you finish. Y
 /// `verify` of the checks above, so the worker runs what the spec names, one
 /// foreground command each. The sentence names no tool: Thoth serves any
 /// language's repo.
-pub const INTERFACE_TEST_LEAD_IN: &str = "Reviewers apply this rule to the tests you add or change: ";
-
 pub const SUITE_NOTE: &str = "Evidence for the whole test suite comes from the control plane's verify of the checks above, not from you. Run the tests the spec names, each as its own foreground command, and do not start a whole-suite run that cannot finish within one command's time limit; when the spec asks for the whole suite, run it in parts that each finish, and keep each part's output.\n";
+
+/// TESTRULE-1: the lead-in of the line right after SUITE_NOTE that hands the worker the reviewers' INTERFACE_TEST_RULE.
+pub const INTERFACE_TEST_LEAD_IN: &str = "Reviewers apply this rule to the tests you add or change: ";
 
 /// LEAN-1: right after the result.json shape. The summary is for what Thoth
 /// cannot record by itself; files, commands, exit codes and usage it already
@@ -306,6 +307,11 @@ fn build_prompt_impl(
     s.push_str("{\"task_id\":\"");
     s.push_str(task_id);
     s.push_str("\",\"status\":\"completed\",\"brief\":\"<short conclusion>\",\"summary\":\"<one paragraph>\",\"claims\":[{\"kind\":\"test_result\",\"text\":\"...\",\"evidence\":[]}]}\n");
+    // CLAIMKIND-1: a research task's prompt is unchanged; its
+    // `RESEARCH_SECTION` already says what a research claim needs.
+    if !research {
+        s.push_str(CLAIM_KINDS_NOTE);
+    }
     s.push_str(BRIEF_NOTE);
     s.push_str(SUMMARY_NOTE);
     s.push_str("Do not modify files outside this directory. Do not push.\n");
@@ -313,10 +319,20 @@ fn build_prompt_impl(
         s.push_str("Do not commit: leave your changes in the worktree. thoth will commit whatever is there once this run finishes cleanly.\n");
     }
     s.push_str(SINGLE_RUN_NOTE);
+    // SMALL-16: only the codex prompt (`worker_commits` false), only on Linux.
+    if !worker_commits && cfg!(target_os = "linux") {
+        s.push_str(CODEX_LINUX_SANDBOX_NOTE);
+    }
     s.push_str(EVIDENCE_SECTION);
     s.push_str(&protected_section(protected));
     s
 }
+
+/// CLAIMKIND-1: the claim kinds a worker of a task that is not a research task
+/// uses, right after the result.json shape. Without it a worker with a note for
+/// the commander guessed `other`, then `research` without sources, and both
+/// deliveries were rule 1.
+pub const CLAIM_KINDS_NOTE: &str = "Use these claim kinds: test_result and doc_reference (each must cite at least one evidence code), completion and behavior (a summary, a note, a decision you took, or a finding for the commander), and protected_change. The kind research is only for a research task, and this is not one.\n";
 
 /// BRIEF-1: what the worker puts in result.json's `brief`, which the
 /// commander reads first.
@@ -324,8 +340,17 @@ pub const BRIEF_NOTE: &str = "`brief` is your short conclusion, which the comman
 
 /// The worker prompt's note that the run is one unattended turn. A worker that
 /// starts a command in the background and ends its turn is killed with it, and
-/// delivers nothing. Reviewer prompts do not carry it.
-pub const SINGLE_RUN_NOTE: &str = "This is a single unattended run: when you end your turn the process exits, and anything still running in the background is killed. Do not start background commands; run every command in the foreground. Finish everything - your checks, the commit if you make one, and .agent/result.json - before you end your turn.\n";
+/// delivers nothing. The note also says how to wait for a command that is
+/// still running: by process id or the shell's `wait`, never `pgrep -f` on the
+/// command's own text, which matches the waiting loop itself. Reviewer prompts
+/// do not carry it.
+pub const SINGLE_RUN_NOTE: &str = "This is a single unattended run: when you end your turn the process exits, and anything still running in the background is killed. Do not start background commands; run every command in the foreground. If you ever have to wait for a command that is still running, wait for it by its process id (`wait PID`, or `kill -0 PID` in a loop) or with the shell's `wait`; never look for it with `pgrep -f` on the command's own text, because that also matches the waiting loop itself and the wait never ends. Finish everything - your checks, the commit if you make one, and .agent/result.json - before you end your turn.\n";
+
+/// SMALL-16: the Codex implementer prompt's note on Linux, where codex's
+/// sandbox blocks the systemd user bus a runner needs. It follows
+/// `SINGLE_RUN_NOTE` and comes before the Evidence section; the Claude and
+/// agy prompts and the Windows codex prompt do not carry it.
+pub const CODEX_LINUX_SANDBOX_NOTE: &str = "Tests that start a runner (for example tests/codex.rs, tests/antigravity.rs, tests/review.rs) cannot run in this sandbox on Linux, because it blocks the systemd user bus and they fail with 'Failed to connect to user scope bus via local transport: Operation not permitted'. Do not try to fix that or investigate systemd: say in your summary which of them you did not run; the commander's verify runs them.\n";
 
 /// brief §4: the reviewer prompt.
 ///
@@ -1634,7 +1659,8 @@ mod tests {
 
     /// RES-1a AC5: a research task's prompt (Claude and agy, and codex) has
     /// the `## Research claims` section right before the result.json shape,
-    /// and is otherwise the non-research prompt byte for byte.
+    /// and is otherwise the non-research prompt byte for byte, less the
+    /// non-research prompt's `CLAIM_KINDS_NOTE` (CLAIMKIND-1).
     #[test]
     fn a_research_prompt_adds_the_research_claims_section_before_the_shape() {
         let pairs = [
@@ -1652,7 +1678,7 @@ mod tests {
             let at = research.find("\n## Research claims\n").expect("section");
             assert!(at > research.find(CHECKS_NOTE).unwrap());
             assert!(at < research.find("write the file `.agent/result.json`").unwrap());
-            assert_eq!(research.replacen(RESEARCH_SECTION, "", 1), plain);
+            assert_eq!(research.replacen(RESEARCH_SECTION, "", 1), plain.replacen(CLAIM_KINDS_NOTE, "", 1));
             for needle in [
                 r#"{"kind":"research","text":"...","evidence":[],"sources":[{"url":"https://...","quote":"..."}]}"#,
                 "http://, https:// or file://",
@@ -1716,8 +1742,7 @@ mod tests {
         assert!(!section.contains("Also treated as test files"));
     }
 
-    /// P7-2 / AC5: a reroute after a rule 6 rejection quotes rule 6's reason,
-    /// so the next worker is told which file to declare.
+    /// P7-2 / AC5: a reroute quotes the refused delivery's reason, so the next worker is told why; the sample reason is one rule 6 gave before LEAN-1 retired it.
     #[test]
     fn a_reroute_after_rule_6_quotes_the_missing_claim_reason() {
         const REASON: &str = "claim missing for protected file tests/x.rs (modified): add a claim \
@@ -1966,6 +1991,10 @@ mod tests {
         ] {
             let claude = build_prompt("01T", &demo_spec(), rework, reroute, None, &[], &Default::default(), false);
             let codex = build_codex_prompt("01T", &demo_spec(), rework, reroute, None, &[], &Default::default(), false);
+            // SMALL-16: on Linux the codex prompt also carries the sandbox note
+            // (a test of its own, tests/codex.rs, pins where); everything else
+            // is still the commit instruction only.
+            let codex = codex.replacen(CODEX_LINUX_SANDBOX_NOTE, "", 1);
             let claude_no_commit = claude.replacen(
                 "When done, commit your work on the current branch, then write the file \
                  `.agent/result.json`",

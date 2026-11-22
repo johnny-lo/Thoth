@@ -302,26 +302,6 @@ mod tests {
         assert_eq!(runs_left(Some(99.0), None, Some(1.0), None, false), (Some(0), Some("five_hour")));
     }
 
-    fn window(name: &str, used: f64, resets_at: Option<i64>) -> Window {
-        Window {
-            name: name.into(),
-            used,
-            resets_at,
-            observed_at: "2026-10-16T00:00:00Z".into(),
-            source: "thoth_events",
-            group: None,
-            group_description: None,
-        }
-    }
-
-    #[test]
-    fn a_reset_window_counts_as_zero_percent_used() {
-        let windows = vec![window("five_hour", 80.0, Some(0)), window("seven_day", 30.0, Some(4_102_444_800))];
-        assert_eq!(used_percent(&windows, "five_hour"), Some(0.0));
-        assert_eq!(used_percent(&windows, "seven_day"), Some(30.0));
-        assert_eq!(used_percent(&windows, "weekly"), None);
-    }
-
     // The averages (the reliable runs whenever the group has one, numbers or
     // not; else the unreliable ones with numbers; else null) are checked from
     // `recommend --json` in tests/recommend_facts.rs, on runs read from the

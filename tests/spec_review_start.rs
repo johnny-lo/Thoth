@@ -136,7 +136,7 @@ impl Server {
         scenario: &str,
         task: Option<&str>,
     ) -> Self {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .args(extra)
             .current_dir(f.repo.path())
@@ -920,7 +920,8 @@ fn sr4_a_review_mode_run_lists_no_refused_edits() {
         let mut c = f.cmd();
         for (name, _) in std::env::vars_os() {
             let upper = name.to_string_lossy().to_ascii_uppercase();
-            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+            // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
                 c.env_remove(&name);
             }
         }

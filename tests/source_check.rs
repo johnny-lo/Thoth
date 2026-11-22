@@ -625,3 +625,65 @@ fn research_spec_review_keeps_network_off_and_code_review_keeps_original_tools()
     assert_eq!(r["allowed_tools"], TOOLS);
     assert_eq!(wait(&f, r["run_id"].as_str().unwrap())["verdict"], "PASS");
 }
+
+/// REV-2 (AC3): a recorded research source check is no code review, so
+/// `review show` has `blocking`, `advisory` and `has_blocking_findings` null
+/// and prints neither of the two human lines.
+#[test]
+fn review_show_of_a_source_check_has_null_blocking_keys() {
+    let f = setup();
+    let (_, sources) = pages(&f, 2);
+    let (task, _) = candidate(&f, &sources);
+    let file = f.home_path().join("check.json");
+    std::fs::write(&file, check_doc(&sources).to_string()).unwrap();
+    let mut c = f.cmd();
+    c.args(["review", "record", &task, "-f"]).arg(&file).arg("--json");
+    let r: Value = serde_json::from_slice(&f.run_ok(c, "review record")).unwrap();
+    assert_eq!(r["task_status"], "pass", "{r}");
+
+    let show = json_ok(&f, &["review", "show", &task, "--json"]);
+    assert_eq!(show["review_count"], 1, "{show}");
+    assert!(!show["findings"]["sources"].as_array().unwrap().is_empty(), "{show}");
+    for k in ["blocking", "advisory", "has_blocking_findings"] {
+        assert!(show.get(k).is_some_and(Value::is_null), "{k} must be present and null: {show}");
+    }
+    let out = f.cmd().args(["review", "show", &task]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let human = String::from_utf8(out.stdout).unwrap();
+    assert!(!human.lines().any(|l| l.starts_with("  blocking: ")), "{human}");
+    assert!(!human.lines().any(|l| l.starts_with("  advisory (not required): ")), "{human}");
+}
+
+/// SMALL-18 C3: the runner records no stream reads for a source check, so a
+/// codex source check's citation never read is warned about with the
+/// `evidence show` text, not the text about files never read.
+#[test]
+fn a_codex_source_checks_unopened_citation_keeps_the_evidence_show_text() {
+    let f = setup();
+    let (_, sources) = pages(&f, 2);
+    let (task, _) = candidate(&f, &sources);
+    let listed = json_ok(&f, &["evidence", "list", &task, "--json"]);
+    let code = listed["evidence"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|e| e["code"].as_str())
+        .unwrap_or_else(|| panic!("no evidence code: {listed}"))
+        .to_string();
+
+    let r = start(&f, &task, "codex-a", "source_check", &[("FAKE_SOURCE_CHECK_CITES", &code)]);
+    let w = wait(&f, r["run_id"].as_str().unwrap());
+    assert_eq!(w["verdict"], "PASS", "{w}");
+
+    let show = json_ok(&f, &["review", "show", &task, "--json"]);
+    assert_eq!(show["unopened_citation"], json!([code]), "{show}");
+    let out = f.cmd().args(["review", "show", &task]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let human = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        human.contains(&format!(
+            "  WARNING unopened_citation: {code} (cited but never read through `evidence show`)"
+        )),
+        "{human}"
+    );
+    assert!(!human.contains("was never read"), "{human}");
+}

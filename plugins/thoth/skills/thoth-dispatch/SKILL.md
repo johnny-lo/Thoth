@@ -7,21 +7,39 @@ description: Use when implementation should be delegated to another subscription
 
 ## Overview
 
-You are the commander. You plan and review; a registered worker profile implements through `thoth`, which records evidence of what the worker actually ran. Judge from that evidence, not from the worker's prose, and record your judgment in Thoth. Never implement the delegated task yourself.
+You are the commander. You plan and review; a registered worker profile implements through `thoth`, which records evidence of what the worker actually ran. Judge from that evidence, never from the worker's prose, and record your judgment in Thoth. Never implement the delegated task yourself.
 
-Thoth does not choose a profile, model or effort for you. You choose them on every launch and say why; Thoth records each launch's choice, your reason and its outcome (a `launch_choice` event, the shared records and the decision table of `thoth models`). `thoth recommend` gives facts only: quota, the external tables, Thoth's own usage and the task's history.
+Thoth does not choose a profile, model or effort for you. You choose them and say why; Thoth records each launch's choice, your reason and its outcome. `thoth recommend` gives facts only.
 
-Do not guess file formats or output keys. Every shape needed by this workflow is in this document. The full contract is under `docs/` in the Thoth repository.
+Do not guess file formats or output keys. The full contract is `docs/adapter-usage.md` in the Thoth repository; the headings named below are there.
 
 ## Setup
 
-- `thoth` must be on `PATH`. Check with `thoth --version`. If it is not found, stop and ask the human to install it.
-- The state directory is `THOTH_HOME`, or `~/.thoth` when that variable is unset.
-- At least one worker profile must be registered and logged in. Use `thoth profile list` to see the actual profiles. Ask the human to register or log in a profile according to the project documentation if none is ready; the commander does not perform login. Names such as `claude-b` and `codex-a` below are examples only, not fixed accounts.
-- Put scratch files such as specs and reviews in the commander's own temporary directory, never in the repository or a worktree. Write UTF-8 without a BOM.
-- First run `thoth status --json` from the repository. If it says the repository is not initialized, run `thoth init --json` once and retry. Continue an existing matching task from its current status instead of creating a duplicate. Outside a git repository it lists the open tasks of every registered repository instead (`outside_repo` is true and each task carries its `repo`); dispatch, verify and review still have to run inside a repository.
+- `thoth --version` must work (`thoth` on `PATH`); if not, stop and ask the human to install it.
+- The state directory is `THOTH_HOME`, or `~/.thoth` when unset.
+- At least one worker profile must be registered and logged in (`thoth profile list`); the human registers and logs in, not you. Names such as `claude-b`, `codex-a` and `agy-a` are examples only.
+- Put scratch files (specs, reviews) in your own temporary directory, never in the repository or a worktree. UTF-8 without a BOM.
+- First run `thoth status --json` in the repository; if it is not initialized, run `thoth init --json` once and retry. Continue a matching task from its current status instead of creating a duplicate.
 
-## 1. Specify the task
+## The one command (light path: low or normal risk code tasks)
+
+1. Write the spec (below) and run `thoth pipeline new -f SPEC --title "short title" --reason "..." --json` (why the stored lists fit this task). It creates the task, starts its pipeline and returns at once with `task_id` and `pipeline_id`. It refuses before creating anything on a spec lint error, a docs, research or review task, no list given or stored, a bad entry, or important or high risk; fix it and run it again.
+2. Run `thoth pipeline show TASK --wait 9m --json` until `status` is `stopped` (exit 3 means still running; call it again).
+3. Act on `stop.reason`, `stop.summary` and `stop.next` (see When the pipeline stops). On `pass`, merge the exact `merge_branch` and `merge_commit`.
+
+For an existing task (`thoth task create -f SPEC --title "..." --json`, or one to continue): `thoth pipeline start TASK --reason "..." --json`, then steps 2 and 3.
+
+Store your default lists once per machine (yours, not a `thoth config` setting):
+
+```
+thoth pipeline defaults set --implementer claude-b:sonnet:medium --implementer claude-a:sonnet:high --reviewer codex-a:MODEL:medium --reviewer claude-a:opus:high --reason "why these are the usual choices" --json
+```
+
+- `set` replaces only the list whose flag you give, whole, in the given order; `thoth pipeline defaults clear [--only implementer|reviewer]` removes them. Thoth uses a stored list exactly as stored: it never ranks, reorders or shortens it. Put the reviewer order (below) into the reviewer list.
+- Check with `thoth pipeline defaults show --json` before relying on them and after profiles or models change: an entry that no longer passes is under `invalid` (`entry_index`, `entry`, `error`) and refuses the start; store a new list or give the flag.
+- A flag (`--implementer` or `--reviewer`) overrides that one list for one task. `settings` says where each list came from: `implementers_source` and `reviewers_source` (`flag` or `default`).
+
+## Specify the task
 
 ```json
 {
@@ -39,187 +57,100 @@ Do not guess file formats or output keys. Every shape needed by this workflow is
 }
 ```
 
-- Use JSON only. `goal` and `acceptance_criteria` are required.
-- The `AC1:` prefix is the criterion id the review must use.
-- Every criterion must be checkable from a diff or command output. Put no code in the spec.
-- A criterion that names a test must say which interface the test checks through: a CLI command, its `--json` output, or a public function. A test that reads the database or other internal state directly, only compares a fixed string, or only checks the exit code does not count.
-- `risk` is `low`, `normal`, `important`, or `high`.
-- `task_type` and `difficulty` are optional labels. Each launch records them in its `launch_choice` event, the shared records and the decision table, so that choices and outcomes can be compared later. `task_type` is `code`, `research`, `review`, `docs`, or `mechanical`; `difficulty` is `low`, `normal`, or `high`. Any other value makes `task create` fail. Set them whenever you know them.
+- JSON only; `goal` and `acceptance_criteria` are required. The `AC1:` prefix is the criterion id the review uses.
+- Every criterion is checkable from a diff or command output. Put no code in the spec.
+- A criterion that names a test says which interface the test checks through: a CLI command, its `--json` output, or a public function.
+- `risk` is `low`, `normal` (the default), `important` or `high`. `task_type` is `code`, `research`, `review`, `docs` or `mechanical`; `difficulty` is `low`, `normal` or `high`. Set them whenever you know them.
+- Lint refuses a spec over 40960 bytes at any risk, or over 20480 bytes at low or normal risk. Run `thoth spec lint SPEC --json` first.
 
-Run `thoth task create -f SPEC --title "short title" --json` and read `task_id` from its output.
+## Choosing profile, model, effort and reviewer
 
-The task starts at the HEAD of the work tree you run the command in. Pass `--base REF` (MCP: `base`) to start it at any other commit or branch instead. The output's `base_branch` says where the finished `thoth/TASK/aN` branch merges back. With `--base`, it is REF only when REF is exactly a local branch name, and null for anything else (a sha, a tag, `origin/x`, `HEAD~1`). Without `--base`, it is the branch checked out in that work tree, or null on a detached HEAD. When it is null, the commander decides where to merge.
+Read `thoth recommend --role implementer|reviewer --task TASK --json` as facts: quota, the external tables, Thoth's usage, `unmatched` models and `task_history` (`candidates[]`, `models[]`, `usage[]`: heading `thoth recommend --role implementer|reviewer [--task TASK] [--tables] [--json]` in `docs/adapter-usage.md`). Judge a model's strength from the external tables, never from its pass or reject record in Thoth.
 
-`task create`, `task update-spec` and `spec review start` first run `thoth spec lint` on the spec (MCP: `thoth_spec_lint`). A lint error refuses the command and writes nothing: a blank or repeated criterion, a check id this repository does not have, a step that writes under `.claude`, a spec over 40960 bytes (split the task), or, at `low` or `normal` risk (a spec without `risk` is `normal`), a spec over 20480 bytes. Lint warnings (line numbers, two-dot diffs, paths or names missing from the main work tree, PowerShell in a bash command, a spec over 20480 bytes at `important` or `high` risk) are added to `warnings`; fix the stale ones before dispatching. Run `thoth spec lint SPEC --json` yourself to see the report before creating the task.
+- Do not launch on a profile with any quota window at 95% or more.
+- Effort: mechanical or low work gets `low` or `medium`; ordinary work `medium`; `difficulty` `high`, or risk `important` or `high`, at least `high`. Use `--model sonnet` for ordinary work; give `haiku` mechanical work only.
+- Every launch, `pipeline new` and `pipeline start` takes `--reason "..."`: why this profile, model and effort. Thoth records it.
+- Escalation: list a stronger model or effort in the implementer list where you want one, and repeat an entry to allow it again.
 
-## 2. Dispatch and wait
+For a code review, a spec review or a source check, at any risk, choose the reviewer in this order:
 
-- Run `thoth recommend --role implementer --task TASK --json`. It chooses nothing; read the facts and choose yourself:
-  - `candidates[]`: `eligible`, `reasons` (each quota window's used percentage), `quota_state`, `peak_percent`, `plan_label`, `shared` and `windows`.
-  - `candidates[].models[]`: the models that account can run now. Each has `agent_arena` and `artificial_analysis` (the rows of those tables whose name matches the model: how strong it is, one row per effort variant) and `ai_stupid_level` (`degraded`: whether it got worse lately); a cell is null when no row matches. Each also has `usage[]`: Thoth's own average tokens (`tokens_avg`), average quota points (`quota_points_avg`, `quota_points_weekly_avg`), `runs_left` and `estimate_reliable` on that account. It has no pass or reject counts.
-  - `unmatched`: the models whose name no table matched; look them up yourself with `thoth recommend --tables --json`, which adds the three full filtered `tables`.
-  - `task_history`: `attempts`, `rejects`, `last_implementer` and `last_reviewer`.
-- Choose like this:
-  - Do not launch on a profile with any quota window at 95% or more.
-  - Judge how strong a model is from the two external tables' rows, and whether it got worse lately from `degraded`. Use each model's own `usage` only to estimate cost and how many runs are left; never judge a model by its pass or reject record in Thoth.
-  - A model Thoth has no runs of is no reason to avoid it: a model the tables rank strong gets ordinary work at once, without a small trial task first.
-  - Effort: `mechanical` or `low` work gets `low` or `medium`; ordinary work `medium`; `difficulty` `high`, or risk `important` or `high`, at least `high`. Give `haiku` mechanical work only.
-- Every `dispatch`, `review start` and `spec review start` takes `--reason "..."` (the MCP `reason` parameter): why this profile, model and effort. When the human has turned on `thoth config set require-reason on`, a launch without a reason is refused.
-- The first launch of an attempt must give `--model` and `--effort`. Only a model without an effort setting (such as `haiku`), or an agy model whose name carries its effort level, may leave out `--effort`; other agy models still need it. A re-dispatch in the same attempt that leaves them out keeps the previous run's of the same role, but a model is never kept across harnesses (pass `--model` when you switch to a profile of another harness), and a kept value is still checked against the model it runs on. `spec review start` keeps nothing: give the model, and the effort with the same exception, every time.
-- Dispatch with `thoth dispatch TASK --profile claude-b --model sonnet --effort medium --reason "..." --json`; the output includes `run_id`, `attempt`, and `worktree`. The profile name is only an example. Use `--model sonnet` for ordinary work and `haiku` for trivial work. Without `--timeout` a run's limit follows the effort sent (none, `low` or `medium` 1h; `high` 3h; `xhigh`, `max` or `ultra` 4h), and a given `--timeout` wins.
-- A codex profile must always receive a codex model that `thoth models` lists. For example: `thoth dispatch TASK --profile codex-a --model MODEL --effort medium --reason "..." --json`. A Claude model or an omitted model is refused. `--allowed-tools` does not apply to codex. Everything after dispatch is the same for all supported profiles.
-- **Antigravity worker** (profile `agy-a`, harness `antigravity`, Google): `thoth dispatch TASK --profile agy-a --model MODEL --effort LEVEL --reason "..." --json`, with MODEL a name `agy models` lists (leave out `--effort` only when that name carries its level).
-  - **Model.** Always pass an agy `--model`, a name that `agy models` lists. Thoth checks it against the model list it read at this login, or the stored list when it cannot read one; a model on neither is refused before the run starts. Only when there is no list at all does Thoth warn that the model is unverified and let it through. Claude aliases and codex names are refused.
-  - **Account.** One agy account per machine user, shared with the human's own agy sessions and their quota. The quota is counted per model group (Gemini models; Claude and GPT models). Thoth reads it only on `thoth profile usage --refresh`, and only after the human has run `thoth config set live-quota on`. The same refresh also asks codex's app-server for each codex profile's live quota (skipped while that profile has a live run).
-  - **Tool lock.** `--allowed-tools` left at its default maps to the agy implementer list. It is enforced by a PreToolUse hook (`.agents/hooks.json`), and each blocked call becomes a `tool_denied` event plus `run_usage.tools_denied`. With `run_command` allowed the lock is a guard rail, not a sandbox.
-  - **Evidence.** Command exit codes come from agy's own transcript. An unknown code is null plus a `command_exit_code_unknown` event, and `thoth verify` is the backstop.
-  - **Reviewer.** `review start TASK --profile agy-a --model MODEL --effort LEVEL --reason "..."` (MODEL from `agy models`) gives a reviewer with no shell and no write tools. Like the codex reviewer, it reads `.agent/review-input/`, and its verdict is agy's `structured_output`.
-- Run `thoth wait TASK --timeout 9m --json` and read `status`. Exit code 3 means it is still running; call it again. A tool call must not exceed ten minutes.
-- Never dispatch while a run for the task is live.
-- Worker tools are restricted by `--allowed-tools` (by default `Bash,Read,Write,Edit,Glob,Grep`, without MCP or subagents). Add a tool only when the task needs it. `review packet` and `status` expose `subagents_spawned`; a value above zero means the worker delegated.
+1. A profile of another provider than the implementer's that has quota and whose tooling can do this job, at that provider's middle model and a medium effort: you switch provider for a different training, not for the most expensive model.
+2. When no other provider can be used, do not wait for its quota to reset: stand in with the implementer's provider now, in a new clean run, using a model stronger than the implementer's (judged from the external tables' rows under each model; for example sonnet implemented, opus reviews) or the implementer's model at a higher effort. A stand-in may use an expensive model.
 
-## 3. Route on `status`
+The same model at the same effort never reviews its own work. When one of these is available, start the review now: never wait for some profile's quota to reset. The `--reason` names the step of the order you reached.
 
-| status | what you do |
-|---|---|
-| `in_review` | Continue to step 4. |
-| `unverified` | Run `thoth events --since 0 --task TASK --json` and inspect the `result_invalid` event's `detail.rule` and `detail.reason`. Re-dispatch with the same command; this keeps the attempt and quotes the reason to the worker. If it happens again, add a constraint naming what evidence to cite with `thoth task update-spec TASK -f SPEC --json`, then dispatch. `review record` is valid only from `in_review`. |
-| `interrupted` | Run `thoth status TASK --json` and inspect `runs[].interrupted_reason`. For `quota`, read the run's `next_step` and `profiles_with_quota` and move on now to a profile that still has quota: an implementer run is dispatched again (`thoth dispatch TASK --profile OTHER --model MODEL --effort LEVEL --reason "..." --json`, the effort only where the model needs one); a reviewer or spec reviewer run is started again with `review start` or `spec review start`, choosing the reviewer as in step 4, never resumed. Only when no registered profile has quota on any model it can run, tell the human and wait until quota comes back; do not try a launch before that. Then a resumable interrupted implementer run continues with `thoth resume RUN --json` (if that is far off, end your turn after telling the human and resume in a later turn); an implementer run with no session to resume is dispatched again, and a reviewer or spec reviewer run is always started again. For `crash`, run `thoth resume RUN --json` once and report a repeat. Dispatching again from `interrupted`, to the same or another profile, makes Thoth write `.agent/handoff.md` for the new worker and add `handoff` to the dispatch output; the old run can no longer be resumed after that. |
-| `failed` | Read `runs[].error_text` and `runner-error.log` under `runs[].run_dir`, then report before retrying. To abandon it, run `thoth task close TASK --reason "..." --json`; it is accepted only from `failed`, `interrupted`, `unverified` and `reject`, and only after all runs stop. It becomes `cancelled` and leaves `thoth status`, but its worktrees stay; later remove them as in step 5. Dispatching again from `failed`, to the same or another profile, makes Thoth write `.agent/handoff.md` for the new worker and add `handoff` to the dispatch output; the old run can no longer be resumed after that. |
-| wait keeps exiting 3 | Run `thoth events --since N --task TASK --json`, using the previous `last_seq` (or 0 initially). New events mean progress, so keep waiting. Otherwise allow the run's own timeout; the run and task then become `failed` with `interrupted_reason` `timeout`, and `resume` refuses a failed run. After reporting a timed-out failure, dispatch again to reuse the attempt and worktree; that dispatch, to the same or another profile, makes Thoth write `.agent/handoff.md` and add `handoff` to the dispatch output, and the old run can no longer be resumed. `thoth cancel RUN` is final and requires a new task to retry; to abandon cleanly, use `task close` after the run stops and remove worktrees in step 5. |
+When a profile has no quota, start the next entry or profile now; only when no profile has quota anywhere, tell the human.
 
-## 4. Review
+## Heavy path: important or high risk
 
-First run `thoth recommend --role reviewer --task TASK --json`. For a code review or a spec review, at any risk, you choose the reviewer in this order:
+`pipeline new` refuses these. Run `thoth task create`, then the spec review gate: `thoth spec review start TASK --edit ...` and `thoth spec review confirm` when it proposes edits, before the first `pipeline start`. An APPROVE spec review is required. Then:
 
-1. A profile of another provider than the implementer's that has quota and whose harness can do this review. Use that provider's middle model and a medium effort, not its most expensive model or its highest effort: you switch provider for a different training, not for the most expensive model.
-2. When no other provider can be used, do not wait for its quota to reset: stand in with the implementer's provider now, using a model stronger than the implementer's (judged from the external tables' rows under each model; for example sonnet implemented, opus reviews) or the implementer's model at a higher effort. A stand-in may use an expensive model.
+```
+thoth pipeline start TASK --implementer P:MODEL:LEVEL --implementer P2:MODEL:LEVEL --reviewer OTHER:MODEL:LEVEL --reviewer STANDIN:MODEL:LEVEL --verify-timeout 120m --reason "..." --json
+```
 
-The same model at the same effort never reviews its own work. When one of these is available, start the review now: never wait for some profile's quota to reset. The `--reason` says which step of the order you reached and why.
+- Give both lists as flags: no stored default fills a list at these risks. Thoth walks both lists forward and picks nothing: a REJECT is reworked on the next implementer entry, a quota or auth stop moves to the next entry, a reviewer entry with the implementer run's model and effort is skipped, and with no entry left it stops (`implementers_exhausted` / `reviewers_exhausted`) instead of waiting for a reset.
+- `--max-attempts N` is the attempt ceiling you authorise; never add `--allow-attempt` without that decision.
+- A REJECT stops `spec_rewrite_needed` until you rewrite the spec (`thoth task update-spec`), unless you started with `--fold-on-reject`.
+- `--verify-timeout` needs room for the whole suite; `--quota-threshold N` skips an entry whose window is N% used or more.
+- `thoth pipeline stop TASK` stops before the next launch and cancels no worker. A `stale` pipeline (its process died): run the same `pipeline start` again.
 
-A batch of related tasks may also be reviewed by the same provider while it is in progress, and then, once all of it is merged, by another provider in a single review of everything the batch merged. That review reports only problems that make something go wrong: each finding gives the concrete failing case (which input, which state, what wrong result) and its severity; style, naming and wording are not reported.
+## When the pipeline stops
 
-Build input in the commander's temporary directory with `thoth review packet TASK --out PACKET.md`. It contains the spec and AC ids, evidence excerpts including failed commands, all attempt diffs, current claims, and earlier reviews; it intentionally omits the worker summary. Do not assemble it manually.
+- `needs_approval`: read `thoth review packet TASK`, approve with `thoth checks approve --run RUN --reason TEXT` yourself, the reason saying what changed, why it is right and which AC answers it. Never approve a deleted or loosened assertion the spec did not ask for: record REJECT with it as a finding. Then run the same `pipeline start` again.
+- `needs_fix_confirmation`: the reviewer left a fix. Verify it yourself (`thoth verify EDIT_RUN --json`, approving its protected changes as above) and confirm it with `thoth review confirm` and a model other than the one that wrote the fix, or drop a wrong fix with `thoth review start TASK --no-edit ...`. The pipeline never confirms over a pending fix.
+- `spec_rewrite_needed`: rewrite the spec with `thoth task update-spec`, then `pipeline start` again.
+- `attempts_exhausted`: decide whether to authorise more attempts, rewrite the spec, or close the task.
+- `implementers_exhausted` / `reviewers_exhausted`: start again with entries that have quota now.
+- Anything else: read `stop.next`; open `thoth review show`, `thoth evidence list` or `thoth events` only for detail. Never fix even a one-line defect yourself.
 
-Before building the packet, run `thoth verify RUN --json`. It re-runs this repository's **approved checks** in the run's worktree (the ids in the spec's `checks`; without that field, every approved check) and records them as new evidence codes the reviewer can cite. It never runs the commands the worker declared: those come back under `worker_declared`, for reference only.
+## By hand: pointers and the statuses the pipeline does not settle
 
-A check that was not run has `error` set and `exit_code` null. Route on the error:
+A docs, research or review task, or a step you want to see, runs by hand. Each pointer is a heading of `docs/adapter-usage.md`:
 
-| error | what you do |
-|---|---|
-| `check X is not approved` | Decide yourself (below). If the check is right, run `thoth checks approve --reason "..."`, then run `verify` again. |
-| `fingerprint mismatch for check X: ...` | The check's program, command or an input file is not what was approved. Read which lines differ. If the spec or the human asked for that change, run the `thoth checks approve --run RUN --reason "..."` command the error prints, then run `verify` again. If not, that change is a finding. |
-| `no approved checks for this repository` | Propose checks (below), approve them with a reason, then run `verify` again. |
-| `missing_since_last_verify` is not empty | An approved check was removed or replaced since the previous verify, so this verify ran fewer checks. Name each one to the human in your report; only a human can decide that was intended and re-add and approve it. It is not a failure of this run. |
+- Dispatch and `--allowed-tools`: `thoth dispatch TASK --profile ID [--model MODEL] [--effort LEVEL] [--reason TEXT] --json`. **Antigravity worker** (tool lock, evidence, account): the same heading, always with a `--model` that `agy models` lists; the lock is "Worker tool lock, and the usage events" in `docs/phase2/usage.md`.
+- Waiting, and the events check when wait keeps exiting 3: `thoth wait TASK --timeout 9m --json`, `thoth events --since N --task TASK --json`. Status keys and `runs[]`: `thoth status TASK --json`.
+- Verify, check and protected-change approval, review start, reviewer fixes: `thoth review start TASK --profile ID [--model MODEL] [--effort LEVEL] [--reason TEXT] [--edit | --no-edit] --json` / `thoth verify RUN --json`; `thoth review confirm TASK --profile ID --model MODEL [--effort LEVEL] [--reason TEXT] [--timeout DURATION] --json`; `thoth checks add | approve | list | remove` (additive). The packet: `thoth review packet TASK [--out FILE] [--json]`.
+- Spec review and lint: `thoth spec review start TASK --profile ID [--model MODEL] [--effort LEVEL] [--reason TEXT] [--timeout DURATION] [--edit] --json`, `thoth spec review confirm TASK --profile ID --model MODEL [--effort LEVEL] [--reason TEXT] [--timeout DURATION] --json`, `thoth spec lint FILE [--json]`.
+- Tasks: `thoth task create -f SPEC.json --title TITLE --json`, `thoth task update-spec TASK -f SPEC.json --json`, `thoth task close TASK --reason TEXT --json`, `thoth resume RUN --json`, `thoth cancel RUN --json`.
+- The pipeline's keys, continuation, ownership and verify slots: `thoth pipeline start TASK ...`, "Continuation (AUTO-1b)", `thoth pipeline show TASK [--wait D] [--json]`, "Pipeline ownership (additive refusal, AUTO-1a)", "Verify slots (AUTO-1a)".
 
-You approve checks and protected test changes yourself, always with `--reason`; the approval, who made it and the reason are shown to the reviewer in the packet's Approvals section.
+`thoth verify RUN --json` re-runs the approved checks and records new evidence codes the reviewer can cite. On a pre-existing or platform failure, do not run the check on the task's `base_commit` by hand: `thoth verify RUN --at-base --json` runs them in a temporary worktree at `base_commit`, labelled `verify@base:`; tell the reviewer to judge by no new failures.
 
-- Approve when the change is what the spec or the human asked for in the conversation: a new check the spec requires, a changed dependency, a version bump.
-- The reason says what changed, why it is right, and which AC or which request it answers.
-- Do not approve a deleted or loosened assertion the spec did not ask for: record REJECT with it as a finding. Never approve only so that a check passes.
-- Ask the human only when you cannot tell.
+Codex and Antigravity reviewers cannot run thoth: Thoth writes the packet and evidence into `.agent/review-input/`. A codex review listing every cited code as `unopened_citation` is expected.
 
-While a decision is open, the task stays `in_review` and you record no verdict.
+`interrupted` for quota: move to a profile with quota now; a resumable run continues with `thoth resume RUN --json` (if quota is far off, tell the human and resume in a later turn). `failed`: read `runs[].error_text`; after a timeout `resume` refuses a failed run, so dispatch again. To abandon, `thoth task close TASK --reason "..." --json` is accepted from `failed`, `interrupted`, `unverified` and `reject`; the task leaves `thoth status` but keeps its worktrees.
 
-Before a review, in this order:
+## Recording a review by hand
 
-1. Run `verify` (above).
-2. Build a first packet with `thoth review packet TASK --json` and read the `protected_changes` entries of the run under review.
-3. No entries, or only `check_input` ones (verify's fingerprint check and its automatic acceptance handle those): nothing to approve.
-4. `test` or `check_word` entries: read those diffs. One approved earlier needs nothing more (`checks approve --run` lists it under `protected_unchanged`, and `review start` does not wait for it). A right change: `thoth checks approve --run RUN --reason "..."`. A wrong one: REJECT.
-5. After approving, build the final packet for the reviewer, so it has the Approvals section.
-
-`review start` and a PASS `review record` refuse while a `test` or `check_word` change of the run is not approved, and the refusal prints the command to run. The approval belongs to that run: a rework run with the same change needs its own.
-
-To propose a check: `thoth checks add ID --cmd "PROGRAM ARGS" [--shell argv|cmd|powershell|sh|bash] [--exe-pin path] [--input PATH]... --json`, then approve it with `thoth checks approve --reason "..."`. For a program outside the repository that updates itself (Claude Code's `claude`), `--exe-pin path` pins its path and not its bytes; it is approved the same way, with a reason, and a program inside the repository or a worktree, or written as a relative path, is refused. `thoth checks list` shows what exists. With a shell other than `argv`, the command is one program plus plain arguments; put shell syntax in a script file and add the script as the check. To have a narrower command re-run, add it as its own check and list its id in the spec's `checks`.
-
-If the approved checks cannot pass on this machine because of a pre-existing or platform failure, do not run the check on the task's `base_commit` by hand. Use `thoth verify RUN --at-base --json`, which re-runs the approved checks in a temporary worktree at `base_commit` and records evidence labelled `verify@base:`. Give the reviewer those codes (next to any plain `verify` ones) and tell it to judge the criterion by its intent: no new failures compared with the baseline.
-
-When the host supports subagents, use a read-only reviewer in a fresh context (an Explore-type subagent in Claude Code). Give it the packet path and permission to run `thoth evidence show CODE --task TASK --bytes 200000 --json`. Tell it that new or changed tests must check behaviour through the interface (a CLI command, its `--json` output, or a public function), and that a test reading the database or other internal state directly, only comparing a fixed string, only checking the exit code, or repeating the implementation's logic is a finding with category `test_interface`. After rework, tell it to check earlier findings. Do not hand it the worker summary as evidence. When an AC asks for something the delivery itself must contain (for example a mapping from ACs to tests), let it read the delivered result with `thoth task result TASK --run RUN --json` and tell it that the content proves only what the worker wrote: behaviour still needs an evidence code from the candidate or a verify row. When the host has no subagent facility, always use `thoth review start` with a registered profile chosen in the order above; never ask a profile to review work it dispatched. Pass a model for the reviewer's harness. Codex and Antigravity reviewers cannot run thoth: Thoth writes the packet, every evidence blob and the target run's whole recorded delivery, masked, into `.agent/review-input/` for them (`.agent/review-input/result.json`), and their prompt says the same about delivered content, that a check that completed with exit code 0 and no recorded execution error passed even with no output (a refused, timed-out or incomplete-output check shows its error under its packet entry and at the top of its evidence file, even beside exit code 0 and output, and does not count), and, when the spec's `checks` list `linux-container`, that it covers Linux clippy and `tests/install_scripts.rs` only. A codex `thoth review show` listing every cited code as `unopened_citation` is expected, not a warning sign; an Antigravity verdict comes from its `structured_output`.
-
-The review must be exactly this shape:
+Shape rules, `fix_size`, categories and the two classes (blocking and advisory) are under the `docs/adapter-usage.md` headings `thoth review record TASK -f REVIEW.json --json` and `thoth review show TASK [--full] --json`.
 
 ```json
-{
-  "verdict": "REJECT",
-  "findings": {
-    "criteria": [
-      {"id": "AC1", "verdict": "met", "evidence": ["E008"]},
-      {"id": "AC2", "verdict": "unmet", "evidence": ["E008"], "note": "tests/triple.rs asserts triple(7) == 14; expected 21", "fix_size": "S", "category": "spec_mismatch"}
-    ],
-    "extra_findings": [
-      {"severity": "minor", "note": "what else", "evidence": ["E008"], "fix_size": "S", "category": "docs"}
-    ]
-  }
-}
+{"verdict": "REJECT", "findings": {"criteria": [
+  {"id": "AC1", "verdict": "met", "evidence": ["E008"]},
+  {"id": "AC2", "verdict": "unmet", "evidence": ["E008"], "note": "asserts 14; expected 21", "fix_size": "S", "category": "spec_mismatch"}
+], "extra_findings": []}}
 ```
 
-Rules: `verdict` is `PASS`, `REJECT`, or `UNVERIFIED`; every AC id appears exactly once; `met` cites evidence; `unmet` cites evidence or has a note; codes belong to this task; and `PASS` requires every AC to be met. Only a blocking finding is a reason to REJECT (see the two classes below): REJECT when at least one unmet AC or extra finding is blocking; PASS when every AC is met and no extra finding is blocking, advisory extra findings going with the PASS. When an AC's only gap is advisory, judge it met and record that gap as an extra finding of that category. Keep only actionable defects in `extra_findings`: each entry is folded into the worker's rework prompt, so drop "no issue found" remarks and observations the worker cannot act on.
+Every AC id once; `met` cites evidence; PASS needs every AC met and no blocking finding. Each extra finding is folded into the worker's rework prompt, so keep only actionable ones. Write it to a temporary file and run `thoth review record TASK -f REVIEW --json`.
 
-Label every unmet criterion and every extra finding with `fix_size` and `category`; a `met` criterion needs neither. `fix_size` is the smallest fix that would resolve it: `S` (at most 10 changed lines in one file), `M` (at most about 50 changed lines, or more than one file, no design change), `L` (larger, or it needs a design or spec change). `category` is one of `spec_mismatch`, `spec_error`, `test_missing`, `test_incomplete`, `test_interface`, `error_path`, `concurrency`, `platform`, `docs`, `evidence`, `check_not_run`, `files`, `security`, `other`. Case does not matter. A finding without them is still accepted, but `thoth retro` counts it as `unsized` and `unclassified`; any other value is refused.
+## After the verdict
 
-The categories come in two classes. Blocking (the behaviour would be wrong): `spec_mismatch`, `spec_error` (the spec itself needs changing, not the implementation redoing), `test_missing` (a new or changed behaviour has no test at all that would fail on the old code), `error_path`, `concurrency`, `platform`, `security`, `files`, `check_not_run` (a check the spec's `checks` lists did not run on the run under review). Advisory (a note to fix later): `test_incomplete` (the behaviour has such a test, but it misses some cases or branches), `test_interface`, `docs`, `evidence` (any other missing evidence, including a command an AC or constraint names), `other`. A finding with no category counts as blocking. Thoth takes the verdict as given: a REJECT with only advisory findings still settles `reject`, and the `verdict` event's `has_blocking_findings` (`thoth events --task TASK --json`) shows whether a blocking finding came with it.
-
-Required checks are the one rule Thoth enforces. A check the spec's `checks` lists ran only when a `thoth verify RUN` of the run under review (not `--at-base`) recorded it with an exit code and no error; a check that ran and failed ran. `checks_not_run` in `thoth review packet TASK --json` lists the ones that did not (`no_verify_row`: never verified there; `did_not_complete`: refused, timed out or incomplete). For each, write one extra finding with category `check_not_run` (check id and reason in the note) and give REJECT. `review record` refuses (stage `required_checks`, task left `in_review`) a report that has such checks and is not a REJECT with a `check_not_run` finding, or has a `check_not_run` finding without a REJECT; a Thoth reviewer run's report like that lands the task `unverified`. To avoid it, run `thoth verify RUN --json` before the review.
-
-Write the review to a temporary file and run `thoth review record TASK -f REVIEW --json`; read `task_status`. Correct any refused shape and record again.
-
-For high risk, review locally but do not record it. Run `thoth review start TASK --profile OTHER_PROFILE --model MODEL --effort LEVEL --reason "..." --json`, then `thoth wait --run RUN --timeout 9m --json`; Thoth's reviewer settles the task (on a code task it is in edit mode, so a REJECT may leave a pending fix: see "Reviewer fixes" below). Choose that reviewer in the order at the start of this step. If its verdict disagrees with yours, stop and ask the human.
-
-**Reviewer fixes.** On a code task (no `task_type`, or one that is not `docs`, `research` or `review`), `thoth review start TASK --profile OTHER_PROFILE --model MODEL --effort LEVEL --reason "..." --json` is in edit mode by default (the same as `--edit`; MCP `thoth_review_start` with `edit` left out or true): the reviewer may attach a small fix to a REJECT instead of sending the task back for a whole attempt. Add `--no-edit` (MCP `edit` false) for a plain review that attaches no fix. A `docs` or `review` task is a plain review unless you add `--edit`, and then its fix goes through the same steps below; while that fix is pending, `thoth task accept` refuses the task until you verify and confirm it. A `research` task cannot attach a fix: `--edit` is refused. `thoth verify EDIT_RUN` runs the spec's `checks` when the list is not empty, otherwise every check in the catalogue, whatever the task type; to check a document task's fix with its document checks only, list those ids in its spec's `checks`. When `thoth wait --run EDIT_RUN --timeout 9m --json` shows `pending_fix` true, run `thoth verify EDIT_RUN --json` (the checks run in the fix worktree), then read the `protected_changes` entries of EDIT_RUN in `thoth review packet TASK --json`: a fix that adds to a test file or changes an inline test region lists them there, and `review confirm` is refused until you approve a right one with `thoth checks approve --run EDIT_RUN --reason "..."` (an approval of the implementer run does not cover the fix); for a wrong one, do not confirm, settle the task with a plain review instead (`thoth review start TASK --no-edit ...`). Then run `thoth review confirm TASK --profile P2 --model M2 --effort E2 --reason "..." --json` with a model other than the one that wrote the fix (the edit review's model at the edit review's effort is refused). A PASS names `merge_branch` and `merge_commit` in `thoth review show TASK`; read that change, then merge that branch instead of `thoth/TASK/aN`. A fix may change at most 40 lines in 3 files, an existing test file may only gain lines, spec files are never changed, and a fix must cover every blocking unmet criterion and every extra finding that is neither minor nor advisory (a finding with no category counts as blocking; otherwise it is refused and the task is redone). Advisory findings need no fix, and a confirmed PASS keeps the ones the fix did not touch; the refusal reasons are under `docs/` in the Thoth repository ("Reviewer fixes, author confirms" in `docs/phase2/usage.md`, `review confirm` in `docs/adapter-usage.md`).
-
-## 5. After the verdict
-
-- On `reject`, dispatch again to start attempt N+1 from the candidate; the first launch of the new attempt gives `--model`, `--effort` and `--reason`. At low or normal risk, findings are included automatically. At important or high risk, read `thoth review show TASK`, incorporate agreed findings into a rewritten spec with `thoth task update-spec TASK -f SPEC --json`, then dispatch. A further rejection requires another update. Return to step 2.
-- Thoth never steps up the model or effort by itself; you decide, from `thoth recommend --role implementer --task TASK --json`'s `task_history` (`rejects` says how many times the task was rejected, `last_implementer` what the rejected run used). When the worker made the mistake, step up one effort level the model supports; at its highest level, switch to a stronger model. For example, if the attempt ran on `haiku` and the mistake looks like a weak-model error, dispatch the rework with `--model sonnet --effort medium`. When the spec was wrong, fix it with `update-spec` and dispatch again at the same level, saying so in `--reason`. `UNVERIFIED` is not a rejection: do not step up for it.
-- On `pass`: merge `thoth/TASK/aN` into the task's `base_branch` and run tests on the merged tree. Then, from the main working tree (not from inside a worktree), run `thoth worktrees prune --json` instead of removing worktrees or branches by hand. It removes the clean worktrees of finished tasks, first removing any directory link inside them (a `node_modules` junction, for example) without touching what it points to, and deletes each finished task's local `thoth/TASK/aN` branches whose work is already in the base branch. Read `removed_branches`, `kept_branches` and `kept`, and tell the human every item it kept and why: a `kept` entry is a worktree path (a `runs[].worktree` of `thoth status TASK --json`) with a `reason` such as `uncommitted_changes` or `link_unremovable`; a `kept_branches` entry has `branch_unmerged`, `branch_checked_out`, `no_base_branch`, `branch_is_a_base` or `branch_delete_failed`, with a `detail` for a failure. Do not force-remove a kept worktree or delete a kept branch yourself; report it.
-- Advisory findings (`test_incomplete`, `test_interface`, `docs`, `evidence`, `other`) need no fix before the merge, and the reviewer is not asked to attach one. Read them from `advisory` in `thoth review show TASK --json` (`blocking` lists the required ones, as AC ids and `extra_findings[N]`). After merging, collect them into the small-fixes list of the repository's backlog and fix a batch of them at a time. A rework at low or normal risk gives the worker the advisory findings as a separate, optional list; only blocking ones count towards a stuck task.
-- After each recorded review and merge, run `thoth report`. It writes `report.html` in the state directory; tell the human its path on the first run; `thoth report --open` opens it in their browser.
-- Once a week, run `thoth retro --json`. For every category with `suggest_check` true (the same kind of finding seen twice or more, even in one task's reworks), propose a lint rule or a check to the human.
-
-## Optional: run a task to the end
-
-Instead of walking steps 2 to 5 by hand, you may hand one code task (queued, in_review, reject, unverified, interrupted or failed) to a background pipeline. It runs the same commands for you and comes back with a short conclusion. The manual loop above stays the reference; use it whenever you want to look at each step.
-
-```
-thoth pipeline start TASK --implementer IMPL_PROFILE:MODEL:LEVEL --implementer NEXT_PROFILE:MODEL:LEVEL --reviewer OTHER_PROFILE:MODEL:LEVEL --reviewer STANDIN_PROFILE:MODEL:LEVEL --verify-timeout 120m --reason "why these choices" --json
-thoth pipeline show TASK --wait 9m --json
-```
-
-- You choose every entry and their order; Thoth walks both lists forward in that order and picks nothing: no ranking, no reordering, no wrapping. A REJECT is reworked on the next implementer entry, a quota or auth stop hands over to the next entry, a crash is resumed once, a timeout is retried once at twice its limit, and a reviewer that stops is replaced by the next reviewer entry. The implementer list is the whole budget for rework and hand-over: list an escalation (a stronger model or effort) where you want it, and repeat an entry to allow it again.
-- Put the reviewer order of step 4 into the list: another provider at a middle model and effort first, a same-provider stand-in (claude-a or claude-c, not claude-b) after it. A reviewer entry with the implementer run's model and effort is skipped. When no entry is left the pipeline stops at once (`implementers_exhausted` / `reviewers_exhausted`) with every entry and why; it never waits for a quota reset.
-- Before each launch it reads `thoth recommend` (and with `--quota-threshold N`, `thoth profile usage`) for the entry you named only, as facts: an ineligible entry (the quota reserve included) or one whose quota window is at least N percent used is skipped. Unknown quota does not hold an entry back; the launch's own checks still decide.
-- `--max-attempts N` is the attempt ceiling you authorise; it adds `--allow-attempt` only up to it. At important/high risk a REJECT stops `spec_rewrite_needed` until you rewrite the spec, unless you started with `--fold-on-reject`: then the findings are appended unchanged to the spec's constraints, and three REJECTs in a row on the same criterion stop `repeated_reject`. Dispatch's own stuck rule stops `stuck`.
-- `--reason` is required and is sent with every launch; a rework, hand-over or retry adds its cause and the entry position. `thoth resume` takes no reason, so the pipeline records it on its `resume` step.
-- Leave `--timeout` and `--review-timeout` out unless you need a limit: the launch commands keep their effort-based default. Give `--verify-timeout` enough room for the whole suite. Set the build parallelism you want (for example `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS`) in the shell that starts the pipeline; verify inherits it.
-- Read `stop.reason`, `stop.summary` and `stop.next` first; open `thoth review show`, `thoth evidence list` or `thoth events` only when you need the detail. `pass` names the exact `merge_branch` and `merge_commit` to merge.
-- `needs_approval`: read `thoth review packet TASK`, approve with `thoth checks approve --run RUN --reason TEXT` yourself, then run the same `pipeline start` again; it continues that candidate.
-- `needs_fix_confirmation`: the pipeline's review of a code task is in edit mode (it adds neither `--edit` nor `--no-edit`), so its reviewer may leave a fix; verify the edit review run and run `thoth review confirm` as in step 4, or, to drop a wrong fix, settle the task with `thoth review start TASK --no-edit ...`. The pipeline never confirms, folds or re-dispatches over a pending fix.
-- `pipeline show` reports `implementer_index`, `reviewer_index` (positions in your lists), `attempts_used`, and per step `entry_index` and `skipped`; select steps by `kind`.
-- `thoth pipeline stop TASK` stops before the next launch and cancels no worker. A pipeline whose process died shows `stale`; start it again with the same command. While a pipeline runs, commands that would change its task are refused; stop it first.
-- With MCP: `thoth_pipeline_start` (lists as arrays; `quota_threshold` an integer, `fold_on_reject` a boolean), `thoth_pipeline_show` (`wait_seconds`; a timed-out wait is not an error) and `thoth_pipeline_stop`.
+- On `pass`, merge and test the merged tree, then from the main working tree run `thoth worktrees prune --json` (its heading in `docs/adapter-usage.md`); report each `kept` path (a `runs[].worktree`) and kept branch, never force-remove it.
+- After each merge run `thoth report` (`thoth report --open` opens it). Weekly, run `thoth retro --json` and propose a check for each `suggest_check`.
 
 ## Using the MCP tools
 
-When tools whose names begin with `thoth_` are available, they may replace matching CLI commands. For example, `thoth task create` maps to `thoth_task_create`, and `thoth review record` maps to `thoth_review_record`. `thoth resume` maps to `thoth_resume`. They return the same document as the CLI's `--json` output. Pass spec and review JSON directly as objects rather than writing files. Pass `repo` as the absolute path of the work tree you are running in: inside a linked worktree that is the worktree's own path, not the main repository's. A new task starts at the HEAD of that work tree. Without `repo`, the server's default repository is used.
-
-Each `thoth_wait` call has a time limit. The CLI's exit code 3 is represented by `timed_out: true`; call `thoth_wait` again. `thoth_wait` takes `timeout_seconds` (a number), not the CLI's `9m`. `thoth_review_packet` returns a file path. `verify` takes two steps: `thoth_verify_start` starts the approved checks in the background and returns a `job_id` at once, then `thoth_job_status` (with `wait_seconds`) reports the job until its `status` is no longer `working`: `completed` (the verify document is in `result`), `failed` or `unknown`. The check catalogue has `thoth_checks_list`, `thoth_checks_add`, `thoth_checks_approve` and `thoth_checks_remove`; a check added this way is pending. Approve with `thoth_checks_approve`: `reason` is required, and `run` (optional) reads that settled run's worktree and also approves the protected test files that run changed. Commands with no MCP tool are still run through the CLI, for example `checks protect`.
+`thoth_pipeline_new` (`spec` as an object or `file` as an absolute path, `reason` required; returns at once), `thoth_pipeline_start` (lists as arrays; a list left out uses the stored default at low or normal risk), `thoth_pipeline_show` (`wait_seconds`; a timed-out wait is not an error) and `thoth_pipeline_stop` match the CLI, as do `thoth_task_create`, `thoth_review_record` and `thoth_resume`; they return the CLI's `--json` document. Pass `repo` as the absolute path of the work tree you run in. `thoth_wait` takes `timeout_seconds` (a number); `timed_out: true` means call again.
 
 ## Common mistakes
 
 | mistake | instead |
 |---|---|
-| Markdown spec, or reading `id` from task creation | JSON spec; read `task_id` |
-| `approve`, `not_met`, or criteria at top level | use the exact review shape above |
-| `wait --timeout 30m` | use `9m`, then call again after exit 3 |
-| `review record` on `unverified` | re-dispatch; record only from `in_review` |
-| `update-spec` before every low-risk rework | findings are folded automatically at low or normal risk |
-| expecting Thoth to choose the profile, model or effort, or leaving out a `--model` or `--effort` the first launch needs | choose them yourself from `thoth recommend` and give them on every first launch |
-| a launch without `--reason` | every `dispatch`, `review start` and `spec review start` says why this profile, model and effort |
-| waiting for a used-up profile's reset when another profile has quota | dispatch again now on a profile with quota; for a review, take the next reviewer in the order of step 4; only when no profile has quota anywhere, tell the human and wait (step 3) |
-| `cancel` to restart a slow run | cancellation is final; let it time out, then dispatch again |
-| guessing the branch name | use `thoth/TASK/aN` |
-| fixing even a one-line defect yourself | record REJECT and send it back |
-| approving with a reason like "ok" or "needed" | say what changed, why it is right, and which AC or request it answers |
-| approving a loosened test so that a check passes | record REJECT with the loosened assertion as a finding |
-| expecting `verify` to run a command the worker declared | `verify` runs approved checks only; add the command as a check and approve it with a reason |
+| Markdown spec, or reading `id` | JSON spec; read `task_id` |
+| `--wait 30m` or `--timeout 30m` | `9m`, then call again after exit 3 |
+| a launch or pipeline without `--reason` | say why this profile, model and effort |
+| waiting for a used-up profile's reset | start the next entry or profile now |
+| `cancel` to restart a slow run | cancellation is final; let it time out |
+| approving with "ok" or "needed" | say what changed, why it is right, which AC |
+| fixing a one-line defect yourself | record REJECT and send it back |

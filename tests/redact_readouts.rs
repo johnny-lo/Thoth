@@ -37,7 +37,8 @@ fn clean(f: &Fixture) -> assert_cmd::Command {
     let mut c = f.cmd();
     for (name, _) in std::env::vars_os() {
         let upper = name.to_string_lossy().to_ascii_uppercase();
-        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+        // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
             c.env_remove(&name);
         }
     }
@@ -204,7 +205,7 @@ struct Server {
 
 impl Server {
     fn start(f: &Fixture, extra_env: &[(&str, &str)], extra_args: &[&str]) -> Self {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .args(extra_args)
             .current_dir(f.repo.path())
@@ -219,7 +220,8 @@ impl Server {
             .stderr(Stdio::piped());
         for (name, _) in std::env::vars_os() {
             let upper = name.to_string_lossy().to_ascii_uppercase();
-            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+            // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
                 c.env_remove(&name);
             }
         }

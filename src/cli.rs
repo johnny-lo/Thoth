@@ -5,6 +5,12 @@ use clap::{Parser, Subcommand};
 /// (`HarnessAdapter::implementer_allowed_tools`).
 pub const DEFAULT_ALLOWED_TOOLS: &str = "Bash,Read,Write,Edit,Glob,Grep";
 
+/// The closing paragraph of the top-level help (CLI-1): the four commands the
+/// main flow does not use are hidden from the Commands list but still work.
+/// Two lines, no indentation, so it cannot be read as part of the list.
+const HIDDEN_COMMANDS_NOTE: &str = "Not listed above, but they still work: submit, decision, transcript, records.\n\
+Run `thoth help COMMAND` for each one's help; they are documented in docs/adapter-usage.md.";
+
 // No Debug here, on `Command` or on `ConfigAction`: the parsed command line
 // can hold an API key pasted after (or instead of) KEY in `config set-secret`,
 // and no `{:?}` may print it.
@@ -12,7 +18,8 @@ pub const DEFAULT_ALLOWED_TOOLS: &str = "Bash,Read,Write,Edit,Glob,Grep";
 #[command(
     name = "thoth",
     version,
-    about = "Control plane for native coding-agent harnesses"
+    about = "Control plane for native coding-agent harnesses",
+    after_help = HIDDEN_COMMANDS_NOTE
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -28,6 +35,7 @@ pub enum Command {
         action: ConfigAction,
     },
     /// Write this computer's run records into the shared records folder (records-dir).
+    #[command(hide = true)]
     Records {
         #[command(subcommand)]
         action: RecordsAction,
@@ -228,6 +236,7 @@ pub enum Command {
         json: bool,
     },
     /// Manually ingest a result.json for a run.
+    #[command(hide = true)]
     Submit {
         #[arg(short = 'f', long = "file")]
         file: std::path::PathBuf,
@@ -242,6 +251,7 @@ pub enum Command {
         action: EvidenceAction,
     },
     /// List what a run's worker did, read from its stream.jsonl; --offset continues from a previous call's next_offset.
+    #[command(hide = true)]
     Transcript {
         run: String,
         #[arg(long, default_value_t = 0)]
@@ -277,6 +287,7 @@ pub enum Command {
         json: bool,
     },
     /// Record a long-lived decision in the repository.
+    #[command(hide = true)]
     Decision {
         #[command(subcommand)]
         action: DecisionAction,
@@ -315,13 +326,13 @@ pub enum Command {
 // No Debug: the reason may hold text the masker has not seen yet.
 #[derive(Subcommand)]
 pub enum PipelineAction {
-    /// Start the background pipeline for a code task that is queued, in_review, reject, unverified, interrupted or failed. Every choice is yours: Thoth walks your --implementer and --reviewer lists forward in order (never ranking, reordering or wrapping), reworks a REJECT on the next implementer entry and moves on from an entry that is ineligible, out of quota or interrupted.
+    /// Start the background pipeline for a code task that is queued, in_review, reject, unverified, interrupted or failed. Every choice is yours: Thoth walks your --implementer and --reviewer lists forward in order (never ranking, reordering or wrapping), reworks a REJECT on the next implementer entry and moves on from an entry that is ineligible, out of quota or interrupted. A list flag left out uses your stored default list (`thoth pipeline defaults set`) on a low or normal risk task.
     Start {
         task: String,
-        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept. Used in order: rework and hand-over take the next entry; a repeated entry authorises reuse.
+        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept. Used in order: rework and hand-over take the next entry; a repeated entry authorises reuse. Left out: the stored default implementer list (low or normal risk only).
         #[arg(long = "implementer", value_name = "PROFILE:MODEL[:EFFORT]", allow_hyphen_values = true)]
         implementers: Vec<String>,
-        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept. Used in order from the first usable entry; one with the implementer run's model and effort is skipped.
+        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept. Used in order from the first usable entry; one with the implementer run's model and effort is skipped. Left out: the stored default reviewer list (low or normal risk only).
         #[arg(long = "reviewer", value_name = "PROFILE:MODEL[:EFFORT]", allow_hyphen_values = true)]
         reviewers: Vec<String>,
         /// Skip an entry whose deciding quota window is at least N percent used (1 to 100; read from `thoth profile usage`, no refresh). Left out: only recommend's eligibility decides.
@@ -351,6 +362,53 @@ pub enum PipelineAction {
         #[arg(long)]
         json: bool,
     },
+    /// Create a code task from a spec file and start its pipeline in one command (the light path). Every input `task create` or `pipeline start` would refuse is refused before anything is created; an important or high risk spec is refused with the heavy-path commands (task create, spec review, pipeline start). Returns at once unless --wait is given.
+    New {
+        /// The spec file, as for `task create -f`.
+        #[arg(short = 'f', long = "file")]
+        file: std::path::PathBuf,
+        /// The task's title; left out, the first line of the goal.
+        #[arg(long)]
+        title: Option<String>,
+        /// Where the task starts, as for `task create --base`.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept, as for `pipeline start`. Left out: the stored default implementer list (low or normal risk only).
+        #[arg(long = "implementer", value_name = "PROFILE:MODEL[:EFFORT]", allow_hyphen_values = true)]
+        implementers: Vec<String>,
+        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept, as for `pipeline start`. Left out: the stored default reviewer list (low or normal risk only).
+        #[arg(long = "reviewer", value_name = "PROFILE:MODEL[:EFFORT]", allow_hyphen_values = true)]
+        reviewers: Vec<String>,
+        /// As for `pipeline start`.
+        #[arg(long = "quota-threshold", value_name = "N", allow_hyphen_values = true)]
+        quota_threshold: Option<String>,
+        /// As for `pipeline start`.
+        #[arg(long = "fold-on-reject")]
+        fold_on_reject: bool,
+        /// As for `pipeline start` (default: the task's attempt_cap).
+        #[arg(long = "max-attempts", value_name = "N", allow_hyphen_values = true)]
+        max_attempts: Option<String>,
+        /// As for `pipeline start`.
+        #[arg(long, value_name = "D", allow_hyphen_values = true)]
+        timeout: Option<String>,
+        /// As for `pipeline start`.
+        #[arg(long = "review-timeout", value_name = "D", allow_hyphen_values = true)]
+        review_timeout: Option<String>,
+        /// As for `pipeline start` (default 120m).
+        #[arg(long = "verify-timeout", value_name = "D", allow_hyphen_values = true)]
+        verify_timeout: Option<String>,
+        /// As for `pipeline start` (default 2h).
+        #[arg(long = "verify-wait", value_name = "D", allow_hyphen_values = true)]
+        verify_wait: Option<String>,
+        /// Why these choices; required even when require-reason is off, and sent with every launch.
+        #[arg(long, allow_hyphen_values = true)]
+        reason: Option<String>,
+        /// After starting, wait up to D for the pipeline to stop, as `pipeline show --wait`; exit 3 if it is still running then.
+        #[arg(long, value_name = "D", allow_hyphen_values = true)]
+        wait: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the task's newest pipeline: a short conclusion first, then its settings and steps.
     Show {
         task: String,
@@ -363,6 +421,42 @@ pub enum PipelineAction {
     /// Ask the task's running pipeline to stop. No worker is cancelled; use `thoth cancel RUN` for that.
     Stop {
         task: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Your default implementer and reviewer lists on this machine (THOTH_HOME/pipeline-defaults.json), used by `pipeline start` for a list flag left out on a low or normal risk task. Not a config setting.
+    Defaults {
+        #[command(subcommand)]
+        action: PipelineDefaultsAction,
+    },
+}
+
+// No Debug: the reason may hold text the masker has not seen yet.
+#[derive(Subcommand)]
+pub enum PipelineDefaultsAction {
+    /// Store a default list: a list whose flag is given replaces that stored list whole (order and duplicates kept); one left out stays as stored.
+    Set {
+        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept.
+        #[arg(long = "implementer", value_name = "PROFILE:MODEL[:EFFORT]", allow_hyphen_values = true)]
+        implementers: Vec<String>,
+        /// PROFILE:MODEL[:EFFORT]; repeatable, order and duplicates kept.
+        #[arg(long = "reviewer", value_name = "PROFILE:MODEL[:EFFORT]", allow_hyphen_values = true)]
+        reviewers: Vec<String>,
+        /// Why these are your defaults; stored with each list this call replaces.
+        #[arg(long, allow_hyphen_values = true)]
+        reason: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read-only: the stored lists, with every entry that no longer passes the entry check on this machine.
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the stored implementer list, reviewer list, or (without --only) both.
+    Clear {
+        #[arg(long, value_parser = ["implementer", "reviewer"])]
+        only: Option<String>,
         #[arg(long)]
         json: bool,
     },

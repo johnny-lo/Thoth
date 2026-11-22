@@ -24,7 +24,8 @@ fn cmd(f: &Fixture) -> assert_cmd::Command {
     let mut c = f.cmd();
     for name in std::env::vars_os().map(|(name, _)| name) {
         let upper = name.to_string_lossy().to_uppercase();
-        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+        // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
             c.env_remove(&name);
         }
     }
@@ -360,7 +361,7 @@ fn an_undeclared_delivery_is_in_review_and_waits_for_the_commanders_approval() {
     ] {
         assert!(prompt.contains(line), "{line}\n{prompt}");
     }
-    assert_eq!(f.wait_for_task_status(&task, &["pass", "reject", "unverified"], 60), "pass");
+    assert_eq!(ok(&f, &["status", &task, "--json"], &[])["status"], "pass");
 }
 
 /// AC1 (submit), AC4's reference-only key: `submit` of a finished run takes
@@ -783,26 +784,6 @@ fn task_create_and_update_spec_refuse_a_large_normal_spec() {
     assert_eq!(events(&f, &task), task_events_before);
 }
 
-/// Stands in for a spec stored before LEAN-1 (when 21KB at normal risk was
-/// only warned about): no command stores one any more, so the fixture writes
-/// the task's row. Everything afterwards is read through the CLI.
-fn store_spec_as_before(f: &Fixture, task: &str, spec: &str) {
-    f.state_conn()
-        .execute("UPDATE tasks SET spec = ?1 WHERE task_id = ?2", [spec, task])
-        .unwrap();
-}
-
-/// The same for a proposed spec an edit review stored before LEAN-1.
-fn store_proposed_as_before(f: &Fixture, task: &str, spec: &str) {
-    f.state_conn()
-        .execute(
-            "UPDATE events SET detail = json_set(detail, '$.proposed_spec', ?1) \
-             WHERE task_id = ?2 AND type = 'spec_review'",
-            [spec, task],
-        )
-        .unwrap();
-}
-
 /// What a refused launch must leave unchanged.
 fn snapshot(f: &Fixture, task: &str) -> (Value, Vec<Value>, Vec<Value>) {
     (ok(f, &["task", "show", task, "--json"], &[]), events(f, task), runs(f, task))
@@ -824,8 +805,16 @@ fn spec_review_start_and_confirm_refuse_a_stored_large_normal_spec() {
         args.into_iter().map(str::to_string).collect::<Vec<String>>()
     };
 
-    let (task, _) = create(&f, SPEC_NORMAL);
-    store_spec_as_before(&f, &task, &big);
+    // a spec stored before LEAN-1 (21KB at normal risk was only warned about):
+    // the debug-only lint switch, for this one command, lets `task create`
+    // store it
+    let file = write_home_file(&f, "stored-big.json", big.as_bytes());
+    let v = ok(
+        &f,
+        &["task", "create", "--title", "lean", "-f", &file, "--json"],
+        &[("THOTH_TEST_SPEC_LINT_PRE_LEAN", "1")],
+    );
+    let task = s(&v["task_id"]);
     let before = snapshot(&f, &task);
     assert_eq!(before.0["spec"], serde_json::from_str::<Value>(&big).unwrap());
     for extra in [&[][..], &["--edit"][..]] {
@@ -840,12 +829,29 @@ fn spec_review_start_and_confirm_refuse_a_stored_large_normal_spec() {
     // confirm: an edit review of a small normal spec, whose proposed spec is
     // then one stored before LEAN-1
     let (task, _) = create(&f, r#"{"goal":"guard the ledger","acceptance_criteria":["AC1: rejects a double spend"],"constraints":["no new crate"],"non_goals":["rewriting the transport"],"excluded_alternatives":[],"risk":"normal"}"#);
+    // the edit review proposes a 21KB constraint: a proposed spec stored before
+    // LEAN-1, made with the debug-only lint switch for this one command
+    let doc = json!({
+        "verdict": "REVISE",
+        "criteria": [{"id": "AC1", "verdict": "ok", "findings": []}],
+        "edits": [{"field": "constraints", "op": "insert", "at": 0, "anchor": "",
+                   "text": "x".repeat(20_900), "criterion": "AC1", "reason": "fixture: a constraint too big"}]
+    });
+    let doc_file = write_home_file(&f, "big-proposal.json", doc.to_string().as_bytes());
     let args = launch("start", &task, &["--edit"]);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let r = ok(&f, &args, &[("FAKE_SCENARIO", "spec_review_edit"), ("FAKE_TASK_ID", task.as_str())]);
+    let r = ok(
+        &f,
+        &args,
+        &[
+            ("FAKE_SCENARIO", "spec_review_doc_file"),
+            ("FAKE_SPEC_REVIEW_DOC", doc_file.as_str()),
+            ("FAKE_TASK_ID", task.as_str()),
+            ("THOTH_TEST_SPEC_LINT_PRE_LEAN", "1"),
+        ],
+    );
     ok(&f, &["wait", "--run", &s(&r["run_id"]), "--timeout", "180s", "--json"], &[]);
     assert_eq!(ok(&f, &["spec", "review", "show", &task, "--json"], &[])["pending_edits"], true);
-    store_proposed_as_before(&f, &task, &big);
     let before = snapshot(&f, &task);
     let args = launch("confirm", &task, &[]);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();

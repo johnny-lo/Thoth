@@ -17,7 +17,8 @@ fn cmd(f: &Fixture) -> assert_cmd::Command {
     let mut c = f.cmd();
     for name in std::env::vars_os().map(|(name, _)| name) {
         let upper = name.to_string_lossy().to_uppercase();
-        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+        // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
             c.env_remove(&name);
         }
     }

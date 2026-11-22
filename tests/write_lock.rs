@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 /// A `thoth` child started in the background, with the environment
 /// `Fixture::cmd` sets for a foreground one.
 fn spawn(f: &Fixture, args: &[&str], envs: &[(&str, &str)]) -> Child {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
     for var in [
         "THOTH_RUN_ID",
         "THOTH_INBOX_DIR",

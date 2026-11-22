@@ -4,9 +4,9 @@
 
 use crate::commands::usage;
 use crate::config::Paths;
-use crate::db::state;
+use crate::db::{reports, state};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 
 pub(crate) struct RunFacts {
@@ -97,32 +97,9 @@ impl TaskHistory {
 }
 
 fn newest_run(conn: &Connection, task_id: &str, role: &str) -> Result<Option<RunFacts>> {
-    let verdict_sql = if role == "reviewer" {
-        "SELECT verdict FROM reviews WHERE reviewer_run_id=r.run_id ORDER BY created_at DESC, review_id DESC LIMIT 1"
-    } else {
-        "SELECT verdict FROM reviews WHERE target_run_id=r.run_id ORDER BY created_at DESC, review_id DESC LIMIT 1"
-    };
-    let sql = format!(
-        "SELECT r.run_id, r.attempt, COALESCE(r.account,''), COALESCE(r.provider,''), COALESCE(r.model,''),
-                r.spec, COALESCE(r.status,''), ({verdict_sql})
-         FROM runs r WHERE r.task_id=?1 AND r.role=?2
-         ORDER BY COALESCE(r.started_at,'') DESC, r.rowid DESC LIMIT 1"
-    );
-    let row = conn
-        .query_row(&sql, [task_id, role], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, Option<String>>(7)?,
-            ))
-        })
-        .optional()?;
-    Ok(row.map(|(run_id, attempt, profile, provider, model, spec, status, verdict)| {
+    let row = reports::newest_run_of_role(conn, task_id, role)?;
+    Ok(row.map(|n| {
+        let reports::NewestRun { run_id, attempt, profile, provider, model, spec, status, verdict } = n;
         let launch = spec.as_deref().and_then(crate::adapter::effort::parse_launch);
         RunFacts {
             run_id,
@@ -147,9 +124,7 @@ pub(crate) fn build(paths: &Paths, repos: &[String], task_id: &str) -> Result<Op
             continue;
         }
         let conn = usage::read_only(&path)?;
-        let exists: Option<String> = conn
-            .query_row("SELECT task_id FROM tasks WHERE task_id=?1", [task_id], |r| r.get(0))
-            .optional()
+        let exists: Option<String> = state::task_id_if_exists(&conn, task_id)
             .with_context(|| format!("looking for task {task_id} in {}", path.display()))?;
         if exists.is_none() {
             continue;

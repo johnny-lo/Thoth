@@ -10,16 +10,23 @@ mod common;
 use common::Fixture;
 use serde_json::Value;
 
-/// `profile login` as a test runs it, without any inherited variable whose
-/// name holds KEY, TOKEN, SECRET or PASSWORD (names only are read).
-fn login(f: &Fixture) -> assert_cmd::Command {
+/// A command without any inherited variable whose name holds KEY, TOKEN,
+/// SECRET or PASSWORD (names only are read).
+fn clean(f: &Fixture) -> assert_cmd::Command {
     let mut c = f.cmd();
     for name in std::env::vars_os().map(|(name, _)| name) {
         let upper = name.to_string_lossy().to_uppercase();
-        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+        // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
             c.env_remove(&name);
         }
     }
+    c
+}
+
+/// `profile login` as a test runs it.
+fn login(f: &Fixture) -> assert_cmd::Command {
+    let mut c = clean(f);
     c.env("THOTH_LOGIN_SKIP_TTY_CHECK", "1")
         .env("FAKE_LOGIN_BY_FILE", "1")
         .env_remove("THOTH_LANG")
@@ -47,7 +54,7 @@ fn run(c: &mut assert_cmd::Command) -> (i32, Value) {
 }
 
 fn profiles(f: &Fixture) -> Vec<Value> {
-    let out = f.cmd().args(["profile", "list", "--json"]).output().unwrap();
+    let out = clean(f).args(["profile", "list", "--json"]).output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     v["profiles"].as_array().unwrap().clone()
 }

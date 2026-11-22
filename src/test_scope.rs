@@ -177,9 +177,9 @@ fn spec_texts(spec_text: &str) -> Vec<String> {
     }
 }
 
-/// The `(name, Some(path))` of every `tests/...` path in `text`, and the
-/// `(name, None)` of every `cargo test --test NAME`.
-fn spec_mentions(text: &str) -> Vec<(String, Option<String>)> {
+/// The `(name, path)` of every `tests/...` path in `text` that is a target
+/// (`tests/NAME.rs` or `tests/NAME/main.rs`), in order of appearance.
+pub fn test_path_mentions(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let path_char = |c: char| name_char(c) || c == '/' || c == '.';
     // paths: `tests/` not preceded by a path character
@@ -193,21 +193,22 @@ fn spec_mentions(text: &str) -> Vec<(String, Option<String>)> {
         let end = text[at..].find(|c: char| !path_char(c)).map(|e| at + e).unwrap_or(text.len());
         // a path ends before trailing dots (end of a sentence)
         let candidate = text[at..end].trim_end_matches('.');
-        if let Some((name, path)) = target_of_path(candidate) {
-            out.push((name, Some(path)));
+        if let Some(found) = target_of_path(candidate) {
+            out.push(found);
         }
     }
-    // `cargo test ... --test NAME` (or `--test=NAME`) up to the end of that
-    // command: a line end, a backtick, or a sentence or list separator
-    let mut from = 0;
-    while let Some(i) = text[from..].find("cargo test") {
-        let start = from + i + "cargo test".len();
-        from = start;
-        let end = text[start..]
-            .find(['\n', '`', ';', '；', '，', '、', '。', '|'])
-            .map(|e| start + e)
-            .unwrap_or(text.len());
-        let words: Vec<&str> = text[start..end].split_whitespace().collect();
+    out
+}
+
+/// The name after each `--test` word (or in each `--test=` word) of every
+/// `cargo test` command in `text`, in order of appearance; a command runs to
+/// the end of that command: a line end, a backtick, or a sentence or list
+/// separator. Scope planning and `spec lint` both read the names through this
+/// one function, so they cannot disagree.
+pub fn cargo_test_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, command) in cargo_test_commands(text) {
+        let words: Vec<&str> = command.split_whitespace().collect();
         let clean = |w: &str| w.trim_matches(|c: char| !name_char(c)).to_string();
         let mut k = 0;
         while k < words.len() {
@@ -215,7 +216,7 @@ fn spec_mentions(text: &str) -> Vec<(String, Option<String>)> {
                 if let Some(next) = words.get(k + 1) {
                     let name = clean(next);
                     if valid_name(&name) && !next.starts_with('-') {
-                        out.push((name, None));
+                        out.push(name);
                     }
                 }
                 k += 2;
@@ -224,12 +225,128 @@ fn spec_mentions(text: &str) -> Vec<(String, Option<String>)> {
             if let Some(v) = words[k].strip_prefix("--test=") {
                 let name = clean(v);
                 if valid_name(&name) {
-                    out.push((name, None));
+                    out.push(name);
                 }
             }
             k += 1;
         }
     }
+    out
+}
+
+/// Every `cargo test` command in `text`, in order: the byte offset just after
+/// `cargo test` and the text from there to the end of the command (a line
+/// end, a backtick, or a sentence or list separator). Scope planning, `spec
+/// lint` and the review packet's spec-named tests all read commands through
+/// this one function.
+pub fn cargo_test_commands(text: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = text[from..].find("cargo test") {
+        let start = from + i + "cargo test".len();
+        from = start;
+        let end = text[start..]
+            .find(['\n', '`', ';', '；', '，', '、', '。', '|'])
+            .map(|e| start + e)
+            .unwrap_or(text.len());
+        out.push((start, &text[start..end]));
+    }
+    out
+}
+
+/// SMALL-17: the test filter of one `cargo test` command, and the target it
+/// is read against (`test:NAME` from `--test NAME` or `--test=NAME`,
+/// `bin:NAME` from `--bin NAME`, `None` without either).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestFilter {
+    /// The byte offset of the command in the text it was read from.
+    pub at: usize,
+    pub name: String,
+    pub target: Option<String>,
+}
+
+/// SMALL-17: the filter of every `cargo test` command in `text` that has one.
+/// A command is read as `cargo_test_commands` cuts it, and also ends after a
+/// word that ends in a comma. The filter is the first word that is no flag and
+/// no flag value: `--test`, `--bin`, `-p`, `--package` and `--features` take a
+/// value, and so does `--skip` after a lone `--`; every other word starting
+/// with `-` is a flag. Trailing `.`, `,`, `;`, `:` and `)` are trimmed; a
+/// word that is not ASCII letters, digits, `_` and `:` starting with a letter
+/// or `_` means the command has no filter.
+pub fn test_filters(text: &str) -> Vec<TestFilter> {
+    let mut out = Vec::new();
+    for (at, command) in cargo_test_commands(text) {
+        let mut words = Vec::new();
+        for w in command.split_whitespace() {
+            words.push(w);
+            if w.ends_with(',') {
+                break;
+            }
+        }
+        let value = |w: &str| {
+            let v = w.trim_matches(|c: char| !name_char(c));
+            valid_name(v).then(|| v.to_string())
+        };
+        let mut target: Option<String> = None;
+        let mut filter: Option<Option<String>> = None;
+        let mut after_dashes = false;
+        let mut k = 0;
+        while k < words.len() {
+            let w = words[k];
+            k += 1;
+            if after_dashes {
+                if w == "--skip" {
+                    k += 1;
+                    continue;
+                }
+            } else if w == "--" {
+                after_dashes = true;
+                continue;
+            } else if let Some(kind) = match w {
+                "--test" => Some("test"),
+                "--bin" => Some("bin"),
+                _ => None,
+            } {
+                if let Some(v) = words.get(k).filter(|n| !n.starts_with('-')).and_then(|n| value(n)) {
+                    target = Some(format!("{kind}:{v}"));
+                }
+                k += 1;
+                continue;
+            } else if let Some((kind, v)) = w
+                .strip_prefix("--test=")
+                .map(|v| ("test", v))
+                .or_else(|| w.strip_prefix("--bin=").map(|v| ("bin", v)))
+            {
+                if let Some(v) = value(v) {
+                    target = Some(format!("{kind}:{v}"));
+                }
+                continue;
+            } else if matches!(w, "-p" | "--package" | "--features") {
+                k += 1;
+                continue;
+            }
+            if w.starts_with('-') || filter.is_some() {
+                continue;
+            }
+            let name = w.trim_end_matches(['.', ',', ';', ':', ')']);
+            let mut chars = name.chars();
+            let ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+            filter = Some(ok.then(|| name.to_string()));
+        }
+        if let Some(Some(name)) = filter {
+            out.push(TestFilter { at, name, target });
+        }
+    }
+    out
+}
+
+/// The `(name, Some(path))` of every `tests/...` path in `text`, and the
+/// `(name, None)` of every `cargo test --test NAME`.
+fn spec_mentions(text: &str) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> =
+        test_path_mentions(text).into_iter().map(|(name, path)| (name, Some(path))).collect();
+    out.extend(cargo_test_names(text).into_iter().map(|name| (name, None)));
     out
 }
 

@@ -316,6 +316,44 @@ fn a_good_codex_run_reaches_in_review_with_stream_evidence() {
 
 // C1b (scope §2.6): thoth commits on the codex worker's behalf ----------
 
+/// SMALL-16: on Linux the codex implementer's prompt says tests that start a
+/// runner cannot run in its sandbox; on Windows, and in a Claude worker's
+/// prompt, that sentence is never there.
+#[test]
+fn the_codex_prompt_carries_the_linux_sandbox_note_only_on_linux() {
+    const NOTE: &str = "Tests that start a runner (for example tests/codex.rs, tests/antigravity.rs, tests/review.rs) cannot run in this sandbox on Linux, because it blocks the systemd user bus and they fail with 'Failed to connect to user scope bus via local transport: Operation not permitted'. Do not try to fix that or investigate systemd: say in your summary which of them you did not run; the commander's verify runs them.";
+    let (f, _cfg, task_id) = setup();
+    let copy = f.home_path().join("codex-prompt.txt");
+    dispatch_codex(&f, &task_id, "ok", &[("FAKE_PROMPT_COPY", copy.to_str().unwrap())]);
+    assert_eq!(f.wait_for(&task_id, "120s").1, "in_review");
+    let prompt = std::fs::read_to_string(&copy).expect("the fake wrote the prompt it received");
+    if cfg!(target_os = "linux") {
+        assert_eq!(prompt.matches(NOTE).count(), 1, "{prompt}");
+        let lines: Vec<&str> = prompt.lines().collect();
+        let at = lines.iter().position(|l| *l == NOTE).expect("the sentence is a line of its own");
+        assert!(lines[at - 1].starts_with("This is a single unattended run:"), "{}", lines[at - 1]);
+        assert_eq!(lines[at + 1], "", "{}", lines[at + 1]);
+        assert_eq!(lines[at + 2], "## Evidence", "{}", lines[at + 2]);
+    } else {
+        assert!(!prompt.contains("systemd user bus"), "{prompt}");
+    }
+
+    // a Claude implementer's prompt never holds it
+    f.add_profile("claude-a");
+    let (claude_task, _) = f.create_task(common::Fixture::SPEC);
+    let claude_copy = f.home_path().join("claude-prompt.txt");
+    let mut c = f.cmd();
+    c.env("FAKE_SCENARIO", "ok")
+        .env("FAKE_TASK_ID", &claude_task)
+        .env("FAKE_PROMPT_COPY", &claude_copy)
+        .args(["dispatch", &claude_task, "--profile", "claude-a", "--model", "sonnet", "--effort", "medium", "--json"]);
+    c.assert().success();
+    assert_eq!(f.wait_for(&claude_task, "120s").1, "in_review");
+    let claude_prompt = std::fs::read_to_string(&claude_copy).expect("the fake claude wrote the prompt");
+    assert!(claude_prompt.contains("This is a single unattended run:"), "{claude_prompt}");
+    assert!(!claude_prompt.contains("systemd user bus"), "{claude_prompt}");
+}
+
 #[test]
 fn a_codex_run_with_no_changes_commits_nothing_and_the_candidate_is_the_base() {
     let (f, _cfg, task_id) = setup();

@@ -106,7 +106,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "thoth_dispatch",
-        description: "Start an implementation run and immediately return its run id. Give model and effort on the first dispatch; a reroute in the same attempt keeps the previous run's. effort can be left out only for a model without an effort setting (haiku) or an agy model whose name ends in its level (gemini-3.8-flash-high: that level is recorded and no flag is sent); any other agy model takes --effort low|medium|high|xhigh|max.",
+        description: "Start an implementation run and immediately return its run id. Give model and effort on the first dispatch; a reroute in the same attempt keeps the previous run's. effort can be left out only for a model without one (haiku), an agy model whose name ends in its level (gemini-3.8-flash-high) or one thoth_models marks no_effort; other agy models take low|medium|high|xhigh|max.",
         read_only: false,
         params: &[
             p!("task", S, true),
@@ -176,7 +176,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "thoth_review_start",
-        description: "Start a review run and immediately return its run id. Give model and effort on the first review of an attempt; starting it again keeps the previous run's. effort can be left out only for a model without an effort setting (haiku) or an agy model whose name ends in its level (gemini-3.8-flash-high); any other agy model takes --effort low|medium|high|xhigh|max. In edit mode the reviewer may attach a small fix to its REJECT; thoth applies it within fixed bounds on thoth/TASK/aN-fix, and thoth_review_show reports pending_fix true until it is verified and confirmed with thoth_review_confirm. edit left out: edit mode for a code task, a plain review for a docs, review or research task; true: edit mode (refused for research); false: a plain review.",
+        description: "Start a review run and immediately return its run id. Give model and effort on the first review of an attempt; starting it again keeps the previous run's. effort can be left out only for a model without one (haiku), an agy model whose name ends in its level (gemini-3.8-flash-high) or one thoth_models marks no_effort; other agy models take low|medium|high|xhigh|max. In edit mode the reviewer may attach a small fix to its REJECT; thoth applies it within fixed bounds on thoth/TASK/aN-fix, and thoth_review_show reports pending_fix true until it is verified and confirmed with thoth_review_confirm. edit left out: edit mode for a code task, a plain review for a docs, review or research task; true: edit mode (refused for research); false: a plain review.",
         read_only: false,
         params: &[
             p!("task", S, true),
@@ -228,7 +228,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "thoth_spec_review_start",
-        description: "Start a read-only spec reviewer run against the task's current spec, checked out at the HEAD of the worktree at repo when that contains the task's base (otherwise at the base), and immediately return its run id; the verdict lands as a spec_review event (source reviewer_run) that the dispatch gate reads. Use a profile of the provider that did not write the spec. Give model and effort every time (effort can be left out only for a model without an effort setting, haiku, or an agy model whose name ends in its level, gemini-3.8-flash-high; any other agy model takes --effort low|medium|high|xhigh|max). Block on it with thoth_wait (run), then read thoth_spec_review_show.",
+        description: "Start a read-only spec reviewer run against the task's current spec, checked out at the HEAD of the worktree at repo when that contains the task's base (otherwise at the base), and immediately return its run id; the verdict lands as a spec_review event (source reviewer_run) that the dispatch gate reads. Use a profile of the provider that did not write the spec. Give model and effort every time (effort can be left out only for a model without one, haiku, an agy model whose name ends in its level, gemini-3.8-flash-high, or one thoth_models marks no_effort; other agy models take low|medium|high|xhigh|max). Block on it with thoth_wait (run), then read thoth_spec_review_show.",
         read_only: false,
         params: &[
             p!("task", S, true),
@@ -365,12 +365,12 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "thoth_pipeline_start",
-        description: "Run a code task (queued, in_review, reject, unverified, interrupted or failed) to a short conclusion in the background: dispatch, wait, protected-change gate, verify, review, verdict. You supply the choices: implementers and reviewers are ordered PROFILE:MODEL[:EFFORT] lists walked forward, never ranked or reordered; a REJECT is reworked on the next implementer entry, a quota/auth stop hands over, a crash resumes once, a timeout retries once at twice the limit. quota_threshold skips an entry whose quota window is that percent used; fold_on_reject lets important/high rework append the findings to the spec. reason goes with every launch. Returns at once; follow it with thoth_pipeline_show. It never approves protected changes or cancels a worker.",
+        description: "Run a code task (queued, in_review, reject, unverified, interrupted or failed) to a short conclusion in the background: dispatch, wait, protected gate, verify, review. implementers and reviewers are your ordered PROFILE:MODEL[:EFFORT] lists, walked forward, never ranked or reordered; one left out uses your stored default at low or normal risk. A REJECT is reworked on the next implementer, a quota/auth stop hands over, a crash resumes once, a timeout retries once at double. quota_threshold skips an entry whose quota window is that percent used; fold_on_reject lets important/high rework append the findings to the spec. reason goes with every launch. Returns at once; follow it with thoth_pipeline_show. Never approves protected changes or cancels a worker.",
         read_only: false,
         params: &[
             p!("task", S, true),
-            p!("implementers", A, true),
-            p!("reviewers", A, true),
+            p!("implementers", A, false),
+            p!("reviewers", A, false),
             p!("reason", S, true),
             p!("quota_threshold", I, false),
             p!("fold_on_reject", B, false),
@@ -396,6 +396,29 @@ pub static TOOLS: &[Tool] = &[
         read_only: false,
         params: &[p!("task", S, true), REPO],
         command: &["pipeline", "stop"],
+    },
+    Tool {
+        name: "thoth_pipeline_new",
+        description: "Create a code task from spec or file (one of them) and start its pipeline in one call. A spec with a lint error creates nothing; a list left out uses the stored default at low or normal risk; an important or high risk spec is refused with the heavy-path commands. Returns at once: follow it with thoth_pipeline_show (wait_seconds).",
+        read_only: false,
+        params: &[
+            p!("spec", O, false),
+            p!("file", S, false),
+            p!("title", S, false),
+            p!("base", S, false),
+            p!("implementers", A, false),
+            p!("reviewers", A, false),
+            p!("reason", S, true),
+            p!("quota_threshold", I, false),
+            p!("fold_on_reject", B, false),
+            p!("max_attempts", I, false),
+            p!("timeout", S, false),
+            p!("review_timeout", S, false),
+            p!("verify_timeout", S, false),
+            p!("verify_wait", S, false),
+            REPO,
+        ],
+        command: &["pipeline", "new"],
     },
     Tool {
         name: "thoth_guide",

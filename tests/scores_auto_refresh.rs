@@ -791,7 +791,7 @@ struct Server {
 
 impl Server {
     fn start(f: &Fixture, envs: &[(&str, &str)]) -> Self {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .current_dir(f.repo.path())
             .env("THOTH_HOME", f.home.path())

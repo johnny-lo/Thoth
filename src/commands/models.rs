@@ -52,6 +52,17 @@ pub(crate) struct AutoRefresh {
     pub(crate) attempted: Vec<&'static str>,
     pub(crate) refreshed: Vec<&'static str>,
     pub(crate) failed: Vec<(&'static str, String)>,
+    /// SMALL-11 (6): sources left out because their last automatic refresh
+    /// failed less than `retry_seconds()` ago.
+    pub(crate) backed_off: Vec<BackedOff>,
+}
+
+/// One source in its back-off: when its automatic refresh failed and the
+/// first time the automatic refresh may try it again (both RFC 3339).
+pub(crate) struct BackedOff {
+    pub(crate) source: &'static str,
+    pub(crate) failed_at: String,
+    pub(crate) retry_after: String,
 }
 
 impl AutoRefresh {
@@ -62,6 +73,7 @@ impl AutoRefresh {
             "attempted": self.attempted,
             "refreshed": self.refreshed,
             "failed": self.failed.iter().map(|(s, e)| json!({"source": s, "error": e})).collect::<Vec<_>>(),
+            "backed_off": self.backed_off.iter().map(|b| json!({"source": b.source, "failed_at": b.failed_at, "retry_after": b.retry_after})).collect::<Vec<_>>(),
         })
     }
 }
@@ -79,6 +91,9 @@ pub(crate) struct ModelInfo {
     /// MODELS-1: a run proved this account cannot use the model, and
     /// nothing has cleared that since (claude-code only).
     pub(crate) unavailable: Option<crate::model_list::Unavailable>,
+    /// AGY-1 (second part): agy refused `--effort` for the model on this
+    /// profile, and nothing has cleared that since (antigravity only).
+    pub(crate) no_effort: Option<crate::model_list::NoEffort>,
 }
 
 #[derive(Clone)]
@@ -319,6 +334,7 @@ impl ModelInfo {
             "thoth_breakdown":self.thoth_breakdown.iter().map(ThothBreakdown::json).collect::<Vec<_>>(),
             "aa":self.aa.as_ref().map(|rows| json!({"rows":rows.iter().map(AaRow::json).collect::<Vec<_>>() })),
             "unavailable":self.unavailable.as_ref().map(|u| json!({"seen_at":u.seen_at,"reason":u.reason,"run_id":u.run_id})),
+            "no_effort":self.no_effort.as_ref().map(crate::model_list::NoEffort::json),
         })
     }
 }
@@ -438,6 +454,11 @@ pub fn run(paths: &Paths, refresh: bool, json_output: bool) -> Result<i32> {
         if !stale {
             continue;
         }
+        // DT-6: a file that is not this source's cache already got the one
+        // line that says so above; "nothing cached" would say it twice.
+        if name == "AI Stupid Level" && !present && snapshot.cache_path.is_file() {
+            continue;
+        }
         let fix = format!("run `thoth models --refresh` with {key_name} set in the environment or stored by thoth config set-secret, or `thoth config set scores-auto-refresh on`.");
         match age_hours {
             Some(hours) => plain.push_str(&format!(
@@ -484,7 +505,7 @@ pub fn run(paths: &Paths, refresh: bool, json_output: bool) -> Result<i32> {
                 },
             );
             plain.push_str(&format!(
-                "  {} ({}) — {}; Thoth runs {} reviewed {} PASS {} REJECT {}{}{}\n",
+                "  {} ({}) — {}; Thoth runs {} reviewed {} PASS {} REJECT {}{}{}{}\n",
                 m.model,
                 m.display_name,
                 score,
@@ -500,7 +521,10 @@ pub fn run(paths: &Paths, refresh: bool, json_output: bool) -> Result<i32> {
                 m.unavailable.as_ref().map_or(String::new(), |u| format!(
                     " — unavailable since {}: {}",
                     u.seen_at, u.reason
-                ))
+                )),
+                m.no_effort
+                    .as_ref()
+                    .map_or(String::new(), |n| format!(" — no effort since {}", n.seen_at))
             ));
             if let Some(rows) = &m.aa {
                 let values = rows
@@ -560,6 +584,7 @@ pub(crate) fn auto_refresh_if_permitted(paths: &Paths) -> AutoRefresh {
             attempted: Vec::new(),
             refreshed: Vec::new(),
             failed: Vec::new(),
+            backed_off: Vec::new(),
         }
     };
     if !auto.failed.is_empty() {
@@ -582,6 +607,7 @@ fn load_with_refresh(paths: &Paths, refreshed: Refreshed, manual: bool) -> Resul
             attempted: Vec::new(),
             refreshed: Vec::new(),
             failed: Vec::new(),
+            backed_off: Vec::new(),
         }
     } else {
         auto_refresh_if_permitted(paths)
@@ -618,7 +644,7 @@ fn load_with_refresh(paths: &Paths, refreshed: Refreshed, manual: bool) -> Resul
             discover(&profile, stored_lists.get(&profile.profile_id));
         let plan = plans.get(&profile.profile_id).map(|p| p.plan.clone());
         let mut models = Vec::new();
-        for Listed { model, display_name, score_name, unavailable } in
+        for Listed { model, display_name, score_name, unavailable, no_effort } in
             listed(paths, &repos, &global, &profile, discovered, plan.as_deref())?
         {
             let score = score_name
@@ -643,6 +669,7 @@ fn load_with_refresh(paths: &Paths, refreshed: Refreshed, manual: bool) -> Resul
                 thoth_breakdown,
                 aa,
                 unavailable,
+                no_effort,
             });
         }
         result.push(ProfileModels {
@@ -701,10 +728,12 @@ pub(crate) struct Listed {
     pub(crate) display_name: String,
     pub(crate) score_name: Option<String>,
     pub(crate) unavailable: Option<crate::model_list::Unavailable>,
+    /// AGY-1 (second part): agy refused `--effort` for it on this profile.
+    pub(crate) no_effort: Option<crate::model_list::NoEffort>,
 }
 
-/// `discovered` (from `discover`) with each model's `score_name` and
-/// `unavailable`, in the list's order.
+/// `discovered` (from `discover`) with each model's `score_name`,
+/// `unavailable` and `no_effort`, in the list's order.
 pub(crate) fn listed(
     paths: &Paths,
     repos: &[String],
@@ -713,19 +742,31 @@ pub(crate) fn listed(
     discovered: Vec<(String, String)>,
     plan: Option<&str>,
 ) -> Result<Vec<Listed>> {
-    // MODELS-1: a claude-code profile's recorded unavailable models.
-    let unavailable_events = if profile.harness == crate::adapter::HARNESS_CLAUDE_CODE {
+    // MODELS-1: a claude-code profile's recorded unavailable models; AGY-1:
+    // an antigravity profile's models agy refused an effort for.
+    let unavailable_events = if profile.harness == crate::adapter::HARNESS_CLAUDE_CODE
+        || profile.harness == crate::adapter::antigravity::HARNESS_NAME
+    {
         crate::db::global::list_quota_events(global, &profile.profile_id)?
     } else {
         Vec::new()
     };
     let mut out = Vec::new();
     for (model, display_name) in discovered {
-        let unavailable = crate::model_list::unavailable_now(&unavailable_events, plan, &model);
+        let unavailable = if profile.harness == crate::adapter::HARNESS_CLAUDE_CODE {
+            crate::model_list::unavailable_now(&unavailable_events, plan, &model)
+        } else {
+            None
+        };
+        let no_effort = if profile.harness == crate::adapter::antigravity::HARNESS_NAME {
+            crate::model_list::no_effort_now(&unavailable_events, &model)
+        } else {
+            None
+        };
         // RJ-2: one name for both sources, from what the harness itself
         // reported; no hard-coded alias table any more.
         let score_name = comparison_name(paths, repos, profile, &model)?;
-        out.push(Listed { model, display_name, score_name, unavailable });
+        out.push(Listed { model, display_name, score_name, unavailable, no_effort });
     }
     Ok(out)
 }
@@ -1256,9 +1297,11 @@ fn refresh_caches(paths: &Paths) -> Result<Refreshed> {
         None => Ok(false),
         Some(key) => refresh_aa_cache(paths, key, MANUAL_FETCH_MAX_TIME_SECONDS),
     };
+    let mut arena_ok = true;
     let arena = match arena::refresh(paths, &arena::Budget::unlimited()) {
         Ok(refreshed) => refreshed,
         Err(error) => {
+            arena_ok = false;
             masked_eprintln!(
                 "warning: {} refresh failed: {}; keeping the cached table",
                 arena::NAME,
@@ -1267,6 +1310,16 @@ fn refresh_caches(paths: &Paths) -> Result<Refreshed> {
             false
         }
     };
+    // SMALL-11 (6): a manual success ends that source's back-off.
+    if asl_key.is_some() && asl.is_ok() {
+        clear_failure(paths, "AI Stupid Level");
+    }
+    if aa_key.is_some() && aa.is_ok() {
+        clear_failure(paths, "Artificial Analysis");
+    }
+    if arena_ok {
+        clear_failure(paths, arena::NAME);
+    }
     match (asl, aa) {
         (Ok(a), Ok(b)) => Ok(Refreshed { asl: a, aa: b, arena }),
         (Err(a), Ok(_)) => bail!("AI Stupid Level refresh failed: {a:#}"),
@@ -1534,9 +1587,10 @@ fn source_due(path: &Path, schema: &str) -> bool {
 }
 
 /// A lock is stale when its modification time is more than
-/// `REFRESH_LOCK_STALE_SECONDS` behind `now`. The content is never consulted:
-/// between `create_new` and the write the file is briefly empty, and an empty
-/// lock still belongs to a live process.
+/// `REFRESH_LOCK_STALE_SECONDS` behind `now`. The content is not consulted
+/// here: between `create_new` and the write the file is briefly empty, and an
+/// empty lock still belongs to a live process (`holder_is_gone` is the one
+/// content rule, and it only ever frees a lock earlier).
 fn lock_is_stale(modified: SystemTime, now: SystemTime) -> bool {
     now.duration_since(modified)
         .is_ok_and(|age| age > Duration::from_secs(REFRESH_LOCK_STALE_SECONDS))
@@ -1548,14 +1602,16 @@ enum LockOutcome {
     Failed(std::io::Error),
 }
 
-/// Creates the lock file exclusively and writes the time for a human reader.
-/// Only the file this call created is removed if the write fails.
+/// Creates the lock file exclusively and writes this process's id, a space
+/// and the time (DT-6: the id lets the next run see at once that the holder
+/// is gone). Only the file this call created is removed if the write fails.
 fn create_lock_file(lock: &Path) -> std::io::Result<()> {
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(lock)?;
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_default();
-    if let Err(error) = file.write_all(now.as_bytes()) {
+    let content = format!("{} {now}", std::process::id());
+    if let Err(error) = file.write_all(content.as_bytes()) {
         drop(file);
         let _ = fs::remove_file(lock);
         return Err(error);
@@ -1563,21 +1619,43 @@ fn create_lock_file(lock: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// DT-6: the process id a lock file names, when its first token is one.
+/// An empty file (the moment between creating it and writing it), a file
+/// holding only a time (what older versions wrote) and an unreadable one
+/// name none.
+fn lock_holder(lock: &Path) -> Option<u32> {
+    let text = fs::read_to_string(lock).ok()?;
+    let pid: u32 = text.split_whitespace().next()?.parse().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// DT-6: whether the lock names a process that no longer exists. A pid whose
+/// image cannot be read is not taken for gone.
+fn holder_is_gone(lock: &Path) -> bool {
+    lock_holder(lock).is_some_and(|pid| matches!(crate::process::image_name(pid), Ok(None)))
+}
+
 /// Best-effort lock: whoever creates the file exclusively holds it. A lock
-/// older than `REFRESH_LOCK_STALE_SECONDS` is removed and taken once; if two
-/// processes reclaim the same stale lock at once, both may fetch.
+/// whose first token is the id of a process that is gone is removed and taken
+/// at once, even when it is fresh; any other lock older than
+/// `REFRESH_LOCK_STALE_SECONDS` is removed and taken once (a pid alone is
+/// never trusted for a live process: it may have been reused, and an empty or
+/// unreadable file names none). If two processes reclaim the same lock at
+/// once, both may fetch.
 fn acquire_lock(lock: &Path, create: &dyn Fn(&Path) -> std::io::Result<()>) -> LockOutcome {
     match create(lock) {
         Ok(()) => return LockOutcome::Held,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return LockOutcome::Failed(error),
     }
-    let modified = match fs::metadata(lock).and_then(|m| m.modified()) {
-        Ok(modified) => modified,
-        Err(_) => return LockOutcome::Busy,
-    };
-    if !lock_is_stale(modified, SystemTime::now()) {
-        return LockOutcome::Busy;
+    if !holder_is_gone(lock) {
+        let modified = match fs::metadata(lock).and_then(|m| m.modified()) {
+            Ok(modified) => modified,
+            Err(_) => return LockOutcome::Busy,
+        };
+        if !lock_is_stale(modified, SystemTime::now()) {
+            return LockOutcome::Busy;
+        }
     }
     let _ = fs::remove_file(lock);
     match create(lock) {
@@ -1590,6 +1668,71 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// SMALL-11 (6): how long after a failed automatic refresh the source is not
+/// tried again. A debug build lets a test shorten it.
+const SCORE_RETRY_SECONDS: i64 = 3600;
+const SCORE_RETRY_FILE: &str = "model-scores-retry.json";
+
+fn retry_seconds() -> i64 {
+    if cfg!(debug_assertions) {
+        if let Some(n) = std::env::var("THOTH_TEST_SCORE_RETRY_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|n| *n >= 0)
+        {
+            return n;
+        }
+    }
+    SCORE_RETRY_SECONDS
+}
+
+/// The sources whose last automatic refresh failed, with the time (RFC 3339)
+/// it did. Kept apart from the cache files so a cache's `fetched_at` keeps
+/// showing its real age. A missing or unreadable file reads as none.
+fn read_failures(paths: &Paths) -> std::collections::BTreeMap<String, String> {
+    fs::read_to_string(paths.home.join(SCORE_RETRY_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_failures(paths: &Paths, failures: &std::collections::BTreeMap<String, String>) {
+    let path = paths.home.join(SCORE_RETRY_FILE);
+    if failures.is_empty() {
+        let _ = fs::remove_file(&path);
+    } else if let Ok(text) = serde_json::to_string(failures) {
+        let _ = fs::write(&path, text);
+    }
+}
+
+fn record_failure(paths: &Paths, source: &str) {
+    let mut failures = read_failures(paths);
+    let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default();
+    failures.insert(source.to_string(), now);
+    write_failures(paths, &failures);
+}
+
+/// A source's success, automatic or manual, ends its back-off.
+fn clear_failure(paths: &Paths, source: &str) {
+    let mut failures = read_failures(paths);
+    if failures.remove(source).is_some() {
+        write_failures(paths, &failures);
+    }
+}
+
+/// `(failed_at, retry_after)` while `source` is in its back-off at `now`.
+fn active_backoff(
+    failures: &std::collections::BTreeMap<String, String>,
+    source: &str,
+    now: OffsetDateTime,
+) -> Option<(String, String)> {
+    let failed_at = failures.get(source)?;
+    let at = OffsetDateTime::parse(failed_at, &Rfc3339).ok()?;
+    let retry = at + time::Duration::seconds(retry_seconds());
+    // A time ahead of the clock is no failure to wait out.
+    (at <= now && now < retry).then(|| (failed_at.clone(), retry.format(&Rfc3339).unwrap_or_default()))
+}
+
 /// Refreshes the external score caches that are missing or a day old, when
 /// the user switched `scores-auto-refresh` on and the source's key is set.
 /// Never fails: problems come back in `failed`.
@@ -1600,6 +1743,7 @@ fn auto_refresh(paths: &Paths) -> AutoRefresh {
         attempted: Vec::new(),
         refreshed: Vec::new(),
         failed: Vec::new(),
+        backed_off: Vec::new(),
     };
     if !crate::commands::settings::scores_auto_refresh(&paths.home) {
         result.skipped = Some("off");
@@ -1619,6 +1763,25 @@ fn auto_refresh(paths: &Paths) -> AutoRefresh {
         && source_due(&paths.home.join("model-scores-aa.json"), AA_SCHEMA);
     // Agent Arena needs no key (RJ-2).
     let arena_due = source_due(&arena::cache_path(paths), arena::SCHEMA);
+    // SMALL-11 (6): a due source whose last automatic refresh failed less
+    // than an hour ago is not tried again, and says so instead of warning.
+    let failures = read_failures(paths);
+    let now = OffsetDateTime::now_utc();
+    let mut hold = |name: &'static str, due: bool| -> bool {
+        if !due {
+            return false;
+        }
+        match active_backoff(&failures, name, now) {
+            Some((failed_at, retry_after)) => {
+                result.backed_off.push(BackedOff { source: name, failed_at, retry_after });
+                false
+            }
+            None => true,
+        }
+    };
+    let asl_due = hold("AI Stupid Level", asl_due);
+    let aa_due = hold("Artificial Analysis", aa_due);
+    let arena_due = hold(arena::NAME, arena_due);
     if !asl_due && !aa_due && !arena_due {
         return result;
     }
@@ -1636,6 +1799,7 @@ fn auto_refresh(paths: &Paths) -> AutoRefresh {
                 (arena::NAME, arena_due),
             ] {
                 if due {
+                    record_failure(paths, name);
                     result.failed.push((name, one_line(&error.to_string())));
                 }
             }
@@ -1665,9 +1829,16 @@ fn auto_refresh(paths: &Paths) -> AutoRefresh {
     for (name, outcome) in outcomes {
         result.attempted.push(name);
         match outcome {
-            Ok(true) => result.refreshed.push(name),
-            Ok(false) => {}
-            Err(error) => result.failed.push((name, one_line(&format!("{error:#}")))),
+            Ok(refreshed) => {
+                clear_failure(paths, name);
+                if refreshed {
+                    result.refreshed.push(name);
+                }
+            }
+            Err(error) => {
+                record_failure(paths, name);
+                result.failed.push((name, one_line(&format!("{error:#}"))));
+            }
         }
     }
     result

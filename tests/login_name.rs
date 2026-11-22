@@ -27,7 +27,8 @@ fn cmd(f: &Fixture) -> assert_cmd::Command {
     let mut c = f.cmd();
     for name in std::env::vars_os().map(|(name, _)| name) {
         let upper = name.to_string_lossy().to_uppercase();
-        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+        // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
             c.env_remove(&name);
         }
     }
@@ -296,4 +297,106 @@ fn login_name_equal_to_a_known_secret_is_masked() {
     let page = report_page(&f, &[(SECRET_VAR, SECRET_VALUE)]);
     assert!(page.contains(&format!("claude-a（{masked}，Pro）")), "{page}");
     assert!(!page.contains(SECRET_VALUE), "{page}");
+}
+
+/// A `thoth` child started in the background, with the environment
+/// `Fixture::cmd` sets for a foreground one (as tests/write_lock.rs does).
+fn spawn(f: &Fixture, args: &[&str], envs: &[(&str, &str)]) -> std::process::Child {
+    let mut c = common::scrubbed(std::process::Command::new(env!("CARGO_BIN_EXE_thoth")));
+    for var in [
+        "THOTH_RUN_ID",
+        "THOTH_INBOX_DIR",
+        "THOTH_EXE",
+        "THOTH_VIA_MCP",
+        "THOTH_RECORDS_DIR",
+        "THOTH_MACHINE_NAME",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "ARTIFICIALANALYSIS_API_KEY",
+        "AISTUPIDLEVEL_API_KEY",
+        "THOTH_TEST_WRITE_TX_PAUSE_FILE",
+        "FAKE_AUTH_EMAIL",
+        "THOTH_LANG",
+    ] {
+        c.env_remove(var);
+    }
+    c.env("THOTH_HOME", f.home_path())
+        .env("THOTH_CLAUDE_BIN", env!("CARGO_BIN_EXE_fake-claude"))
+        .env("THOTH_CODEX_BIN", env!("CARGO_BIN_EXE_fake-codex"))
+        .env("THOTH_AGY_BIN", env!("CARGO_BIN_EXE_fake-agy"))
+        .env("THOTH_TEST_POLL_MS", "100")
+        .current_dir(f.repo_path())
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    c.spawn().expect("spawn thoth")
+}
+
+/// PANEL-3 AC2: a login check whose global database is locked by another
+/// writer still succeeds; it only warns on stderr, once, that the login name
+/// of that profile was not stored, and `--json` keeps `logged_in` true.
+#[test]
+fn login_name_a_locked_global_database_only_warns_on_stderr() {
+    let f = setup(&["claude-a", "claude-b"]);
+
+    // claude-b is logged out through the CLI: a run whose session was rejected
+    let spec = f.home_path().join("spec.json");
+    std::fs::write(&spec, Fixture::SPEC).unwrap();
+    let mut c = cmd(&f);
+    c.args(["task", "create", "-f"]).arg(&spec).arg("--json");
+    let task = parse(&String::from_utf8(f.run_ok(c, "task create")).unwrap())["task_id"].as_str().unwrap().to_string();
+    let marker = f.home_path().join("logout.marker");
+    let mut c = cmd(&f);
+    c.env("FAKE_SCENARIO", "auth_expired")
+        .env("FAKE_TASK_ID", &task)
+        .env("FAKE_LOGOUT_MARKER", &marker)
+        .args(["dispatch", &task, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium", "--json"]);
+    f.run_ok(c, "dispatch");
+    assert_eq!(f.wait_for(&task, "120s").1, "interrupted", "{}", f.explain_task(&task));
+    let status_of = |id: &str| -> String {
+        let mut c = cmd(&f);
+        c.args(["profile", "list", "--json"]);
+        let v = parse(&String::from_utf8(f.run_ok(c, "profile list")).unwrap());
+        v["profiles"].as_array().unwrap().iter().find(|p| p["profile_id"] == id).unwrap()["status"].as_str().unwrap().to_string()
+    };
+    assert_eq!(status_of("claude-b"), "logged_out");
+    // the person logs in again
+    std::fs::remove_file(&marker).unwrap();
+
+    // a check of claude-b that logs it in again holds global.db's write lock
+    let hold = f.home_path().join("hold");
+    let hold_s = hold.display().to_string();
+    let holder = spawn(
+        &f,
+        &["profile", "check", "claude-b", "--json"],
+        &[("FAKE_AUTH_EMAIL", "bob@example.org"), ("THOTH_TEST_WRITE_TX_PAUSE_FILE", &hold_s)],
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !hold.exists() {
+        assert!(std::time::Instant::now() < deadline, "{} never appeared", hold.display());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // meanwhile claude-a's check cannot store its login name. The holder
+    // keeps the lock until this command has exited, so every write it tries
+    // is refused however long it waits: the debug-only busy-timeout switch
+    // only shortens a wait for a lock it can never get (5 s each without it).
+    let mut c = cmd(&f);
+    c.env("FAKE_AUTH_EMAIL", "alice@example.org")
+        .env("THOTH_TEST_BUSY_TIMEOUT_MS", "300")
+        .args(["profile", "check", "claude-a", "--json"]);
+    let (code, stdout, stderr) = run(&mut c);
+    // release the holder before any assertion can end the test
+    std::fs::remove_file(&hold).unwrap();
+    let held = holder.wait_with_output().unwrap();
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let warned: Vec<&str> = stderr.lines().filter(|l| l.starts_with("warning: could not store the login name of claude-a: ")).collect();
+    assert_eq!(warned.len(), 1, "{stderr}");
+    assert_eq!(parse(&stdout)["logged_in"], true, "{stdout}");
+    assert!(held.status.success(), "{}\n{}", String::from_utf8_lossy(&held.stdout), String::from_utf8_lossy(&held.stderr));
+    assert_eq!(name(&f, "claude-a"), Value::Null);
 }

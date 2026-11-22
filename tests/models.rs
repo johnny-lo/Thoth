@@ -562,6 +562,39 @@ fn t6_legacy_cache_is_unavailable_and_named_in_plain_output() {
         .stdout(predicates::str::contains("--refresh"));
 }
 
+/// SMALL-16 (DT-6): a model-scores.json that is not an AI Stupid Level v1
+/// cache gets the one line that says so, not that line and a second one
+/// saying nothing is cached. A missing cache still gets the stale line, and
+/// the other sources' stale lines do not change.
+#[test]
+fn a_cache_with_the_wrong_schema_gets_one_message() {
+    const STALE: &str = "stale: no AI Stupid Level scores cached";
+    let f = setup();
+    let missing = plain(&f);
+    assert_eq!(missing.lines().filter(|l| l.starts_with(STALE)).count(), 1, "{missing}");
+    assert!(!missing.contains("is not an AI Stupid Level v1 cache"), "{missing}");
+    let others = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.starts_with("stale: no Artificial Analysis") || l.starts_with("stale: no Agent Arena"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(others(&missing).len(), 2, "{missing}");
+
+    let path = f.home_path().join("model-scores.json");
+    fs::write(&path, r#"{"schema":"something-else","fetched_at":"2026-09-29T00:00:00Z"}"#).unwrap();
+    let wrong = plain(&f);
+    let message = format!("{} is not an AI Stupid Level v1 cache; run `thoth models --refresh`.", path.display());
+    assert_eq!(wrong.lines().filter(|l| *l == message).count(), 1, "{wrong}");
+    assert!(!wrong.contains(STALE), "{wrong}");
+    assert_eq!(others(&wrong), others(&missing), "{wrong}");
+    // --json says what it said: no usable cache
+    let v = output(&f);
+    assert_eq!(v["cache"]["present"], false, "{v}");
+    assert_eq!(v["cache"]["stale"], true, "{v}");
+    assert!(v["cache"]["age_hours"].is_null(), "{v}");
+}
+
 #[test]
 fn t7_fresh_cache_skips_curl_but_stale_cache_refreshes() {
     let f = setup();

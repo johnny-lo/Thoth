@@ -26,13 +26,14 @@
 //! `THOTH_HOME/verify-slots/slot-K.json`.
 
 use crate::config::Paths;
+use crate::db::pipelines::{self, Row};
 use crate::db::{self, state};
 use crate::ids;
 use crate::model::{event_type, role};
 use crate::output;
 use crate::redact::Masker;
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -72,42 +73,14 @@ fn preflight_seam(kind: &str, args: &mut Vec<String>) {
     }
 }
 
-const TABLE: &str = "CREATE TABLE IF NOT EXISTS pipelines (
-  pipeline_id       TEXT PRIMARY KEY,
-  task_id           TEXT NOT NULL,
-  status            TEXT NOT NULL,
-  step              TEXT NOT NULL,
-  settings          TEXT NOT NULL,
-  pipeline_pid      INTEGER,
-  heartbeat_at      TEXT,
-  started_at        TEXT NOT NULL,
-  ended_at          TEXT,
-  stop_requested    INTEGER NOT NULL DEFAULT 0,
-  stop              TEXT,
-  dir               TEXT NOT NULL,
-  implementer_index INTEGER NOT NULL DEFAULT 0,
-  reviewer_index    INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_pipelines_task ON pipelines(task_id);";
-
-const COLS: &str = "pipeline_id, task_id, status, step, settings, pipeline_pid, heartbeat_at, \
-                    started_at, ended_at, stop_requested, stop, dir, implementer_index, reviewer_index";
-
 fn ensure_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(TABLE)?;
-    Ok(())
+    pipelines::ensure_table(conn)
 }
 
 /// Whether this state.db has the table; false for a repository that never
 /// started a pipeline (also when it is opened read-only).
 fn table_exists(conn: &Connection) -> bool {
-    conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pipelines'",
-        [],
-        |r| r.get::<_, i64>(0),
-    )
-    .map(|n| n > 0)
-    .unwrap_or(false)
+    pipelines::table_exists(conn).unwrap_or(false)
 }
 
 /// One implementer or reviewer choice, exactly as the commander supplied it
@@ -120,7 +93,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         match &self.effort {
             Some(e) => format!("{}:{}:{e}", self.profile, self.model),
             None => format!("{}:{}", self.profile, self.model),
@@ -146,51 +119,48 @@ pub struct Settings {
     /// to the spec's constraints instead of stopping for a rewrite.
     #[serde(default)]
     pub fold_on_reject: bool,
+    /// LIGHT-1: where each list came from, `flag` or `default` (a stored
+    /// default list); a pipeline recorded before LIGHT-1 reads as `flag`.
+    #[serde(default = "flag_source")]
+    pub implementers_source: String,
+    #[serde(default = "flag_source")]
+    pub reviewers_source: String,
+    /// LIGHT-1: the stored default list used (its reason and set_at), null
+    /// for a list from its flag.
+    #[serde(default)]
+    pub implementers_default: Option<DefaultUsed>,
+    #[serde(default)]
+    pub reviewers_default: Option<DefaultUsed>,
 }
 
-#[derive(Debug, Clone)]
-struct Row {
-    id: String,
-    task_id: String,
-    status: String,
-    step: String,
-    settings: Value,
-    pid: Option<i64>,
-    heartbeat_at: Option<String>,
-    started_at: String,
-    ended_at: Option<String>,
-    stop_requested: bool,
-    stop: Option<Value>,
-    dir: String,
-    implementer_index: i64,
-    reviewer_index: i64,
+fn flag_source() -> String {
+    "flag".to_string()
 }
 
-fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
-    let settings: String = r.get(4)?;
-    let stop: Option<String> = r.get(10)?;
-    Ok(Row {
-        id: r.get(0)?,
-        task_id: r.get(1)?,
-        status: r.get(2)?,
-        step: r.get(3)?,
-        settings: serde_json::from_str(&settings).unwrap_or(Value::Null),
-        pid: r.get(5)?,
-        heartbeat_at: r.get(6)?,
-        started_at: r.get(7)?,
-        ended_at: r.get(8)?,
-        stop_requested: r.get::<_, i64>(9)? != 0,
-        stop: stop.and_then(|s| serde_json::from_str(&s).ok()),
-        dir: r.get(11)?,
-        implementer_index: r.get(12)?,
-        reviewer_index: r.get(13)?,
-    })
+/// LIGHT-1: which stored default list a pipeline used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DefaultUsed {
+    pub reason: String,
+    pub set_at: String,
+}
+
+/// LIGHT-1: the four settings keys a pipeline recorded before LIGHT-1 lacks,
+/// filled in as both lists from their flags.
+fn with_sources(settings: &Value) -> Value {
+    let mut s = settings.clone();
+    if let Some(o) = s.as_object_mut() {
+        for k in ["implementers_source", "reviewers_source"] {
+            o.entry(k).or_insert_with(|| json!("flag"));
+        }
+        for k in ["implementers_default", "reviewers_default"] {
+            o.entry(k).or_insert(Value::Null);
+        }
+    }
+    s
 }
 
 fn get_row(conn: &Connection, id: &str) -> Result<Option<Row>> {
-    Ok(conn
-        .query_row(&format!("SELECT {COLS} FROM pipelines WHERE pipeline_id = ?1"), [id], row_of)
-        .optional()?)
+    pipelines::get(conn, id)
 }
 
 /// The task's newest pipeline (ids are ULIDs, so they sort by start time).
@@ -198,24 +168,14 @@ fn latest_for_task(conn: &Connection, task_id: &str) -> Result<Option<Row>> {
     if !table_exists(conn) {
         return Ok(None);
     }
-    Ok(conn
-        .query_row(
-            &format!("SELECT {COLS} FROM pipelines WHERE task_id = ?1 ORDER BY pipeline_id DESC LIMIT 1"),
-            [task_id],
-            row_of,
-        )
-        .optional()?)
+    pipelines::latest_for_task(conn, task_id)
 }
 
 fn running_for_task(conn: &Connection, task_id: &str) -> Result<Vec<Row>> {
     if !table_exists(conn) {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {COLS} FROM pipelines WHERE task_id = ?1 AND status = 'running' ORDER BY pipeline_id"
-    ))?;
-    let rows = stmt.query_map([task_id], row_of)?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    pipelines::running_for_task(conn, task_id)
 }
 
 // --- liveness -------------------------------------------------------------------
@@ -293,11 +253,7 @@ fn append_log(dir: &Path, line: &str, masker: &Masker) {
 }
 
 fn step_details(conn: &Connection, task_id: &str, pipeline_id: &str) -> Result<Vec<Value>> {
-    let mut stmt =
-        conn.prepare("SELECT detail FROM events WHERE task_id = ?1 AND type = ?2 ORDER BY seq")?;
-    let rows = stmt
-        .query_map(params![task_id, event_type::PIPELINE_STEP], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
+    let rows = state::event_details_of_task(conn, task_id, event_type::PIPELINE_STEP)?;
     Ok(rows
         .into_iter()
         .filter_map(|d| serde_json::from_str::<Value>(&d).ok())
@@ -311,11 +267,7 @@ fn settle_in(conn: &Connection, row: &Row, stop: &Stop, masker: &Masker) -> Resu
     let now = ids::now_rfc3339();
     let mut stop_json = stop.json();
     masker.mask_value(&mut stop_json);
-    let n = conn.execute(
-        "UPDATE pipelines SET status = 'stopped', ended_at = ?1, stop = ?2 \
-         WHERE pipeline_id = ?3 AND status = 'running'",
-        params![now, stop_json.to_string(), row.id],
-    )?;
+    let n = pipelines::settle_running(conn, &now, &stop_json.to_string(), &row.id)?;
     if n == 0 {
         return Ok(false);
     }
@@ -376,6 +328,7 @@ fn stale_stop(row: &Row) -> Stop {
 
 // --- start ---------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 pub struct StartArgs<'a> {
     pub task: &'a str,
     pub implementers: &'a [String],
@@ -413,50 +366,93 @@ fn duration(flag: &str, value: Option<&str>) -> Result<Option<u64>> {
     }
 }
 
-/// Checks one `PROFILE:MODEL[:EFFORT]` entry; reads only.
-fn parse_entry(gconn: &Connection, flag: &str, pos: usize, total: usize, raw: &str) -> Result<Entry> {
+/// Checks one `PROFILE:MODEL[:EFFORT]` entry; reads only. The inner error is
+/// why the entry fails (the text after `invalid --FLAG entry K of L ('E'): `);
+/// the outer one is a database error. Without a profile database
+/// (`gconn` None) every profile is unknown.
+pub(crate) fn check_entry(gconn: Option<&Connection>, raw: &str) -> Result<std::result::Result<Entry, String>> {
     use crate::commands::auto_pick::{effort_optional, is_auto, AUTO};
-    let fail = |why: String| anyhow!("invalid --{flag} entry {pos} of {total} ('{raw}'): {why}");
     let parts: Vec<&str> = raw.split(':').map(str::trim).collect();
     if !(2..=3).contains(&parts.len()) || parts.iter().any(|p| p.is_empty()) {
-        return Err(fail(
+        return Ok(Err(
             "write PROFILE:MODEL or PROFILE:MODEL:EFFORT, two or three parts, none of them empty".into(),
         ));
     }
     let (profile_id, model, effort) = (parts[0], parts[1], parts.get(2).copied());
     if profile_id == AUTO || is_auto(model) || effort.is_some_and(is_auto) {
-        return Err(fail(
+        return Ok(Err(
             "auto was removed: Thoth does not pick a profile, model or effort for you; give each one yourself".into(),
         ));
     }
-    let Some(profile) = db::global::get_profile(gconn, profile_id)? else {
-        return Err(fail(format!("no such profile: {profile_id}")));
+    let profile = match gconn {
+        Some(c) => db::global::get_profile(c, profile_id)?,
+        None => None,
     };
-    crate::commands::profile::require_supported_harness(&format!("profile {profile_id}"), &profile.harness)
-        .map_err(|e| fail(format!("{e:#}")))?;
+    let Some(profile) = profile else {
+        return Ok(Err(format!("no such profile: {profile_id}")));
+    };
+    let gconn = gconn.expect("a profile was found, so there is a connection");
+    if let Err(e) =
+        crate::commands::profile::require_supported_harness(&format!("profile {profile_id}"), &profile.harness)
+    {
+        return Ok(Err(format!("{e:#}")));
+    }
     let adapter = crate::adapter::for_harness(&profile.harness);
     let known = crate::model_list::known_models_text(gconn, &profile);
-    adapter
-        .check_model(&profile.profile_id, model, &known)
-        .map_err(|e| fail(format!("{e:#}")))?;
+    if let Err(e) = adapter.check_model(&profile.profile_id, model, &known) {
+        return Ok(Err(format!("{e:#}")));
+    }
     let effort = match effort {
-        Some(e) => Some(crate::adapter::effort::parse_level(e).map_err(fail)?),
-        None if effort_optional(&profile, model) => None,
+        Some(e) => match crate::adapter::effort::parse_level(e) {
+            Ok(level) => Some(level),
+            Err(why) => return Ok(Err(why)),
+        },
+        None if effort_optional(gconn, &profile, model) => None,
         None => {
-            return Err(fail(format!(
+            return Ok(Err(format!(
                 "model {model} on profile {profile_id} needs an effort (low, medium, high, xhigh, max or \
-                 ultra); it can be left out only for a model without an effort setting (haiku) or an agy \
-                 model whose name ends in its level"
+                 ultra); it can be left out only for a model without an effort setting (haiku), an agy \
+                 model whose name ends in its level, or an agy model agy refused --effort for on this \
+                 profile"
             )))
         }
     };
-    Ok(Entry { profile: profile_id.to_string(), model: model.to_string(), effort })
+    Ok(Ok(Entry { profile: profile_id.to_string(), model: model.to_string(), effort }))
 }
 
-pub fn start(paths: &Paths, cwd: &Path, a: StartArgs<'_>) -> Result<i32> {
-    if std::env::var_os("THOTH_RUN_ID").is_some() {
-        bail!("pipeline start refuses to run with THOTH_RUN_ID set: a pipeline is started by the commander, not by a run");
-    }
+/// Checks one flag entry: `invalid FLAG entry K of L ('ENTRY'): WHY`.
+pub(crate) fn parse_entry(gconn: Option<&Connection>, flag: &str, pos: usize, total: usize, raw: &str) -> Result<Entry> {
+    check_entry(gconn, raw)?.map_err(|why| anyhow!("invalid {flag} entry {pos} of {total} ('{raw}'): {why}"))
+}
+
+/// LIGHT-1: checks one entry of a stored default list again at start; one
+/// that no longer passes refuses the start (nothing is skipped).
+fn parse_stored_entry(gconn: &Connection, flag: &str, pos: usize, total: usize, e: &Entry) -> Result<Entry> {
+    let raw = e.text();
+    check_entry(Some(gconn), &raw)?.map_err(|why| {
+        anyhow!(
+            "invalid stored default {flag} entry {pos} of {total} ('{raw}'): {why}; store a list that passes \
+             with `thoth pipeline defaults set {flag} PROFILE:MODEL[:EFFORT] --reason TEXT`, or give \
+             {flag} PROFILE:MODEL[:EFFORT] for this start"
+        )
+    })
+}
+
+/// The flag values `pipeline start` checks first, in its order.
+struct Flags {
+    reason: String,
+    timeout: Option<u64>,
+    review_timeout: Option<u64>,
+    verify_timeout: u64,
+    verify_wait: u64,
+    max_attempts: Option<i64>,
+    quota_threshold: Option<i64>,
+}
+
+type Stored = Option<crate::commands::pipeline_defaults::StoredList>;
+
+/// `pipeline start`'s argument checks, in its order (after THOTH_RUN_ID).
+fn check_flags(a: &StartArgs<'_>) -> Result<Flags> {
     let reason = match a.reason.map(str::trim) {
         Some(r) if !r.is_empty() => r.to_string(),
         _ => bail!(
@@ -476,12 +472,180 @@ pub fn start(paths: &Paths, cwd: &Path, a: StartArgs<'_>) -> Result<i32> {
         },
     };
     let quota_threshold = quota_threshold(a.quota_threshold)?;
-    if a.implementers.is_empty() {
-        bail!("the implementer list is empty: give --implementer PROFILE:MODEL[:EFFORT] at least once");
+    Ok(Flags { reason, timeout, review_timeout, verify_timeout, verify_wait, max_attempts, quota_threshold })
+}
+
+/// LIGHT-1: the stored default list for each list flag left out, and the
+/// refusal of a list that is neither given nor stored.
+fn stored_lists(paths: &Paths, a: &StartArgs<'_>) -> Result<(Stored, Stored)> {
+    // LIGHT-1: a list whose flag is left out comes from the stored default;
+    // the file is read only then, so with both flags it changes nothing.
+    let stored = if a.implementers.is_empty() || a.reviewers.is_empty() {
+        crate::commands::pipeline_defaults::read(paths)?
+    } else {
+        None
+    };
+    let impl_default = if a.implementers.is_empty() {
+        match stored.as_ref().and_then(|d| d.implementers.clone()) {
+            Some(l) => Some(l),
+            None => bail!(
+                "the implementer list is empty: give --implementer PROFILE:MODEL[:EFFORT] at least once, or \
+                 store a default implementer list with `thoth pipeline defaults set --implementer \
+                 PROFILE:MODEL[:EFFORT] --reason TEXT` (used at low or normal risk)"
+            ),
+        }
+    } else {
+        None
+    };
+    let rev_default = if a.reviewers.is_empty() {
+        match stored.as_ref().and_then(|d| d.reviewers.clone()) {
+            Some(l) => Some(l),
+            None => bail!(
+                "the reviewer list is empty: give --reviewer PROFILE:MODEL[:EFFORT] at least once, or \
+                 store a default reviewer list with `thoth pipeline defaults set --reviewer \
+                 PROFILE:MODEL[:EFFORT] --reason TEXT` (used at low or normal risk)"
+            ),
+        }
+    } else {
+        None
+    };
+    Ok((impl_default, rev_default))
+}
+
+/// LIGHT-1: only low and normal risk take the light path; important and
+/// high risk tasks take the heavy path, where the commander chooses both
+/// lists for the task in hand. `subject` is `task ID` or `spec FILE`.
+fn risk_rule(subject: &str, risk: &str, impl_default: &Stored, rev_default: &Stored) -> Result<()> {
+    if matches!(risk, "low" | "normal") {
+        return Ok(());
     }
-    if a.reviewers.is_empty() {
-        bail!("the reviewer list is empty: give --reviewer PROFILE:MODEL[:EFFORT] at least once");
+    let missing: Vec<&str> = [
+        impl_default.is_some().then_some("--implementer"),
+        rev_default.is_some().then_some("--reviewer"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !missing.is_empty() {
+        let verb = if missing.len() > 1 { "were" } else { "was" };
+        bail!(
+            "{subject} is {risk} risk and {} {verb} left out: a stored default list is used only at low or \
+             normal risk; an important or high risk task takes the heavy path, where you choose both \
+             lists for the task in hand. Give {}",
+            missing.join(" and "),
+            missing.iter().map(|f| format!("{f} PROFILE:MODEL[:EFFORT]")).collect::<Vec<_>>().join(" and ")
+        );
     }
+    Ok(())
+}
+
+/// Both lists checked entry by entry: the flags as given, or the stored
+/// default as stored. Nothing is picked, ranked or reordered.
+fn entries_of(
+    gconn: &Connection,
+    a: &StartArgs<'_>,
+    impl_default: &Stored,
+    rev_default: &Stored,
+) -> Result<(Vec<Entry>, Vec<Entry>)> {
+    let mut implementers = Vec::new();
+    match impl_default {
+        None => {
+            for (i, raw) in a.implementers.iter().enumerate() {
+                implementers.push(parse_entry(Some(gconn), "--implementer", i + 1, a.implementers.len(), raw)?);
+            }
+        }
+        Some(l) => {
+            for (i, e) in l.entries.iter().enumerate() {
+                implementers.push(parse_stored_entry(gconn, "--implementer", i + 1, l.entries.len(), e)?);
+            }
+        }
+    }
+    let mut reviewers = Vec::new();
+    match rev_default {
+        None => {
+            for (i, raw) in a.reviewers.iter().enumerate() {
+                reviewers.push(parse_entry(Some(gconn), "--reviewer", i + 1, a.reviewers.len(), raw)?);
+            }
+        }
+        Some(l) => {
+            for (i, e) in l.entries.iter().enumerate() {
+                reviewers.push(parse_stored_entry(gconn, "--reviewer", i + 1, l.entries.len(), e)?);
+            }
+        }
+    }
+    Ok((implementers, reviewers))
+}
+
+/// What `pipeline start` printed: its `--json` document, human line and
+/// warnings.
+pub(crate) struct Started {
+    pub(crate) pipeline_id: String,
+    pub(crate) doc: Value,
+    pub(crate) human: String,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// Why a start did not complete: refused before the pipeline was recorded
+/// (nothing written), or failed after its row and `pipeline_started` exist.
+pub(crate) enum StartFailure {
+    Refused(anyhow::Error),
+    Recorded { pipeline_id: String, error: anyhow::Error },
+}
+
+impl StartFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            StartFailure::Refused(e) | StartFailure::Recorded { error: e, .. } => e,
+        }
+    }
+}
+
+pub fn start(paths: &Paths, cwd: &Path, a: StartArgs<'_>) -> Result<i32> {
+    if std::env::var_os("THOTH_RUN_ID").is_some() {
+        bail!("pipeline start refuses to run with THOTH_RUN_ID set: a pipeline is started by the commander, not by a run");
+    }
+    let started = start_quiet(paths, cwd, &a).map_err(StartFailure::into_error)?;
+    if !a.json {
+        for w in &started.warnings {
+            masked_eprintln!("warning: {w}");
+        }
+    }
+    output::emit(a.json, &started.doc, &started.human);
+    Ok(0)
+}
+
+/// Everything `pipeline start` does after its THOTH_RUN_ID check, without
+/// printing.
+pub(crate) fn start_quiet(paths: &Paths, cwd: &Path, a: &StartArgs<'_>) -> std::result::Result<Started, StartFailure> {
+    let p = prepare_start(paths, cwd, a).map_err(StartFailure::Refused)?;
+    record_start(&p).map_err(StartFailure::Refused)?;
+    launch_start(&p).map_err(|error| StartFailure::Recorded { pipeline_id: p.id.clone(), error })
+}
+
+/// A start that passed every refusal, ready to be recorded.
+struct Prepared {
+    root: PathBuf,
+    conn: Connection,
+    task_id: String,
+    entry_status: String,
+    stale_olds: Vec<Row>,
+    settings: Settings,
+    settings_json: Value,
+    require_reason: bool,
+    id: String,
+    dir: PathBuf,
+    row: Row,
+    now: String,
+    masker: Masker,
+    impl_from_default: bool,
+    rev_from_default: bool,
+    max_attempts: i64,
+}
+
+fn prepare_start(paths: &Paths, cwd: &Path, a: &StartArgs<'_>) -> Result<Prepared> {
+    let Flags { reason, timeout, review_timeout, verify_timeout, verify_wait, max_attempts, quota_threshold } =
+        check_flags(a)?;
+    let (impl_default, rev_default) = stored_lists(paths, a)?;
 
     let (repo_id, root, conn) = crate::commands::task::open_repo(paths, cwd)?;
     let task_id = ids::resolve_prefix(&state::list_task_ids(&conn)?, a.task)?;
@@ -518,24 +682,26 @@ pub fn start(paths: &Paths, cwd: &Path, a: StartArgs<'_>) -> Result<i32> {
             "queued, in_review, reject, unverified, interrupted or failed"
         );
     }
+    risk_rule(&format!("task {task_id}"), &task.risk, &impl_default, &rev_default)?;
     let gconn = db::open_global(paths)?;
-    let mut implementers = Vec::new();
-    for (i, raw) in a.implementers.iter().enumerate() {
-        implementers.push(parse_entry(&gconn, "implementer", i + 1, a.implementers.len(), raw)?);
-    }
-    let mut reviewers = Vec::new();
-    for (i, raw) in a.reviewers.iter().enumerate() {
-        reviewers.push(parse_entry(&gconn, "reviewer", i + 1, a.reviewers.len(), raw)?);
-    }
+    let (implementers, reviewers) = entries_of(&gconn, a, &impl_default, &rev_default)?;
     let max_attempts = match max_attempts {
         Some(n) => n,
         None => state::get_task_attempt_cap(&conn, &task_id)?,
     };
 
     let masker = Masker::load(Some(&paths.home));
+    let source = |d: &Stored| if d.is_some() { "default" } else { "flag" }.to_string();
+    let used = |d: &Stored| {
+        d.as_ref().map(|l| DefaultUsed { reason: masker.mask_text(&l.reason).0, set_at: l.set_at.clone() })
+    };
     let settings = Settings {
         implementers,
         reviewers,
+        implementers_source: source(&impl_default),
+        reviewers_source: source(&rev_default),
+        implementers_default: used(&impl_default),
+        reviewers_default: used(&rev_default),
         max_attempts,
         timeout_seconds: timeout,
         review_timeout_seconds: review_timeout,
@@ -566,61 +732,88 @@ pub fn start(paths: &Paths, cwd: &Path, a: StartArgs<'_>) -> Result<i32> {
         implementer_index: 0,
         reviewer_index: 0,
     };
-    {
-        let tx = db::write_tx(&conn)?;
-        for old in running_for_task(&tx, &task_id)? {
-            if !stale_olds.iter().any(|s| s.id == old.id) {
-                bail!(
-                    "task {task_id} already has a running pipeline {} (step {}); follow it with `thoth \
-                     pipeline show {task_id}`, or stop it with `thoth pipeline stop {task_id}`",
-                    old.id,
-                    old.step
-                );
-            }
+    Ok(Prepared {
+        root,
+        conn,
+        task_id,
+        entry_status: task.status,
+        stale_olds,
+        settings,
+        settings_json,
+        require_reason,
+        id,
+        dir,
+        row,
+        now,
+        masker,
+        impl_from_default: impl_default.is_some(),
+        rev_from_default: rev_default.is_some(),
+        max_attempts,
+    })
+}
+
+/// The pipeline row and its `pipeline_started` event, in one transaction: a
+/// refusal or an error here leaves nothing recorded.
+fn record_start(p: &Prepared) -> Result<()> {
+    let Prepared { conn, task_id, stale_olds, settings, settings_json, id, row, now, masker, .. } = p;
+    let tx = db::write_tx(conn)?;
+    for old in running_for_task(&tx, task_id)? {
+        if !stale_olds.iter().any(|s| s.id == old.id) {
+            bail!(
+                "task {task_id} already has a running pipeline {} (step {}); follow it with `thoth \
+                 pipeline show {task_id}`, or stop it with `thoth pipeline stop {task_id}`",
+                old.id,
+                old.step
+            );
         }
-        for old in &stale_olds {
-            settle_in(&tx, old, &stale_stop(old), &masker)?;
-        }
-        tx.execute(
-            "INSERT INTO pipelines (pipeline_id, task_id, status, step, settings, heartbeat_at, \
-             started_at, dir) VALUES (?1, ?2, 'running', 'starting', ?3, ?4, ?4, ?5)",
-            params![id, task_id, settings_json.to_string(), now, row.dir],
-        )?;
-        state::append_event(
-            &tx,
-            &state::NewEvent {
-                task_id: Some(task_id.clone()),
-                run_id: None,
-                event_type: event_type::PIPELINE_STARTED.to_string(),
-                detail: json!({
-                    "pipeline_id": id,
-                    "settings": settings_json,
-                    "entry_status": task.status,
-                    "reason": settings.reason,
-                    "require_reason": require_reason,
-                    "quota_threshold": settings.quota_threshold,
-                    "fold_on_reject": settings.fold_on_reject,
-                }),
-            },
-        )?;
-        tx.commit()?;
     }
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    for old in stale_olds {
+        settle_in(&tx, old, &stale_stop(old), masker)?;
+    }
+    pipelines::insert_running(&tx, id, task_id, &settings_json.to_string(), now, &row.dir)?;
+    state::append_event(
+        &tx,
+        &state::NewEvent {
+            task_id: Some(task_id.clone()),
+            run_id: None,
+            event_type: event_type::PIPELINE_STARTED.to_string(),
+            detail: json!({
+                "pipeline_id": id,
+                "settings": settings_json,
+                "entry_status": p.entry_status,
+                "reason": settings.reason,
+                "require_reason": p.require_reason,
+                "quota_threshold": settings.quota_threshold,
+                "fold_on_reject": settings.fold_on_reject,
+            }),
+        },
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// After the pipeline is recorded: its folder, its log and its background
+/// process. An error here leaves the recorded pipeline behind.
+fn launch_start(p: &Prepared) -> Result<Started> {
+    let Prepared { root, conn, task_id, settings, settings_json, id, dir, row, masker, max_attempts, .. } = p;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     append_log(
-        &dir,
+        dir,
         &format!(
-            "started for task {task_id} ({}); implementers {}; reviewers {}; max attempts {max_attempts}; \
+            "started for task {task_id} ({}); implementers {}{}; reviewers {}{}; max attempts {max_attempts}; \
              quota threshold {}; fold on reject {}",
-            task.status,
+            p.entry_status,
             settings.implementers.iter().map(Entry::text).collect::<Vec<_>>().join(", "),
+            if p.impl_from_default { " (stored default)" } else { "" },
             settings.reviewers.iter().map(Entry::text).collect::<Vec<_>>().join(", "),
+            if p.rev_from_default { " (stored default)" } else { "" },
             settings.quota_threshold.map(|t| format!("{t}%")).unwrap_or_else(|| "none".into()),
             settings.fold_on_reject
         ),
-        &masker,
+        masker,
     );
 
-    let pid = match spawn_background(&root, &id) {
+    let pid = match spawn_background(root, id) {
         Ok(pid) => pid,
         Err(e) => {
             let stop = Stop::new(
@@ -629,17 +822,14 @@ pub fn start(paths: &Paths, cwd: &Path, a: StartArgs<'_>) -> Result<i32> {
             )
             .next(format!("thoth pipeline start {task_id} --implementer ... --reviewer ... --reason TEXT"))
             .evidence(json!({"dir": row.dir}));
-            settle(&conn, &row, &stop, &masker)?;
+            settle(conn, row, &stop, masker)?;
             bail!(
                 "could not start the background process of pipeline {id}: {e:#}; it is recorded as \
                  stopped (spawn_failed)"
             );
         }
     };
-    conn.execute(
-        "UPDATE pipelines SET pipeline_pid = ?1 WHERE pipeline_id = ?2",
-        params![pid as i64, id],
-    )?;
+    pipelines::set_pid(conn, pid as i64, id)?;
 
     // AUTO-1b: every entry of both lists is used in order, so AUTO-1a's
     // "only the first entry" warning is gone; the key stays for later notes.
@@ -654,19 +844,14 @@ pub fn start(paths: &Paths, cwd: &Path, a: StartArgs<'_>) -> Result<i32> {
         "pipeline_pid": pid,
         "warnings": warnings,
     });
-    if !a.json {
-        for w in &warnings {
-            masked_eprintln!("warning: {w}");
-        }
-    }
-    output::emit(
-        a.json,
-        &v,
-        &format!(
+    Ok(Started {
+        pipeline_id: id.clone(),
+        doc: v,
+        human: format!(
             "pipeline {id} started for task {task_id} (pid {pid}); follow it with `thoth pipeline show {task_id}`"
         ),
-    );
-    Ok(0)
+        warnings,
+    })
 }
 
 fn spawn_background(root: &Path, id: &str) -> Result<u32> {
@@ -719,7 +904,7 @@ fn show_doc(conn: &Connection, row: &Row, now: &str) -> Result<Value> {
         "step": row.step,
         "stale": is_stale(row, now),
         "stop_requested": row.stop_requested,
-        "settings": row.settings,
+        "settings": with_sources(&row.settings),
         "implementer_index": row.implementer_index,
         "reviewer_index": row.reviewer_index,
         "attempts_used": attempts_used(conn, &row.task_id),
@@ -749,6 +934,18 @@ fn entries_text(v: &Value) -> String {
                 .join(", ")
         })
         .unwrap_or_default()
+}
+
+/// LIGHT-1: how the human `pipeline show` marks a list from a stored default.
+fn default_mark(source: &Value, used: &Value) -> String {
+    if source != "default" {
+        return String::new();
+    }
+    format!(
+        " (stored default, set {}: {})",
+        used["set_at"].as_str().unwrap_or("?"),
+        used["reason"].as_str().unwrap_or("")
+    )
 }
 
 fn show_human(doc: &Value) -> String {
@@ -785,9 +982,11 @@ fn show_human(doc: &Value) -> String {
     }
     let s = &doc["settings"];
     lines.push(format!(
-        "settings: implementers {}; reviewers {}; max attempts {}; verify timeout {}s, verify wait {}s; quota threshold {}; fold on reject {}",
+        "settings: implementers {}{}; reviewers {}{}; max attempts {}; verify timeout {}s, verify wait {}s; quota threshold {}; fold on reject {}",
         entries_text(&s["implementers"]),
+        default_mark(&s["implementers_source"], &s["implementers_default"]),
         entries_text(&s["reviewers"]),
+        default_mark(&s["reviewers_source"], &s["reviewers_default"]),
         s["max_attempts"],
         s["verify_timeout_seconds"],
         s["verify_wait_seconds"],
@@ -833,9 +1032,17 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, wait: Option<&str>, json: b
     let wait = duration("wait", wait)?;
     let (_repo_id, _root, conn) = crate::commands::task::open_repo(paths, cwd)?;
     let task_id = ids::resolve_prefix(&state::list_task_ids(&conn)?, needle)?;
+    let (doc, code) = show_waiting(&conn, &task_id, wait)?;
+    output::emit(json, &doc, &show_human(&doc));
+    Ok(code)
+}
+
+/// `pipeline show`'s document and exit code: with `wait`, after waiting up
+/// to that many seconds for the pipeline to stop (3 if it still runs).
+fn show_waiting(conn: &Connection, task_id: &str, wait: Option<u64>) -> Result<(Value, i32)> {
     let deadline = wait.map(|w| Instant::now() + Duration::from_secs(w));
     loop {
-        let Some(row) = latest_for_task(&conn, &task_id)? else {
+        let Some(row) = latest_for_task(conn, task_id)? else {
             bail!("task {task_id} has no pipeline; start one with `thoth pipeline start {task_id} ...`");
         };
         let running = row.status == "running";
@@ -843,10 +1050,230 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, wait: Option<&str>, json: b
             std::thread::sleep(Duration::from_millis(500));
             continue;
         }
-        let doc = show_doc(&conn, &row, &ids::now_rfc3339())?;
-        output::emit(json, &doc, &show_human(&doc));
-        return Ok(if running && deadline.is_some() { 3 } else { 0 });
+        let doc = show_doc(conn, &row, &ids::now_rfc3339())?;
+        return Ok((doc, if running && deadline.is_some() { 3 } else { 0 }));
     }
+}
+
+// --- new -----------------------------------------------------------------------------
+
+pub struct NewArgs<'a> {
+    pub file: &'a Path,
+    pub title: Option<&'a str>,
+    pub base: Option<&'a str>,
+    pub wait: Option<&'a str>,
+    /// `pipeline start`'s flags; `task` is not used (the task is the one
+    /// this command creates).
+    pub start: StartArgs<'a>,
+}
+
+/// ONE-1 test seam (debug builds only): the pipeline start after the task is
+/// created is refused, as when its inputs changed in between.
+const NEW_START_REFUSE_SEAM: &str = "THOTH_TEST_PIPELINE_NEW_START_REFUSE";
+
+/// SMALL-12 test seam (debug builds only): after a refused start, the close of
+/// the new task is not attempted and counts as failed.
+const NEW_CLOSE_FAIL_SEAM: &str = "THOTH_TEST_PIPELINE_NEW_CLOSE_FAIL";
+
+/// A command-line word as typed: unquoted when it is plain, else in double
+/// quotes.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        quoted(s)
+    }
+}
+
+fn quoted(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// `pipeline start`'s flags exactly as given to `pipeline new`: the list
+/// entries in order, the reason, the other flags, `--json` when given.
+fn start_flags_text(a: &StartArgs<'_>) -> String {
+    let mut out = String::new();
+    for e in a.implementers {
+        out.push_str(&format!(" --implementer {}", shell_word(e)));
+    }
+    for e in a.reviewers {
+        out.push_str(&format!(" --reviewer {}", shell_word(e)));
+    }
+    if let Some(r) = a.reason {
+        out.push_str(&format!(" --reason {}", quoted(r)));
+    }
+    for (flag, value) in [
+        ("--max-attempts", a.max_attempts),
+        ("--timeout", a.timeout),
+        ("--review-timeout", a.review_timeout),
+        ("--verify-timeout", a.verify_timeout),
+        ("--verify-wait", a.verify_wait),
+        ("--quota-threshold", a.quota_threshold),
+    ] {
+        if let Some(v) = value {
+            out.push_str(&format!(" {flag} {}", shell_word(v)));
+        }
+    }
+    if a.fold_on_reject {
+        out.push_str(" --fold-on-reject");
+    }
+    if a.json {
+        out.push_str(" --json");
+    }
+    out
+}
+
+/// AC4: an important or high risk spec with both lists given. A new task has
+/// no APPROVE spec review, so the pipeline's first dispatch would be
+/// refused; the heavy-path commands are listed instead.
+fn heavy_path_refusal(a: &NewArgs<'_>, file: &str, risk: &str) -> String {
+    let mut create = format!("thoth task create -f {}", shell_word(file));
+    if let Some(t) = a.title {
+        create.push_str(&format!(" --title {}", quoted(t)));
+    }
+    if let Some(b) = a.base {
+        create.push_str(&format!(" --base {}", shell_word(b)));
+    }
+    create.push_str(" --json");
+    let mut steps = vec![
+        create,
+        "thoth spec review start TASK --edit --profile PROFILE --model MODEL --effort LEVEL --reason TEXT --json \
+         (a reviewer of another provider than the spec's author)"
+            .to_string(),
+        "thoth wait --run RUN --json".to_string(),
+        "thoth spec review confirm TASK --profile PROFILE --model MODEL --effort LEVEL --reason TEXT --json \
+         (by the spec's author, when `thoth spec review show TASK --json` has pending_edits true)"
+            .to_string(),
+        format!("once approved is true: thoth pipeline start TASK{}", start_flags_text(&a.start)),
+    ];
+    if let Some(w) = a.wait {
+        steps.push(format!("thoth pipeline show TASK --wait {} --json", shell_word(w)));
+    }
+    let numbered: Vec<String> = steps.iter().enumerate().map(|(i, s)| format!("{}. {s}", i + 1)).collect();
+    format!(
+        "refusing: spec {file} is {risk} risk, and nothing was created: a new task has no APPROVE spec review, \
+         so the pipeline's first dispatch would be refused (dispatch_refused). pipeline new is the light path \
+         (low or normal risk); an important or high risk task takes the heavy path. Run, in order:\n{}",
+        numbered.join("\n")
+    )
+}
+
+/// ONE-1: `thoth pipeline new`. Every refusal comes before the task is
+/// created; then `task create` and `pipeline start` run as those commands
+/// would.
+pub fn new(paths: &Paths, cwd: &Path, a: NewArgs<'_>) -> Result<i32> {
+    if std::env::var_os("THOTH_RUN_ID").is_some() {
+        bail!("pipeline new refuses to run with THOTH_RUN_ID set: a pipeline is started by the commander, not by a run");
+    }
+    let sa = &a.start;
+    check_flags(sa)?;
+    let wait = duration("wait", a.wait)?;
+    let (impl_default, rev_default) = stored_lists(paths, sa)?;
+    let plan = crate::commands::task::plan_create(paths, cwd, a.file, a.title, a.base)?;
+    let file = a.file.display().to_string();
+    if crate::spec::is_document_task(plan.raw()) {
+        bail!(
+            "spec {file} is a document task (task_type docs, research or review); the pipeline runs code tasks \
+             only. Create it with `thoth task create -f {}` and take its delivery with `thoth task accept TASK \
+             --reason TEXT` once it is in_review",
+            shell_word(&file)
+        );
+    }
+    let risk = plan.risk().to_string();
+    risk_rule(&format!("spec {file}"), &risk, &impl_default, &rev_default)?;
+    {
+        let gconn = db::open_global(paths)?;
+        entries_of(&gconn, sa, &impl_default, &rev_default)?;
+    }
+    if !matches!(risk.as_str(), "low" | "normal") {
+        bail!("{}", heavy_path_refusal(&a, &file, &risk));
+    }
+
+    let created = crate::commands::task::commit_create(paths, cwd, plan)?;
+    let task_id = created.task_id.clone();
+    let start_args = StartArgs { task: &task_id, ..*sa };
+    let outcome = if cfg!(debug_assertions) && std::env::var_os(NEW_START_REFUSE_SEAM).is_some() {
+        Err(StartFailure::Refused(anyhow!("{NEW_START_REFUSE_SEAM} is set (test seam)")))
+    } else {
+        start_quiet(paths, cwd, &start_args)
+    };
+    let started = match outcome {
+        Ok(s) => s,
+        Err(StartFailure::Refused(e)) => {
+            let reason = format!("thoth pipeline new closed it because the pipeline start was refused: {e:#}");
+            let closed = if cfg!(debug_assertions) && std::env::var_os(NEW_CLOSE_FAIL_SEAM).is_some() {
+                Err(anyhow!("{NEW_CLOSE_FAIL_SEAM} is set (test seam)"))
+            } else {
+                crate::commands::task::close_quiet(paths, cwd, &task_id, &reason)
+            };
+            match closed {
+                Ok(_) => bail!(
+                    "task {task_id} was created, but the pipeline start was refused, so thoth pipeline new closed \
+                     the task (cancelled). The pipeline start error: {e:#}"
+                ),
+                Err(ce) => bail!(
+                    "task {task_id} was created, but the pipeline start was refused, and closing the task failed; \
+                     task {task_id} is still queued without a pipeline. The pipeline start error: {e:#}. The \
+                     close error: {ce:#}"
+                ),
+            }
+        }
+        Err(StartFailure::Recorded { pipeline_id, error }) => bail!(
+            "task {task_id} was created and pipeline {pipeline_id} was recorded, but the start did not complete: \
+             {error:#}. The task stays queued; run `thoth pipeline start {task_id}{}` again",
+            start_flags_text(sa)
+        ),
+    };
+
+    let shown = match wait {
+        None => None,
+        Some(w) => {
+            let waited = crate::commands::task::open_repo(paths, cwd).and_then(|(_r, _root, conn)| show_waiting(&conn, &task_id, Some(w)));
+            match waited {
+                Ok(v) => Some(v),
+                Err(e) => bail!(
+                    "pipeline {} was started for task {task_id}, but waiting for it failed: {e:#}; follow it with \
+                     `thoth pipeline show {task_id}`",
+                    started.pipeline_id
+                ),
+            }
+        }
+    };
+    let code = shown.as_ref().map(|(_, c)| *c).unwrap_or(0);
+    let mut warnings = created.warnings.clone();
+    warnings.extend(started.warnings.iter().cloned());
+    if sa.json {
+        let v = json!({
+            "ok": true,
+            "task_id": task_id,
+            "pipeline_id": started.pipeline_id,
+            "task_create": created.doc,
+            "pipeline_start": started.doc,
+            "warnings": warnings,
+            "pipeline_show": shown.as_ref().map(|(d, _)| d.clone()),
+        });
+        output::emit(true, &v, "");
+    } else {
+        for w in &warnings {
+            masked_eprintln!("warning: {w}");
+        }
+        output::emit(false, &Value::Null, &created.human);
+        output::emit(false, &Value::Null, &started.human);
+        if let Some((d, _)) = &shown {
+            output::emit(false, d, &show_human(d));
+        }
+    }
+    Ok(code)
 }
 
 pub fn stop(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> {
@@ -868,10 +1295,7 @@ pub fn stop(paths: &Paths, cwd: &Path, needle: &str, json: bool) -> Result<i32> 
     }
     {
         let tx = db::write_tx(&conn)?;
-        tx.execute(
-            "UPDATE pipelines SET stop_requested = 1 WHERE pipeline_id = ?1 AND status = 'running'",
-            [&row.id],
-        )?;
+        pipelines::request_stop(&tx, &row.id)?;
         state::append_event(
             &tx,
             &state::NewEvent {
@@ -1204,10 +1628,7 @@ pub fn run_background(pipeline_id: &str) -> Result<i32> {
     if row.status != "running" {
         return Ok(0);
     }
-    conn.execute(
-        "UPDATE pipelines SET pipeline_pid = ?1 WHERE pipeline_id = ?2",
-        params![std::process::id() as i64, pipeline_id],
-    )?;
+    pipelines::set_pid(&conn, std::process::id() as i64, pipeline_id)?;
     let masker = Masker::load(Some(&paths.home));
     let settings: Settings = serde_json::from_value(row.settings.clone())
         .map_err(|e| anyhow!("pipeline {pipeline_id}'s settings cannot be read: {e}"))?;
@@ -1266,16 +1687,10 @@ fn heartbeat_loop(
     let mut last: Option<Instant> = None;
     while !done.load(Ordering::SeqCst) {
         if last.is_none_or(|l| l.elapsed() >= HEARTBEAT_EVERY) {
-            let _ = conn.execute(
-                "UPDATE pipelines SET heartbeat_at = ?1 WHERE pipeline_id = ?2 AND status = 'running'",
-                params![ids::now_rfc3339(), id],
-            );
+            let _ = pipelines::beat(&conn, &ids::now_rfc3339(), &id);
             last = Some(Instant::now());
         }
-        let stop = conn
-            .query_row("SELECT stop_requested FROM pipelines WHERE pipeline_id = ?1", [&id], |r| r.get::<_, i64>(0))
-            .unwrap_or(0)
-            != 0;
+        let stop = pipelines::stop_requested(&conn, &id).unwrap_or(false);
         let pid = verify_pid.load(Ordering::SeqCst);
         if stop && pid != 0 && !killed.swap(true, Ordering::SeqCst) {
             let _ = crate::process::controller().kill_tree(pid);
@@ -1513,10 +1928,7 @@ impl Bg {
 
     fn set_step(&mut self, step: &str) -> Result<()> {
         self.current_step = step.to_string();
-        self.conn.execute(
-            "UPDATE pipelines SET step = ?1 WHERE pipeline_id = ?2 AND status = 'running'",
-            params![step, self.id],
-        )?;
+        pipelines::set_step(&self.conn, step, &self.id)?;
         self.log(&format!("step {step}"));
         if std::env::var(FAIL_AT_SEAM).ok().as_deref() == Some(step) {
             bail!("injected failure at step {step} ({FAIL_AT_SEAM})");
@@ -1527,10 +1939,7 @@ impl Bg {
     fn set_impl_index(&mut self, pos: usize) -> Result<()> {
         if pos >= self.impl_index {
             self.impl_index = pos;
-            self.conn.execute(
-                "UPDATE pipelines SET implementer_index = ?1 WHERE pipeline_id = ?2",
-                params![pos as i64, self.id],
-            )?;
+            pipelines::set_implementer_index(&self.conn, pos as i64, &self.id)?;
         }
         Ok(())
     }
@@ -1538,10 +1947,7 @@ impl Bg {
     fn set_rev_index(&mut self, pos: usize) -> Result<()> {
         if pos >= self.rev_index {
             self.rev_index = pos;
-            self.conn.execute(
-                "UPDATE pipelines SET reviewer_index = ?1 WHERE pipeline_id = ?2",
-                params![pos as i64, self.id],
-            )?;
+            pipelines::set_reviewer_index(&self.conn, pos as i64, &self.id)?;
         }
         Ok(())
     }
@@ -1580,11 +1986,7 @@ impl Bg {
     }
 
     fn stop_requested(&self) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT stop_requested FROM pipelines WHERE pipeline_id = ?1",
-            [&self.id],
-            |r| r.get::<_, i64>(0),
-        )? != 0)
+        pipelines::stop_requested(&self.conn, &self.id)
     }
 
     fn stopped(&self, run: Option<&str>) -> Stop {
@@ -3343,5 +3745,67 @@ fn fmt_percent(p: f64) -> String {
         format!("{}", p as i64)
     } else {
         format!("{p}")
+    }
+}
+
+// SMALL-12: a pipeline recorded before LIGHT-1 can be made only by writing the
+// database, which no integration test may do, so its read-back is checked here
+// on the settings value itself (the agreed exception to the interface rule).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pre_light1_settings() -> Value {
+        json!({
+            "implementers": [{"profile": "claude-b", "model": "sonnet", "effort": "medium"}],
+            "reviewers": [
+                {"profile": "codex-a", "model": "gpt-5.6-luna", "effort": "medium"},
+                {"profile": "claude-a", "model": "opus", "effort": "high"}
+            ],
+            "max_attempts": 3,
+            "timeout_seconds": 3600,
+            "review_timeout_seconds": null,
+            "verify_timeout_seconds": 1800,
+            "verify_wait_seconds": 600,
+            "reason": "recorded before LIGHT-1"
+        })
+    }
+
+    #[test]
+    fn a_pipeline_recorded_before_light_1_reads_back_as_two_lists_from_their_flags() {
+        let old = pre_light1_settings();
+
+        // what `pipeline show --json` prints under settings
+        let shown = with_sources(&old);
+        let (old_map, shown_map) = (old.as_object().unwrap(), shown.as_object().unwrap());
+        assert_eq!(shown["implementers_source"], "flag");
+        assert_eq!(shown["reviewers_source"], "flag");
+        assert_eq!(shown["implementers_default"], Value::Null);
+        assert_eq!(shown["reviewers_default"], Value::Null);
+        assert_eq!(shown_map.len(), old_map.len() + 4, "{shown}");
+        for (k, v) in old_map {
+            assert_eq!(&shown[k.as_str()], v, "{k}");
+        }
+
+        // what the background pipeline reads
+        let read: Settings = serde_json::from_value(old).unwrap();
+        assert_eq!(read.implementers_source, "flag");
+        assert_eq!(read.reviewers_source, "flag");
+        assert_eq!(read.implementers_default, None);
+        assert_eq!(read.reviewers_default, None);
+        assert_eq!(read.implementers.len(), 1);
+        assert_eq!(read.reviewers.len(), 2);
+
+        // a settings value that has the four keys is returned unchanged
+        let mut current = pre_light1_settings();
+        let o = current.as_object_mut().unwrap();
+        o.insert("implementers_source".into(), json!("default"));
+        o.insert("reviewers_source".into(), json!("flag"));
+        o.insert(
+            "implementers_default".into(),
+            json!({"reason": "stored pair", "set_at": "2026-11-01T00:00:00Z"}),
+        );
+        o.insert("reviewers_default".into(), Value::Null);
+        assert_eq!(with_sources(&current), current);
     }
 }

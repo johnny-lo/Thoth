@@ -64,6 +64,7 @@ pub const STATE_CHANGING: &[&str] = &[
     "thoth_checks_remove",
     "thoth_pipeline_start",
     "thoth_pipeline_stop",
+    "thoth_pipeline_new",
 ];
 
 /// Set in the environment of `thoth_checks_approve`'s child only, so the
@@ -708,9 +709,44 @@ fn execute(
             flag(&mut argv, a, "reason", "reason")
         }
         "thoth_checks_remove" => pos!("id"),
-        "thoth_pipeline_start" => {
-            pos!("task");
+        "thoth_pipeline_start" | "thoth_pipeline_new" => {
+            // ONE-1: pipeline new takes exactly one of spec or file in place
+            // of the task; checked first, and the spec is written only after
+            // every other parameter passed, so a tool error leaves no file.
+            let new_file = if t.name == "thoth_pipeline_new" {
+                match (a.get("spec"), a.get("file").and_then(Value::as_str)) {
+                    (Some(_), None) => None,
+                    (None, Some(file)) => {
+                        let p = PathBuf::from(file);
+                        if !p.is_absolute() || !p.is_file() {
+                            return tool_error(
+                                "parameter file must be the absolute path of an existing file".into(),
+                                None,
+                                None,
+                                None,
+                            );
+                        }
+                        Some(p)
+                    }
+                    _ => {
+                        return tool_error(
+                            "parameters spec and file: exactly one is required".into(),
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                }
+            } else {
+                pos!("task");
+                None
+            };
+            // LIGHT-1: a list left out passes no flag, so the stored default
+            // applies (or the CLI refuses); an empty array is still an error.
             for (n, f) in [("implementers", "implementer"), ("reviewers", "reviewer")] {
+                if a.get(n).is_none_or(Value::is_null) {
+                    continue;
+                }
                 let items = a[n].as_array().cloned().unwrap_or_default();
                 if items.is_empty() {
                     return tool_error(format!("parameter {n} must not be empty"), None, None, None);
@@ -742,6 +778,21 @@ fn execute(
                 ("verify_wait", "verify-wait"),
             ] {
                 flag(&mut argv, a, n, f)
+            }
+            if t.name == "thoth_pipeline_new" {
+                flag(&mut argv, a, "title", "title");
+                flag(&mut argv, a, "base", "base");
+                let file = match new_file {
+                    Some(p) => p,
+                    None => match json_file(&paths, "spec", &a["spec"]) {
+                        Ok(p) => {
+                            temp = Some(p.clone());
+                            p
+                        }
+                        Err(e) => return tool_error(e.to_string(), None, None, None),
+                    },
+                };
+                argv.push(format!("--file={}", file.display()))
             }
         }
         "thoth_pipeline_show" => {

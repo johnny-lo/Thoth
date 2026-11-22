@@ -240,7 +240,7 @@ fn old_agentctl_dir_only() {
     std::fs::write(home.path().join(".agentctl").join("global.db"), "").unwrap();
     let before = tree(home.path());
 
-    let out = Command::new(env!("CARGO_BIN_EXE_thoth"))
+    let out = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")))
         .args(["doctor", "--json"])
         .current_dir(f.repo.path())
         .env("USERPROFILE", home.path())
@@ -445,7 +445,7 @@ fn checks_missing_program_named_once_when_not_adjacent_in_the_list() {
 /// A state directory that is not there, and a half-set AGENTCTL_HOME: the
 /// detail names the path and where it came from.
 fn doctor_in(home: &Path, f: &common::Fixture, vars: &[(&str, &Path)]) -> Value {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
     c.args(["doctor", "--json"])
         .current_dir(f.repo.path())
         .env("USERPROFILE", home)
@@ -711,7 +711,7 @@ struct Mcp {
 
 impl Mcp {
     fn start(f: &common::Fixture) -> Mcp {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .current_dir(f.repo.path())
             .env("THOTH_HOME", f.home.path())

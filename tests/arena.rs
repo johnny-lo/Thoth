@@ -350,6 +350,59 @@ fn b_the_automatic_refresh_touches_an_unchanged_sha_and_downloads_a_new_one() {
     assert_eq!(v["external"]["agent_arena"]["boards"], json!(["agent", "agent_a", "agent_b"]), "{v}");
 }
 
+// --- SMALL-16 (DT-6): the refresh lock of a process that is gone ------------------------
+
+const LOCK_FILE: &str = ".model-scores.refresh.lock";
+
+/// A fresh lock file with `content`, as the refresh of another process would
+/// have written it a moment ago.
+fn write_lock(f: &Fixture, content: &str) -> PathBuf {
+    let lock = f.home_path().join(LOCK_FILE);
+    fs::write(&lock, content).unwrap();
+    lock
+}
+
+#[test]
+fn a_score_refresh_lock_of_a_dead_process_is_reclaimed_at_once() {
+    let f = setup();
+    let hub = Hub::new();
+    hub.publish("sha-one", &["agent_a"]);
+    switch_on(&f);
+    // fresh (just written), but its process id belongs to nothing
+    let lock = write_lock(&f, &format!("2147483000 {}", ago(0)));
+    let (v, stderr, code) = models_json(&f, &hub, false);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(v["auto_refresh"]["attempted"], json!(["Agent Arena"]), "{v}");
+    assert!(v["auto_refresh"]["skipped"].is_null(), "{v}");
+    assert_eq!(v["auto_refresh"]["failed"], json!([]), "{v}");
+    assert!(!lock.exists(), "the refresh that took the lock removed it afterwards");
+}
+
+#[test]
+fn a_fresh_lock_of_a_live_process_or_an_empty_one_skips_the_refresh_as_busy() {
+    let f = setup();
+    let hub = Hub::new();
+    hub.publish("sha-one", &["agent_a"]);
+    switch_on(&f);
+    // this very process is alive: its lock is held
+    let live = write_lock(&f, &format!("{} {}", std::process::id(), ago(0)));
+    let (v, stderr, code) = models_json(&f, &hub, false);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(v["auto_refresh"]["skipped"], "busy", "{v}");
+    assert_eq!(v["auto_refresh"]["attempted"], json!([]), "{v}");
+    assert!(live.exists(), "a lock that is held stays");
+    // an empty lock (the moment between creating the file and writing it) is held too
+    write_lock(&f, "");
+    let (v, _, _) = models_json(&f, &hub, false);
+    assert_eq!(v["auto_refresh"]["skipped"], "busy", "{v}");
+    assert_eq!(v["auto_refresh"]["attempted"], json!([]), "{v}");
+    // and so is one with a time only, the content older versions wrote
+    write_lock(&f, &ago(0));
+    let (v, _, _) = models_json(&f, &hub, false);
+    assert_eq!(v["auto_refresh"]["skipped"], "busy", "{v}");
+    assert_eq!(v["auto_refresh"]["attempted"], json!([]), "{v}");
+}
+
 // --- AC1 (c): failures leave the old cache alone -------------------------------------
 
 #[test]
@@ -514,10 +567,7 @@ fn f_only_the_agent_arena_requests_of_the_real_fetch_follow_redirects() {
     let asl_url = fixture_url("tests/fixtures/aistupidlevel/v1-models.json");
     let aa_base = format!("{}/page-", fixture_url("tests/fixtures/artificialanalysis"));
 
-    let mut c = std::process::Command::new(&thoth);
-    for var in ["THOTH_RUN_ID", "THOTH_INBOX_DIR", "THOTH_EXE", "THOTH_RECORDS_DIR", "THOTH_MACHINE_NAME"] {
-        c.env_remove(var);
-    }
+    let mut c = common::scrubbed(std::process::Command::new(&thoth));
     let out = c
         .current_dir(f.repo.path())
         .env("THOTH_HOME", f.home.path())

@@ -26,7 +26,8 @@ fn cmd(f: &Fixture) -> assert_cmd::Command {
     let mut c = f.cmd();
     for name in std::env::vars_os().map(|(name, _)| name) {
         let upper = name.to_string_lossy().to_uppercase();
-        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+        // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
             c.env_remove(&name);
         }
     }
@@ -857,8 +858,11 @@ fn a_killed_pipeline_turns_stale_and_a_restart_attaches_without_dispatching_agai
     assert_eq!(of_type(&events(&f, &task), "pipeline_started")[1]["detail"]["entry_status"], "in_review");
 }
 
+// SMALL-11 changed this: `thoth status` settles a run whose runner is dead as
+// interrupted (reason crash), the pipeline reads status while it waits, so it
+// resumes the run once as for any crash instead of stopping `runner_lost`.
 #[test]
-fn a_lost_runner_stops_the_pipeline_with_runner_lost_and_the_cancel_command() {
+fn a_lost_runner_is_settled_as_a_crash_and_the_pipeline_resumes_it_once() {
     let f = setup();
     let task = create(&f);
     let (_gate, _) = gated_start(&f, &task, &[]);
@@ -874,14 +878,26 @@ fn a_lost_runner_stops_the_pipeline_with_runner_lost_and_the_cancel_command() {
         std::thread::sleep(Duration::from_millis(200));
     };
     common::kill_pid_only(runner);
-    let doc = wait_stopped(&f, &task);
-    assert_eq!(stop_reason(&doc), "runner_lost", "{doc:#}");
-    assert_eq!(doc["stop"]["evidence"]["run_id"], run.as_str());
-    let hb = s(&doc["stop"]["evidence"]["heartbeat_at"]);
-    assert_eq!(run_row(&f, &task, &run)["heartbeat_at"], hb.as_str());
-    assert!(s(&doc["stop"]["summary"]).contains(&hb), "{doc:#}");
-    let cancel = format!("thoth cancel {run}");
-    assert!(doc["stop"]["next"].as_array().unwrap().iter().any(|n| n == cancel.as_str()), "{doc:#}");
+    // the pipeline does not stop: it resumes the crashed run (wait_show panics
+    // when the pipeline stops, so a runner_lost stop fails here)
+    let doc = wait_show(&f, &task, "a resume step", |v| !steps(v, "resume").is_empty());
+    assert_ne!(doc["status"], "stopped", "{doc:#}");
+    let resumes = steps(&doc, "resume");
+    assert_eq!(resumes.len(), 1, "{doc:#}");
+    assert_eq!(resumes[0]["run_id"], run.as_str(), "{doc:#}");
+    assert!(s(&resumes[0]["reason"]).contains("crash"), "{doc:#}");
+    // `status` settled the dead runner's run as interrupted with reason crash.
+    // The resume returns the same run to running, and the pipeline resumes it
+    // on its own schedule, so what a test can read afterwards is the event
+    // that settlement wrote, not the run's status at that moment.
+    let settled: Vec<Value> = events(&f, &task)
+        .into_iter()
+        .filter(|e| e["type"] == "status_change" && e["run_id"] == run.as_str() && e["detail"]["settled_by"] == "status")
+        .collect();
+    assert_eq!(settled.len(), 1, "{settled:?}");
+    assert_eq!(settled[0]["detail"]["to"], "interrupted", "{settled:?}");
+    assert_eq!(settled[0]["detail"]["interrupted_reason"], "crash", "{settled:?}");
+    assert_ne!(show(&f, &task)["stop"]["reason"], "runner_lost");
 }
 
 // --- AC5: the protected-change gate --------------------------------------------------
@@ -1311,7 +1327,9 @@ fn dead_reused_or_malformed_slot_owners_are_recovered_and_a_timeout_lists_the_ho
     let p1 = start(&f, &t1, &[], &worker_env(&t1, "hooks", "review_pass"));
     wait_show(&f, &t1, "E in verify", |v| v["step"] == "verify" && !gate_log(&f, "E").0.is_empty());
     let t2 = create_in(&f, other.path(), Fixture::SPEC);
-    start_in(&f, other.path(), &t2, &["--verify-wait", "3s"], &worker_env(&t2, "hooks", "review_pass"));
+    // the slot is never freed while t2 waits (gate E stays closed), so 1s
+    // is as good a timeout as 3s
+    start_in(&f, other.path(), &t2, &["--verify-wait", "1s"], &worker_env(&t2, "hooks", "review_pass"));
     let d2 = wait_stopped_in(&f, other.path(), &t2);
     assert_eq!(stop_reason(&d2), "verify_wait_timeout", "{d2:#}");
     let holders = d2["stop"]["evidence"]["holders"].as_array().unwrap();
@@ -1786,11 +1804,12 @@ struct McpServer {
 impl McpServer {
     fn start(f: &Fixture, envs: &[(&str, &str)]) -> Self {
         use std::process::Stdio;
-        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(std::process::Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp").arg("--default-repo").arg(f.repo_path()).arg("--max-wait").arg("5s").current_dir(f.repo_path());
         for name in std::env::vars_os().map(|(name, _)| name) {
             let upper = name.to_string_lossy().to_uppercase();
-            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+            // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
                 c.env_remove(&name);
             }
         }
@@ -1853,7 +1872,8 @@ fn the_three_pipeline_tools_start_show_and_stop_through_mcp() {
     assert_eq!(start_schema["properties"]["implementers"], json!({"type": "array", "items": {"type": "string"}}));
     let mut required: Vec<String> = start_schema["required"].as_array().unwrap().iter().map(s).collect();
     required.sort();
-    assert_eq!(required, ["implementers", "reason", "reviewers", "task"]);
+    // LIGHT-1: both lists are optional; a list left out uses the stored default
+    assert_eq!(required, ["reason", "task"]);
     assert_eq!(tools.last().unwrap()["name"], "thoth_guide");
     assert!(!tools.iter().any(|t| s(&t["name"]).contains("pipeline_run")));
     assert!(serde_json::to_vec(&list["result"]["tools"]).unwrap().len() <= 20_000);

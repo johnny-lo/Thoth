@@ -135,9 +135,7 @@ pub fn category_blocks(category: Option<&str>) -> bool {
         .is_none_or(|c| c.class == FindingClass::Blocking)
 }
 
-/// REV-1 (AC3): whether a review's findings hold at least one blocking
-/// finding: an unmet criterion or an extra finding whose category blocks
-/// (`category_blocks`). A met criterion never counts.
+/// REV-1 (AC3): whether a review's findings hold at least one blocking finding: an unmet criterion or an extra finding whose category blocks (`category_blocks`; no category blocks). An unmet criterion with an advisory category and a met criterion never count.
 pub fn has_blocking_findings(findings: &Findings) -> bool {
     findings
         .criteria
@@ -636,6 +634,21 @@ pub fn output_schema() -> serde_json::Value {
     let mut category_enum = category_names();
     category_enum.push(NO_LABEL);
     let category = serde_json::json!({"type": "string", "enum": category_enum});
+    // MEAS-1 (AC3): the marks on the previous REJECT's findings; strict, so
+    // every field is required and "" stands for no note or no diff_at.
+    let prior_rejection = serde_json::json!({"type": "array", "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["review_id", "ref", "fixed_by_behaviour", "evidence", "diff_at", "note"],
+        "properties": {
+            "review_id": {"type": "string"},
+            "ref": {"type": "string"},
+            "fixed_by_behaviour": {"type": "string", "enum": crate::prior_rejection::VALUES},
+            "evidence": codes,
+            "diff_at": {"type": "string"},
+            "note": {"type": "string"},
+        },
+    }});
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -645,7 +658,7 @@ pub fn output_schema() -> serde_json::Value {
             "findings": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["criteria", "extra_findings"],
+                "required": ["criteria", "extra_findings", "prior_rejection"],
                 "properties": {
                     "criteria": {"type": "array", "items": {
                         "type": "object",
@@ -672,6 +685,7 @@ pub fn output_schema() -> serde_json::Value {
                             "category": category,
                         },
                     }},
+                    "prior_rejection": prior_rejection,
                 },
             },
         },

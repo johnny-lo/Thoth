@@ -287,6 +287,8 @@ fn check_approvals_an_existing_approval_survives_the_upgrade() {
     let ch = doctor_checks(&f);
     assert_eq!(ch["data"]["stale"], json!([]), "{ch:#}");
     assert_eq!(ch["data"]["approved"], 1, "{ch:#}");
+    // a broken fallback would list the check here instead
+    assert_eq!(ch["data"]["unreadable"], json!([]), "{ch:#}");
 
     let l = list(&f);
     let c1 = row(&l, "c1");

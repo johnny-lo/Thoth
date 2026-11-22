@@ -23,7 +23,7 @@ use crate::spec;
 use crate::spec_edits::ReviewMode;
 use crate::worktree;
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// brief §15: the reviewer may read and run, never edit. `Bash` stays in
@@ -77,13 +77,8 @@ pub struct StartArgs<'a> {
 /// if another implementer run completed while the review was in flight; the
 /// event is a fact about this review.
 pub fn target_run_id_for(conn: &Connection, reviewer_run_id: &str) -> Result<Option<String>> {
-    let detail: Option<String> = conn
-        .query_row(
-            "SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
-            rusqlite::params![reviewer_run_id, event_type::REVIEW_STARTED],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let detail: Option<String> =
+        state::latest_event_detail_of_run(conn, reviewer_run_id, event_type::REVIEW_STARTED)?;
     Ok(detail
         .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
         .and_then(|v| v["target_run_id"].as_str().map(|s| s.to_string())))
@@ -92,39 +87,38 @@ pub fn target_run_id_for(conn: &Connection, reviewer_run_id: &str) -> Result<Opt
 /// Read the latest accepted delivery for this exact target, including manual
 /// resubmissions. Never substitute the task's other attempts.
 pub fn target_result(conn: &Connection, target_run_id: &str) -> Result<serde_json::Value> {
-    let detail: Option<String> = conn.query_row(
-        "SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
-        rusqlite::params![target_run_id, event_type::RESULT_INGESTED],
-        |r| r.get(0),
-    ).optional()?;
+    let detail: Option<String> =
+        state::latest_event_detail_of_run(conn, target_run_id, event_type::RESULT_INGESTED)?;
     Ok(detail.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .map(|d| d["result_json"].clone()).unwrap_or(serde_json::Value::Null))
 }
 
-/// Which evidence codes a reviewer run actually opened, from its
-/// `evidence_opened` events (v6 §2.3, and the honesty metric in §13).
-pub fn opened_codes(conn: &Connection, reviewer_run_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq",
-    )?;
-    let details = stmt
-        .query_map(
-            rusqlite::params![reviewer_run_id, event_type::EVIDENCE_OPENED],
-            |r| r.get::<_, String>(0),
-        )?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-    let mut out: Vec<String> = Vec::new();
-    for d in details {
-        if let Some(code) = serde_json::from_str::<serde_json::Value>(&d)
-            .ok()
-            .and_then(|v| v["code"].as_str().map(|s| s.to_string()))
-        {
-            if !out.contains(&code) {
-                out.push(code);
-            }
-        }
-    }
-    Ok(out)
+/// What a reviewer run opened, from its `evidence_opened` events (v6 §2.3,
+/// and the honesty metric in §13), and how it compares with what it cites.
+pub struct Opened {
+    /// Every code opened, in event order: through `evidence show`, or (EVOPEN-1)
+    /// found in a Codex or agy reviewer's stream.
+    pub opened: Vec<String>,
+    /// EVOPEN-1: the codes of `opened` found in the reviewer's stream.
+    pub in_stream: Vec<String>,
+    /// The cited codes not in `opened`.
+    pub unopened: Vec<String>,
+}
+
+/// `Opened` for `reviewer_run_id` against `cited`.
+pub fn opened_codes(conn: &Connection, reviewer_run_id: &str, cited: &[String]) -> Result<Opened> {
+    let (opened, in_stream) = crate::commands::evidence_stream::opened_split(conn, reviewer_run_id)?;
+    let unopened = cited.iter().filter(|c| !opened.contains(c)).cloned().collect();
+    Ok(Opened { opened, in_stream, unopened })
+}
+
+/// `opened_codes`, with a failed read as nothing opened (an ingest goes on).
+pub fn opened_or_none(conn: &Connection, reviewer_run_id: &str, cited: &[String]) -> Opened {
+    opened_codes(conn, reviewer_run_id, cited).unwrap_or_else(|_| Opened {
+        opened: Vec::new(),
+        in_stream: Vec::new(),
+        unopened: cited.to_vec(),
+    })
 }
 
 /// Records the target run's candidate diff the way the runner does: from the
@@ -141,31 +135,167 @@ fn record_target_diff(
     candidate: &str,
     root: &Path,
 ) -> Result<String> {
+    let row = prepare_target_diff(conn, paths, repo_id, task_base, target, candidate, root)?;
+    evidence::insert_prepared(conn, &target_ctx(paths, repo_id, target), row)
+}
+
+/// The evidence context of the target run: the diff and the commit are
+/// attributed to the implementer run whose candidate this is, not to the
+/// review, since they are evidence about the implementation.
+fn target_ctx<'a>(paths: &'a Paths, repo_id: &'a str, target: &'a Run) -> evidence::EvidenceContext<'a> {
+    evidence::EvidenceContext { paths, repo_id, task_id: &target.task_id, run_id: &target.run_id }
+}
+
+/// `record_target_diff`'s git work and blob, without the insert (RES-1b).
+fn prepare_target_diff(
+    conn: &Connection,
+    paths: &Paths,
+    repo_id: &str,
+    task_base: &str,
+    target: &Run,
+    candidate: &str,
+    root: &Path,
+) -> Result<evidence::PreparedRow> {
     let tip = worktree::rev_parse_head(root).ok();
-    let ctx = evidence::EvidenceContext {
-        paths,
-        repo_id,
-        task_id: &target.task_id,
-        // Attributed to the implementer run whose candidate this is, not to the
-        // review: the diff is evidence about the implementation.
-        run_id: &target.run_id,
+    let ctx = target_ctx(paths, repo_id, target);
+    // Nothing to attribute when the run starts at the task's base and there
+    // is no tip to compare with: that is the plain diff.
+    let attribution = match tip {
+        None if task_base == target.base_commit => None,
+        _ => Some(evidence::Attribution { task_base, integration_tip: tip.as_deref() }),
     };
-    match tip {
-        // Nothing to attribute: the run starts at the task's base and there is
-        // no tip to compare with, so this is the plain diff.
-        None if task_base == target.base_commit => {
-            evidence::record_diff(conn, &ctx, root, &target.base_commit, candidate)
+    evidence::prepare_diff_attributed(conn, &ctx, root, &target.base_commit, candidate, attribution.as_ref())
+}
+
+/// RES-1b: what a research task's PASS prepared before the write lock: the
+/// candidate's missing diff and commit evidence (git run, blobs stored), and
+/// the warnings and the error of recording a diff again that
+/// `prepare_protected_evidence` would give.
+struct PreparedCandidateEvidence {
+    /// The run the rows belong to (the run validated in step 3).
+    run_id: String,
+    /// The rows to insert, diff before commit; `bool` is true for a diff
+    /// recorded again because the newest one had no readable list.
+    rows: Vec<(evidence::PreparedRow, bool)>,
+    warnings: Vec<String>,
+    again_error: Option<String>,
+}
+
+/// RES-1b: `prepare_protected_evidence` for a research task's PASS, with the
+/// git work done now, outside the write lock, and the inserts left to
+/// `insert_candidate_evidence` inside the transaction.
+fn prepare_candidate_evidence(
+    conn: &Connection,
+    paths: &Paths,
+    repo_id: &str,
+    task_base: &str,
+    target: &Run,
+    candidate: &str,
+    root: &Path,
+) -> PreparedCandidateEvidence {
+    let mut warnings: Vec<String> = Vec::new();
+    let existing = match state::list_evidence_for_task(conn, &target.task_id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warnings.push(format!(
+                "could not read task {}'s existing evidence ({e}); the candidate diff and \
+                 commit may be recorded a second time",
+                target.task_id
+            ));
+            Vec::new()
         }
-        _ => evidence::record_diff_attributed(
-            conn,
-            &ctx,
-            root,
-            &target.base_commit,
-            candidate,
-            Some(&evidence::Attribution { task_base, integration_tip: tip.as_deref() }),
-        ),
+    };
+    let has = |kind: &str, field: &str| {
+        existing.iter().any(|row| {
+            row.kind == kind
+                && serde_json::from_str::<serde_json::Value>(&row.detail)
+                    .ok()
+                    .and_then(|d| d[field].as_str().map(|s| s == candidate))
+                    .unwrap_or(false)
+        })
+    };
+    let unreadable = matches!(
+        crate::protected::latest_diff(conn, target),
+        Ok(Some(ref d)) if d.changes.is_none()
+    );
+    let mut rows = Vec::new();
+    let mut again_error = None;
+    let diff = || prepare_target_diff(conn, paths, repo_id, task_base, target, candidate, root);
+    if !has("diff", "to_commit") {
+        match diff() {
+            Ok(row) => rows.push((row, false)),
+            Err(e) => {
+                warnings.push(format!("could not record the candidate diff: {e:#}"));
+                // the newest diff stays the unreadable one, and recording it
+                // again would run the same git commands
+                if unreadable {
+                    again_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+    } else if unreadable {
+        match diff() {
+            Ok(row) => rows.push((row, true)),
+            Err(e) => again_error = Some(format!("{e:#}")),
+        }
+    }
+    if !has("commit", "sha") {
+        match evidence::prepare_commit(&target_ctx(paths, repo_id, target), root, candidate) {
+            Ok(row) => rows.push((row, false)),
+            Err(e) => warnings.push(format!("could not record the candidate commit: {e:#}")),
+        }
+    }
+    PreparedCandidateEvidence { run_id: target.run_id.clone(), rows, warnings, again_error }
+}
+
+/// RES-1b: inserts what `prepare_candidate_evidence` prepared, inside the
+/// caller's transaction; returns the warnings and the error of recording a
+/// diff again, as `prepare_protected_evidence` does.
+fn insert_candidate_evidence(
+    tx: &Connection,
+    paths: &Paths,
+    repo_id: &str,
+    target: &Run,
+    prepared: PreparedCandidateEvidence,
+) -> (Vec<String>, Option<String>) {
+    let PreparedCandidateEvidence { rows, mut warnings, mut again_error, .. } = prepared;
+    let ctx = target_ctx(paths, repo_id, target);
+    for (row, again) in rows {
+        let kind = row.kind();
+        if let Err(e) = evidence::insert_prepared(tx, &ctx, row) {
+            if again {
+                again_error = Some(format!("{e:#}"));
+            } else {
+                warnings.push(format!("could not record the candidate {kind}: {e:#}"));
+            }
+        }
+    }
+    (warnings, again_error)
+}
+
+/// Test seam, debug builds only, so a release build has no such switch and
+/// ignores the variable. With `THOTH_TEST_RECORD_PAUSE=P`, `review record`
+/// writes the file `P.reached` right before it takes the write lock and
+/// waits (at most 30 s) until the file `P.go` exists, so a test can show
+/// that nothing holds the lock while its git work runs.
+#[cfg(debug_assertions)]
+fn test_record_pause() {
+    let Some(p) = std::env::var_os("THOTH_TEST_RECORD_PAUSE") else { return };
+    let p = std::path::PathBuf::from(p);
+    let with = |ext: &str| {
+        let mut s = p.clone().into_os_string();
+        s.push(ext);
+        std::path::PathBuf::from(s)
+    };
+    let _ = std::fs::write(with(".reached"), b"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !with(".go").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+#[cfg(not(debug_assertions))]
+fn test_record_pause() {}
 
 /// Makes the target's protected changes checkable before the gate reads
 /// them: `ensure_candidate_evidence`, then, when the newest diff evidence has
@@ -248,11 +378,13 @@ pub(crate) fn protected_refusal(
         )));
     };
     let Some(changes) = latest.changes else {
+        // TESTGAP-2: "recording it again failed" only when it did; a row
+        // recorded again that still has no readable list stops after the
+        // first half.
+        let again = again_error.map(|e| format!(", and recording it again failed; {e}")).unwrap_or_default();
         return Ok(Some(format!(
-            "run {run_id}'s diff evidence {} has no readable protected_changes, and recording it \
-             again failed{}",
+            "run {run_id}'s diff evidence {} has no readable protected_changes{again}",
             latest.code,
-            again_error.map(|e| format!("; {e}")).unwrap_or_default()
         )));
     };
     let left = crate::protected::uncovered(
@@ -514,7 +646,7 @@ fn launch(paths: &Paths, cwd: &Path, args: StartArgs<'_>, confirm: bool) -> Resu
     )?;
     let require_reason = crate::commands::settings::require_reason(&paths.home);
     auto_pick::require_reason_gate(&task_id, command, reason.as_deref(), require_reason)?;
-    let launch = auto_pick::launch_settings(&choice, &profile);
+    let launch = auto_pick::launch_settings(&gconn, &choice, &profile);
     // SMALL-9b: the effort sent picks the limit; the previous run's is never kept.
     let timeout_seconds = args
         .timeout_seconds
@@ -1139,13 +1271,16 @@ pub(crate) fn new_review_row(
     reviewer_run_id: Option<String>,
     verdict: Verdict,
     findings: &review_json::Findings,
+    marks: &crate::prior_rejection::Marks,
 ) -> state::Review {
     state::Review {
         review_id: ids::new_review_id(),
         target_run_id,
         reviewer_run_id,
         verdict: verdict.as_str().to_string(),
-        findings: serde_json::to_string(findings).unwrap_or_else(|_| "{}".to_string()),
+        // MEAS-1 (AC5): the marks and their check ride along; a record with
+        // neither keeps the bytes it always had.
+        findings: marks.findings_json(findings),
         created_at: ids::now_rfc3339(),
     }
 }
@@ -1170,6 +1305,9 @@ pub(crate) struct VerdictEventShape<'a> {
     pub(crate) cited: &'a [String],
     pub(crate) opened: Option<&'a [String]>,
     pub(crate) unopened: Option<&'a [String]>,
+    /// EVOPEN-1: the codes of `opened` found in the reviewer's stream;
+    /// `None` (null) where `opened` is.
+    pub(crate) opened_in_stream: Option<&'a [String]>,
     pub(crate) source: Option<&'a str>,
     /// REV-3 (AC3): the required checks that did not run, as the code review
     /// was checked against them; recorded as `checks_not_run` (null for a
@@ -1178,6 +1316,9 @@ pub(crate) struct VerdictEventShape<'a> {
     /// against the edit review run that holds the fix's verify); `None`
     /// leaves the key out.
     pub(crate) checks_not_run: Option<&'a [crate::required_checks::NotRun]>,
+    /// MEAS-1 (AC5): the `prior_rejection` key: the stored check's summary,
+    /// or null when the record stores none (and for a source check).
+    pub(crate) prior_rejection: serde_json::Value,
 }
 
 /// The `verdict` event's `detail`, shared by the reviewer-run path and
@@ -1191,8 +1332,10 @@ pub(crate) fn verdict_event_detail(shape: VerdictEventShape<'_>) -> serde_json::
         cited,
         opened,
         unopened,
+        opened_in_stream,
         source,
         checks_not_run,
+        prior_rejection,
     } = shape;
     let mut detail = serde_json::json!({
         "verdict": verdict.as_str(),
@@ -1205,6 +1348,7 @@ pub(crate) fn verdict_event_detail(shape: VerdictEventShape<'_>) -> serde_json::
         "cited": cited,
         "opened": opened,
         "unopened_citation": unopened,
+        "opened_in_stream": opened_in_stream,
     });
     // REV-1 (AC3): whether the verdict came with a blocking finding, next to
     // the reviewer's own verdict (Thoth does not change it). A source check
@@ -1217,6 +1361,8 @@ pub(crate) fn verdict_event_detail(shape: VerdictEventShape<'_>) -> serde_json::
         detail["has_blocking_findings"] =
             serde_json::Value::Bool(review_json::has_blocking_findings(&doc.findings));
     }
+    // MEAS-1 (AC5): the marks' check, summarised; never part of the verdict.
+    detail["prior_rejection"] = if doc.findings.sources.is_empty() { prior_rejection } else { serde_json::Value::Null };
     // REV-3 (AC3): what the review was checked against.
     if let Some(list) = checks_not_run {
         detail["checks_not_run"] = if doc.findings.sources.is_empty() {
@@ -1314,18 +1460,17 @@ pub fn ingest_review(
     };
 
     let verdict = Verdict::parse(&doc.verdict).unwrap_or(Verdict::Unverified);
-    let opened = opened_codes(conn, &run.run_id).unwrap_or_default();
-    let unopened: Vec<String> = cited
-        .iter()
-        .filter(|c| !opened.contains(c))
-        .cloned()
-        .collect();
+    let Opened { opened, in_stream, unopened } = opened_or_none(conn, &run.run_id, &cited);
 
+    // MEAS-1: the marks on the previous REJECT, checked now; they never
+    // change what this review settles.
+    let marks = crate::prior_rejection::for_review(conn, task, target_run_id, json_text);
     let review = new_review_row(
         target_run_id.to_string(),
         Some(run.run_id.clone()),
         verdict,
         &doc.findings,
+        &marks,
     );
 
     let tx = match db::write_tx(conn) {
@@ -1362,8 +1507,10 @@ pub fn ingest_review(
                 cited: &cited,
                 opened: Some(&opened),
                 unopened: Some(&unopened),
+                opened_in_stream: Some(&in_stream),
                 source: None,
                 checks_not_run: Some(&not_run),
+                prior_rejection: marks.event_value(),
             }),
         },
     ) {
@@ -1582,6 +1729,30 @@ pub fn record(paths: &Paths, cwd: &Path, args: RecordArgs<'_>) -> Result<i32> {
         }
     }
 
+    // RES-1b: a research task's PASS does the git work for the candidate's
+    // missing evidence now, from the run validated in step 3, before the
+    // write lock; the rows are inserted inside the transaction, after the
+    // target check, so a target that moved still leaves no row.
+    let mut research_prepared: Option<PreparedCandidateEvidence> = None;
+    if verdict == Verdict::Pass {
+        if let Some(run_id) = validation_target.as_deref() {
+            if let Some(t) = state::get_run(&conn, run_id)? {
+                if let Some(candidate) = t.candidate_commit.clone() {
+                    research_prepared = Some(prepare_candidate_evidence(
+                        &conn,
+                        paths,
+                        &repo_id,
+                        &task.base_commit,
+                        &t,
+                        &candidate,
+                        &root,
+                    ));
+                }
+            }
+        }
+    }
+    test_record_pause();
+
     // 4-7: everything else, inside one write transaction. `db::write_tx`
     // takes SQLite's write lock at `BEGIN`, so the preconditions re-checked
     // here are authoritative rather than a snapshot another writer (a Thoth
@@ -1657,13 +1828,11 @@ pub fn record(paths: &Paths, cwd: &Path, args: RecordArgs<'_>) -> Result<i32> {
             bail!("review.json invalid at stage {}: {why}", crate::required_checks::STAGE);
         }
     }
-    // Hold the write lock before any evidence preparation for source checks.
-    // A target that moved since validation must leave no writes behind.
-    if verdict == Verdict::Pass && validation_target.is_some() {
-        let (w, e) = prepare_protected_evidence(
-            &tx, paths, &repo_id, &task.base_commit, &target,
-            target.candidate_commit.as_deref().expect("checked candidate"), &root,
-        );
+    // RES-1b: the source check's evidence rows, prepared before the lock,
+    // are inserted only now that the target is known not to have moved, and
+    // roll back with the verdict.
+    if let Some(prepared) = research_prepared.take().filter(|p| p.run_id == target.run_id) {
+        let (w, e) = insert_candidate_evidence(&tx, paths, &repo_id, &target, prepared);
         for line in &w { masked_eprintln!("warning: {line}"); }
         notes = w;
         again = e.map(|e| (target.run_id.clone(), e));
@@ -1679,7 +1848,9 @@ pub fn record(paths: &Paths, cwd: &Path, args: RecordArgs<'_>) -> Result<i32> {
         }
     }
 
-    let review = new_review_row(target.run_id.clone(), None, verdict, &doc.findings);
+    // MEAS-1 (D8): checked like a reviewer run's, against the run it settles.
+    let marks = crate::prior_rejection::for_review(&tx, &task, &target.run_id, json_text);
+    let review = new_review_row(target.run_id.clone(), None, verdict, &doc.findings, &marks);
     state::insert_review(&tx, &review)?;
 
     let now = ids::now_rfc3339();
@@ -1714,8 +1885,10 @@ pub fn record(paths: &Paths, cwd: &Path, args: RecordArgs<'_>) -> Result<i32> {
                 cited: &cited,
                 opened: None,
                 unopened: None,
+                opened_in_stream: None,
                 source: Some("external"),
                 checks_not_run: Some(&not_run),
+                prior_rejection: marks.event_value(),
             }),
         },
     )?;
@@ -1804,6 +1977,7 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
                 "cited": [],
                 "opened": [],
                 "unopened_citation": [],
+                "opened_in_stream": [],
                 "claims": if full { serde_json::json!([]) } else { serde_json::Value::Null },
                 "source": serde_json::Value::Null,
                 "brief": serde_json::Value::Null,
@@ -1841,23 +2015,34 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
     } else {
         "external"
     };
-    let (opened, unopened): (Option<Vec<String>>, Option<Vec<String>>) =
-        match &latest.reviewer_run_id {
-            Some(reviewer_run_id) => {
-                let opened = opened_codes(&conn, reviewer_run_id)?;
-                // brief §8: a citation the reviewer never opened is reported,
-                // not punished. It may have read the same bytes out of the
-                // diff it was handed, or out of the index label - but it is
-                // exactly the signal §13's honesty metric wants.
-                let unopened: Vec<String> = cited
-                    .iter()
-                    .filter(|c| !opened.contains(c))
-                    .cloned()
-                    .collect();
-                (Some(opened), Some(unopened))
-            }
-            None => (None, None),
-        };
+    // brief §8: a citation the reviewer never opened is reported, not
+    // punished. It may have read the same bytes out of the diff it was
+    // handed, or out of the index label - but it is exactly the signal §13's
+    // honesty metric wants. EVOPEN-1: a Codex or agy reviewer's reads of its
+    // evidence files count as opened too (found in its stream at ingest).
+    let opened_view = match &latest.reviewer_run_id {
+        Some(reviewer_run_id) => Some(opened_codes(&conn, reviewer_run_id, &cited)?),
+        None => None,
+    };
+    let opened = opened_view.as_ref().map(|o| o.opened.clone());
+    let unopened = opened_view.as_ref().map(|o| o.unopened.clone());
+    let opened_in_stream = opened_view.as_ref().map(|o| o.in_stream.clone());
+    // EVOPEN-1: whether the reviewer reads files rather than running thoth,
+    // from its profile's harness; the warning says what it never read.
+    // SMALL-18: a research task's source check has no stream reads recorded
+    // (the runner looks for none), so its warning keeps the `evidence show`
+    // text whatever the harness.
+    let reads_files = match &latest.reviewer_run_id {
+        _ if spec::is_research_task(&task.spec) => false,
+        Some(reviewer_run_id) => state::get_run(&conn, reviewer_run_id)?
+            .and_then(|run| {
+                crate::commands::usage::global_read_only(paths)
+                    .ok()
+                    .and_then(|g| crate::db::global::get_profile(&g, &run.account).ok().flatten())
+            })
+            .is_some_and(|p| crate::commands::evidence_stream::reads_from_files(&p.harness)),
+        None => false,
+    };
 
     // The claims the review was judging, with the codes each one cited. This is
     // the "Requirement vs Implementation vs Evidence" triangle from v6 §4, in
@@ -1914,6 +2099,7 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
         "cited": cited,
         "opened": opened,
         "unopened_citation": unopened,
+        "opened_in_stream": opened_in_stream,
         "claims": if full { serde_json::json!(claims) } else { serde_json::Value::Null },
         "source": source,
         "brief": brief.as_ref().map(|b| b.text.clone()),
@@ -1962,6 +2148,10 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
         lines.push(format!("  blocking: {}", refs(&split.blocking)));
         lines.push(format!("  advisory (not required): {}", refs(&split.advisory)));
     }
+    // MEAS-1 (AC5): the marks on the previous rejection, as Thoth checked them.
+    if let Some(check) = findings_value.get(crate::prior_rejection::CHECK_KEY).filter(|c| c.is_object()) {
+        lines.extend(prior_rejection_lines(check));
+    }
     match &opened {
         Some(opened) => lines.push(format!(
             "  opened: {}",
@@ -1969,12 +2159,17 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
         )),
         None => lines.push("  opened: n/a (external review)".to_string()),
     }
+    if let Some(in_stream) = opened_in_stream.as_ref().filter(|l| !l.is_empty()) {
+        lines.push(format!("  found in the reviewer's stream: {}", in_stream.join(",")));
+    }
     if let Some(unopened) = &unopened {
         if !unopened.is_empty() {
-            lines.push(format!(
-                "  WARNING unopened_citation: {} (cited but never read through `evidence show`)",
-                unopened.join(",")
-            ));
+            let why = if reads_files {
+                "cited but its file in .agent/review-input/evidence/ was never read"
+            } else {
+                "cited but never read through `evidence show`"
+            };
+            lines.push(format!("  WARNING unopened_citation: {} ({why})", unopened.join(",")));
         }
     }
     lines.extend(fix_lines(&task_id, &fix_state, &v));
@@ -1995,6 +2190,40 @@ pub fn show(paths: &Paths, cwd: &Path, needle: &str, full: bool, json: bool) -> 
     }
     output::emit(json, &v, &lines.join("\n"));
     Ok(0)
+}
+
+/// MEAS-1 (AC5): `review show`'s human lines about a stored
+/// `prior_rejection_check`.
+fn prior_rejection_lines(check: &serde_json::Value) -> Vec<String> {
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or("-").to_string();
+    let n = |k: &str| check["counts"][k].as_u64().unwrap_or(0);
+    match check["status"].as_str() {
+        Some("checked") => {
+            let mut lines = vec![format!(
+                "  prior rejection {}: yes {}, no {}, not_fixed {}, unmarked {}",
+                text(&check["review_id"]),
+                n("yes"),
+                n("no"),
+                n("not_fixed"),
+                n("unmarked")
+            )];
+            for e in check["entries"].as_array().into_iter().flatten() {
+                if e["marked"] != serde_json::Value::Bool(true) {
+                    lines.push(format!("    unmarked {}: {}", text(&e["ref"]), text(&e["reason"])));
+                }
+            }
+            lines
+        }
+        Some("previous_not_reject") => vec![format!(
+            "  prior rejection: previous review {} was {}, nothing to mark",
+            text(&check["review_id"]),
+            text(&check["previous_verdict"])
+        )],
+        _ => vec![format!(
+            "  prior rejection: no previous rejection, {} entries ignored",
+            check["extra_entries"].as_array().map_or(0, Vec::len)
+        )],
+    }
 }
 
 /// RFIX-1: `review show`'s human lines about the fix: one for the fix, one

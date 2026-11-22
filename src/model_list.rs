@@ -294,6 +294,127 @@ pub(crate) fn forget(conn: &Connection, profile_id: &str, model: &str) -> Result
     )
 }
 
+/// AGY-1 (second part): `quota_events.kind` of the runner's record that agy
+/// refused `--effort` for a model on this profile.
+pub(crate) const KIND_EFFORT_REFUSED: &str = "effort_refused";
+
+/// The text agy answers a refused `--effort` with (agy 1.5.14,
+/// 2026-11-23); the runner recognises the refusal by it, never by the name.
+pub(crate) const EFFORT_NOT_SUPPORTED: &str = "--effort is not supported for model";
+
+/// What `thoth models` and `recommend` show, and the launch commands read,
+/// for a model agy refused an effort for on this profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoEffort {
+    pub(crate) seen_at: String,
+    pub(crate) run_id: Option<String>,
+    /// The level that was sent and refused.
+    pub(crate) effort: Option<String>,
+    /// agy's error text.
+    pub(crate) reason: String,
+}
+
+impl NoEffort {
+    /// The `no_effort` value of `thoth models --json` and `recommend --json`.
+    pub(crate) fn json(&self) -> Value {
+        serde_json::json!({
+            "seen_at": self.seen_at,
+            "run_id": self.run_id,
+            "effort": self.effort,
+            "reason": self.reason,
+        })
+    }
+
+    /// The `effort_note` of a launch that sends no effort because of it.
+    pub(crate) fn launch_note(&self, model: &str, profile_id: &str) -> String {
+        format!(
+            "{model} takes no effort on profile {profile_id}: agy refused --effort at {} (run {})",
+            self.seen_at,
+            self.run_id.as_deref().unwrap_or("unknown")
+        )
+    }
+}
+
+/// Whether `model` counts as taking no effort on this profile: the newest
+/// `effort_refused` / `model_forgotten` event naming it (trimmed, any letter
+/// case) is an `effort_refused`. `events` are oldest first.
+pub(crate) fn no_effort_now(events: &[QuotaEvent], model: &str) -> Option<NoEffort> {
+    let (event, detail) = events
+        .iter()
+        .rev()
+        .map(|e| (e, detail_of(e)))
+        .find(|(e, d)| (e.kind == KIND_EFFORT_REFUSED || e.kind == KIND_MODEL_FORGOTTEN) && detail_model_is(d, model))?;
+    if event.kind != KIND_EFFORT_REFUSED {
+        return None;
+    }
+    Some(NoEffort {
+        seen_at: event.ts.clone(),
+        run_id: detail["run_id"].as_str().map(str::to_string),
+        effort: detail["effort"].as_str().map(str::to_string),
+        reason: detail["error_text"].as_str().unwrap_or("agy refused --effort").to_string(),
+    })
+}
+
+/// `no_effort_now` for one antigravity profile, read from global.db; `None`
+/// for every other harness and when the events cannot be read (a launch is
+/// never failed for a record it cannot read).
+pub(crate) fn no_effort(gconn: &Connection, profile: &Profile, model: &str) -> Option<NoEffort> {
+    no_effort_for(gconn, &profile.harness, &profile.profile_id, model)
+}
+
+/// `no_effort` by harness and profile id (the runner has no `Profile` row
+/// for the run's own account at hand).
+pub(crate) fn no_effort_for(gconn: &Connection, harness: &str, profile_id: &str, model: &str) -> Option<NoEffort> {
+    if harness != crate::adapter::antigravity::HARNESS_NAME {
+        return None;
+    }
+    let events = global::list_quota_events(gconn, profile_id).ok()?;
+    no_effort_now(&events, model)
+}
+
+/// The runner's record of a refused effort: one `effort_refused` quota event.
+pub(crate) fn record_effort_refused(
+    gconn: &Connection,
+    profile_id: &str,
+    model: &str,
+    effort: &str,
+    run_id: &str,
+    task_id: &str,
+    error_text: &str,
+) -> Result<i64> {
+    test_fail_effort_record()?;
+    global::insert_quota_event(
+        gconn,
+        &crate::ids::now_rfc3339(),
+        profile_id,
+        KIND_EFFORT_REFUSED,
+        &serde_json::json!({
+            "model": model,
+            "effort": effort,
+            "run_id": run_id,
+            "task_id": task_id,
+            "error_text": error_text,
+        }),
+    )
+}
+
+/// Test seam, debug builds only, so a release build has no such switch and
+/// ignores the variable. With `THOTH_TEST_FAIL_EFFORT_RECORD=1` in the
+/// runner's environment, recording a refused effort fails, so a test can see
+/// the runner log it and carry on.
+#[cfg(debug_assertions)]
+fn test_fail_effort_record() -> Result<()> {
+    if std::env::var_os("THOTH_TEST_FAIL_EFFORT_RECORD").is_some_and(|v| v == "1") {
+        bail!("THOTH_TEST_FAIL_EFFORT_RECORD is set");
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn test_fail_effort_record() -> Result<()> {
+    Ok(())
+}
+
 /// Whole hours between `seen_at` and now, or `None` when it does not parse.
 pub(crate) fn hours_since(seen_at: &str) -> Option<i64> {
     let seen = OffsetDateTime::parse(seen_at, &Rfc3339).ok()?;

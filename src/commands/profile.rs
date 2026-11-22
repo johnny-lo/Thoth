@@ -169,6 +169,9 @@ pub fn set_shared(paths: &Paths, id: &str, value: &str, json: bool) -> Result<i3
 }
 
 pub fn list(paths: &Paths, json: bool) -> Result<i32> {
+    // SMALL-13: the command that shows the operator's setup also says, once on
+    // stderr, that config.json cannot be used, though it reads no setting.
+    crate::commands::settings::warn_once(&paths.home);
     let conn = db::open_global(paths)?;
     let profiles = global::list_profiles(&conn)?;
     let shared: Vec<bool> = profiles
@@ -389,7 +392,9 @@ pub fn check(paths: &Paths, id: &str, json: bool) -> Result<i32> {
 
 /// `profile forget-model ID MODEL` (MODELS-1): one `model_forgotten` quota
 /// event, so the launch commands accept the model again until a run proves
-/// it unavailable once more. Nothing else on the profile changes.
+/// it unavailable once more. AGY-1: it also clears an agy model's
+/// `effort_refused` record, so `--effort` is sent (and needed) again. Nothing
+/// else on the profile changes.
 pub fn forget_model(paths: &Paths, id: &str, model: &str, json: bool) -> Result<i32> {
     let model = model.trim();
     if model.is_empty() {
@@ -408,7 +413,7 @@ pub fn forget_model(paths: &Paths, id: &str, model: &str, json: bool) -> Result<
     output::emit(
         json,
         &v,
-        &format!("profile {id}: model {model} is no longer recorded as unavailable"),
+        &format!("profile {id}: model {model} is no longer recorded as unavailable or as taking no effort"),
     );
     Ok(0)
 }

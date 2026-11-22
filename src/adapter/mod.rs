@@ -449,6 +449,26 @@ impl LaunchHooks for NoLaunchHooks {}
 pub const HARNESS_CLAUDE_CODE: &str = "claude-code";
 pub const HARNESS_CODEX: &str = "codex";
 
+/// The sections every code review prompt ends with, after the harness's own
+/// review prompt, for every harness: REV-3's `required_checks` section (as
+/// the caller built it), MEAS-1's `## Previous rejection to mark` for
+/// `prior` (`None` when Thoth could not work it out; `mask` masks each
+/// note), and in edit mode RFIX-1's section on attaching a fix.
+pub fn code_review_sections(
+    harness: &str,
+    required_checks: &str,
+    prior: Option<&crate::prior_rejection::Target>,
+    mode: crate::spec_edits::ReviewMode,
+    mask: &mut dyn FnMut(&str) -> String,
+) -> String {
+    let mut s = required_checks.to_string();
+    s.push_str(&crate::prior_rejection::prompt_section(prior, mask));
+    if mode == crate::spec_edits::ReviewMode::Edit {
+        s.push_str(&crate::review_fix_edits::edit_prompt_section(harness == HARNESS_CLAUDE_CODE));
+    }
+    s
+}
+
 /// One harness the runner can launch.
 pub struct Harness {
     /// The `profiles.harness` value.
@@ -547,6 +567,10 @@ pub fn looks_like_quota(text: &str) -> bool {
 /// - `failed to refresh oauth token`: a recorded Claude Code failure
 ///   (tests/fixtures/stream-oauth-refresh-failed.jsonl), which itself says it
 ///   is usually transient.
+/// - `no capacity available for model`: agy 1.5.14's 503 answer of
+///   2026-11-23 (`Our servers are experiencing high traffic right now ...
+///   (UNAVAILABLE (code 503): No capacity available for model M on the
+///   server)`, exit 3), seen on task 01M82081E1GH5Y8KR7NRYZDVNE.
 pub const TRANSIENT_MARKERS: &[&str] = &[
     "overloaded",
     "there was a network issue",
@@ -555,6 +579,7 @@ pub const TRANSIENT_MARKERS: &[&str] = &[
     "the stream was interrupted",
     "stream disconnected before completion",
     "failed to refresh oauth token",
+    "no capacity available for model",
 ];
 
 /// Whether a harness error names a temporary problem: `text`, lower-cased,
@@ -567,6 +592,65 @@ pub fn looks_like_transient(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MEAS-1 (AC3): every code review prompt, for each harness and in
+    /// plain and edit mode, carries `## Previous rejection to mark` after
+    /// `## Required checks not run` and before the edit-mode section; with a
+    /// REJECT to mark it lists its findings and the rules, otherwise it says
+    /// there is nothing to mark.
+    #[test]
+    fn adapter_code_review_prompts_carry_the_previous_rejection_section() {
+        use crate::prior_rejection::{target_from, RecordRef};
+        use crate::spec_edits::ReviewMode;
+        let spec: crate::spec::TaskSpec = serde_json::from_value(serde_json::json!({
+            "goal": "g", "acceptance_criteria": ["AC1: a", "AC2: b"], "constraints": [], "non_goals": [],
+            "excluded_alternatives": [], "risk": "normal"
+        }))
+        .unwrap();
+        let ids = crate::review_json::ac_ids(&spec);
+        let rejected = r#"{"criteria":[
+            {"id":"AC1","verdict":"unmet","evidence":["E001","E002"],"note":"the greeting is wrong","fix_size":"S","category":"spec_mismatch"},
+            {"id":"AC2","verdict":"met","evidence":["E001"]}],
+            "extra_findings":[{"severity":"minor","note":"stale usage text","evidence":[]}]}"#;
+        let records = [RecordRef { review_id: "01REJECTED", verdict: "REJECT", attempt: Some(1), findings: rejected }];
+        let to_mark = target_from(&records, 2);
+        let nothing = target_from(&records, 1);
+        let required = crate::review_json::required_checks_prompt_section(&[]);
+        for harness in [HARNESS_CLAUDE_CODE, HARNESS_CODEX, antigravity::HARNESS_NAME] {
+            for mode in [ReviewMode::Review, ReviewMode::Edit] {
+                let base = for_harness(harness).build_review_prompt("T1", &spec, &ids, "thoth", Some("E001"), &[], &[], None);
+                let mut keep = |s: &str| s.to_string();
+                let prompt = format!("{base}{}", code_review_sections(harness, &required, Some(&to_mark), mode, &mut keep));
+                let at = prompt.find("\n## Previous rejection to mark\n").unwrap_or_else(|| panic!("{harness}: {prompt}"));
+                assert!(prompt.find("\n## Required checks not run\n").unwrap() < at, "{harness}: {prompt}");
+                let edit = prompt.find("## Attaching a fix (edit mode)");
+                assert_eq!(edit.is_some(), mode == ReviewMode::Edit, "{harness}: {prompt}");
+                if let Some(e) = edit {
+                    assert!(at < e, "{harness}: {prompt}");
+                }
+                let section = &prompt[at..edit.unwrap_or(prompt.len())];
+                assert!(section.contains("01REJECTED") && section.contains("attempt 1"), "{harness}: {section}");
+                let lines: Vec<&str> = section.lines().filter(|l| l.starts_with("- AC") || l.starts_with("- extra_findings[")).collect();
+                assert_eq!(
+                    lines,
+                    [
+                        "- AC1 [category spec_mismatch, fix_size S] the greeting is wrong (evidence E001, E002)",
+                        "- extra_findings[0] [category none, fix_size none, severity minor] stale usage text (evidence none)",
+                    ],
+                    "{harness}: {section}"
+                );
+                for needle in ["findings.prior_rejection", "\"yes\"", "\"no\"", "\"not_fixed\"", "diff_at", "evidence index", "never decide"] {
+                    assert!(section.contains(needle), "{harness}: {needle} missing from {section}");
+                }
+
+                let prompt = format!("{base}{}", code_review_sections(harness, &required, Some(&nothing), mode, &mut keep));
+                let at = prompt.find("\n## Previous rejection to mark\n").unwrap_or_else(|| panic!("{harness}: {prompt}"));
+                let section = &prompt[at..prompt.find("## Attaching a fix").unwrap_or(prompt.len())];
+                assert!(section.contains("Nothing to mark") && section.contains("[]"), "{harness}: {section}");
+                assert!(!section.contains("- AC1 ["), "{harness}: {section}");
+            }
+        }
+    }
 
     #[test]
     fn research_reviewers_get_web_tools_without_write_tools() {
@@ -694,7 +778,8 @@ mod tests {
     #[test]
     fn looks_like_transient_matches_each_listed_marker_and_nothing_else() {
         // One sentence per marker, in TRANSIENT_MARKERS order. The four agy
-        // sentences and the Claude one are recordings (AC7's fixtures);
+        // sentences and the Claude one are recordings (AC7's fixtures), the
+        // last one agy 1.5.14's no-capacity answer (AGY-1);
         // `overloaded` and the codex disconnect are the fakes' synthetic text.
         let sentences = [
             "Repeated 529 Overloaded errors",
@@ -704,6 +789,7 @@ mod tests {
             "The stream was interrupted. Please continue the task you were working on.",
             "stream disconnected before completion: error decoding response body (synthetic; the string H5 names, no recording)",
             "Failed to refresh OAuth token: another Claude Code process is refreshing it",
+            "Our servers are experiencing high traffic right now, please try again in a minute. (UNAVAILABLE (code 503): No capacity available for model gpt-oss-120b-medium on the server)",
         ];
         assert_eq!(sentences.len(), TRANSIENT_MARKERS.len());
         for (marker, s) in TRANSIENT_MARKERS.iter().zip(sentences) {

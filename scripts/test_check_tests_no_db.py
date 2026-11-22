@@ -103,6 +103,19 @@ class GreenTests(TmpCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, "tests/m.rs 1\ntests/p.rs 1\n")
 
+    def test_a_fixture_connection_helper_call_is_counted(self):
+        self.write("tests/s.rs", "let c = f.state_conn();\nlet g = f.global_conn();\nlet n = 1;\n")
+        self.allow("tests/s.rs 2\n")
+        code, out, _ = self.check()
+        self.assertEqual(code, 0, out)
+        code, out, _ = self.check("--print-counts")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "tests/s.rs 2\n")
+        self.allow("")
+        code, out, _ = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("f.state_conn()", out)
+
     def test_subdirectory_paths_use_forward_slashes(self):
         self.write("tests/common/mod.rs", ONE_HIT)
         self.write("tests/deep/er/x.rs", ONE_HIT)

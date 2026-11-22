@@ -7,6 +7,14 @@
 //! `$THOTH_HOME/secrets.json`. Each one is replaced by `[redacted:KIND]`,
 //! where KIND names the kind of secret and nothing about its value.
 //!
+//! GITENV-1: git's configuration group - GIT_CONFIG_COUNT whose value is a
+//! decimal number N, with GIT_CONFIG_KEY_n and GIT_CONFIG_VALUE_n for every
+//! n below N - is one unit. A worker gets all of it, or none of it when any
+//! of its values is a known secret value (an exact value found without the
+//! group's own names, or one holding a key format); the values of the
+//! group's GIT_CONFIG_KEY_n are git setting names and not exact values. A
+//! GIT_CONFIG_KEY_ variable outside a group is a secret-named one as before.
+//!
 //! A `Masker` holds the exact values in memory only. It has no Debug,
 //! Display or Serialize, and no message, log line or event built here ever
 //! carries one of them.
@@ -137,13 +145,16 @@ impl Masker {
                 }
             }
         }
-        let mut named: Vec<(String, String)> = vars
+        let utf8: Vec<(String, String)> = vars
             .into_iter()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .filter(|(k, _)| {
-                let upper = k.to_ascii_uppercase();
-                SECRET_NAME_WORDS.iter().any(|w| upper.contains(w))
-            })
+            .collect();
+        // GITENV-1: a git group's GIT_CONFIG_KEY_n holds a setting name,
+        // not a secret, so it is not taken by its name.
+        let group = git_config_group(&utf8);
+        let mut named: Vec<(String, String)> = utf8
+            .into_iter()
+            .filter(|(k, _)| !group.contains(k) && secret_named(k))
             .collect();
         named.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, value) in named {
@@ -197,18 +208,41 @@ impl Masker {
     /// trimmed as `load` trims, is one of this masker's exact values, whatever
     /// the name. The format check uses no exact values, and a value is only
     /// compared whole, so a variable such as PATH is not listed only because
-    /// it holds another variable's value. Names only, sorted, without
-    /// repeats; a name or value that is not UTF-8 is skipped.
+    /// it holds another variable's value. GITENV-1: git's group (see
+    /// `git_config_group`) is one unit, listed whole when any of its values
+    /// is such a known value or holds a key format, and not at all otherwise.
+    /// Names only, sorted, without repeats; a name or value that is not UTF-8
+    /// is skipped.
     pub(crate) fn secret_env_names(&self) -> Vec<String> {
+        self.secret_names_among(
+            std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect(),
+        )
+    }
+
+    /// `secret_env_names` over `vars` instead of this process's environment.
+    fn secret_names_among(&self, vars: Vec<(String, String)>) -> Vec<String> {
         let formats = Masker::load_with(None, Vec::new());
-        let mut names: Vec<String> = std::env::vars_os()
-            .filter_map(|(k, v)| {
-                let (name, value) = (k.to_str()?.to_string(), v.to_str()?.to_string());
-                let named = !Masker::load_with(None, vec![(k, v)]).entries.is_empty();
-                let alias = self.entries.iter().any(|e| e.value == value.trim());
-                (named || alias || !formats.find(&value).is_empty()).then_some(name)
-            })
-            .collect();
+        let known = |value: &str| {
+            self.entries.iter().any(|e| e.value == value.trim()) || !formats.find(value).is_empty()
+        };
+        let group = git_config_group(&vars);
+        let mut names: Vec<String> = Vec::new();
+        let mut group_known = false;
+        for (name, value) in &vars {
+            if group.contains(name) {
+                group_known |= known(value);
+                continue;
+            }
+            let named = !Masker::load_with(None, vec![(name.into(), value.into())]).entries.is_empty();
+            if named || known(value) {
+                names.push(name.clone());
+            }
+        }
+        if group_known {
+            names.extend(group);
+        }
         names.sort();
         names.dedup();
         names
@@ -332,6 +366,41 @@ impl Masker {
         }
         counts
     }
+}
+
+/// Whether a variable's name contains one of `SECRET_NAME_WORDS`, in any case.
+fn secret_named(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_NAME_WORDS.iter().any(|w| upper.contains(w))
+}
+
+/// GITENV-1: the names in `vars` that make up git's configuration group:
+/// `GIT_CONFIG_COUNT` when its value is a decimal number N (digits only),
+/// with every `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` there for n from 0
+/// to N-1, n written as git writes it (no sign, no leading zero). Empty when
+/// there is no such count. Names are compared exactly, as git reads them.
+fn git_config_group(vars: &[(String, String)]) -> Vec<String> {
+    let decimal = |s: &str| -> Option<u64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    };
+    // git writes n as %lu, so GIT_CONFIG_KEY_01 is never read
+    let index = |s: &str| decimal(s).filter(|_| s == "0" || !s.starts_with('0'));
+    let count = vars.iter().find(|(k, _)| k == "GIT_CONFIG_COUNT").and_then(|(_, v)| decimal(v));
+    let Some(count) = count else { return Vec::new() };
+    vars.iter()
+        .map(|(k, _)| k)
+        .filter(|k| {
+            *k == "GIT_CONFIG_COUNT"
+                || k.strip_prefix("GIT_CONFIG_KEY_")
+                    .or_else(|| k.strip_prefix("GIT_CONFIG_VALUE_"))
+                    .and_then(index)
+                    .is_some_and(|n| n < count)
+        })
+        .cloned()
+        .collect()
 }
 
 /// The byte range of every marker in `text`, in order: `[redacted:`, then 1
@@ -817,6 +886,96 @@ mod tests {
         assert!(!has("RD4_UNIT_PATHLIKE"));
         assert!(!has("RD4_UNIT_OTHER"));
         assert!(!without.iter().any(|x| x.starts_with("RD4_UNIT_")), "listed without a known value");
+    }
+
+    /// The five variables Claude Code's Linux shells set, with `extra` added
+    /// or replacing the one of the same name.
+    fn git_vars(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut vars: BTreeMap<String, String> = [
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "credential.interactive"),
+            ("GIT_CONFIG_VALUE_0", "false"),
+            ("GIT_CONFIG_KEY_1", "credential.guiPrompt"),
+            ("GIT_CONFIG_VALUE_1", "false"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        for (k, v) in extra {
+            vars.insert(k.to_string(), v.to_string());
+        }
+        vars.into_iter().collect()
+    }
+
+    fn os(vars: &[(String, String)]) -> Vec<(OsString, OsString)> {
+        vars.iter().map(|(k, v)| (OsString::from(k), OsString::from(v))).collect()
+    }
+
+    const GROUP: [&str; 5] =
+        ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_VALUE_1"];
+
+    #[test]
+    fn a_git_config_group_stays_whole_and_its_keys_are_not_secret_values() {
+        let vars = git_vars(&[("RD_UNIT_GIT_TOKEN", "dummy-unit-git-1")]);
+        let m = Masker::load_with(None, os(&vars));
+        let text = "set credential.interactive and credential.guiPrompt; dummy-unit-git-1";
+        assert_eq!(m.mask_text(text).0, "set credential.interactive and credential.guiPrompt; [redacted:env:RD_UNIT_GIT_TOKEN]");
+        assert_eq!(m.secret_names_among(vars), ["RD_UNIT_GIT_TOKEN"]);
+    }
+
+    #[test]
+    fn a_git_config_key_outside_a_group_is_still_a_secret() {
+        let key = |n: &str| (format!("GIT_CONFIG_KEY_{n}"), "dummy.unit.setting".to_string());
+        let count = |c: &str| ("GIT_CONFIG_COUNT".to_string(), c.to_string());
+        // (variables, the KEY that belongs to no group)
+        let cases: Vec<(Vec<(String, String)>, String)> = vec![
+            (vec![key("0")], "GIT_CONFIG_KEY_0".into()),
+            (vec![count("two"), key("0")], "GIT_CONFIG_KEY_0".into()),
+            (vec![count(""), key("0")], "GIT_CONFIG_KEY_0".into()),
+            (vec![count("1"), key("1")], "GIT_CONFIG_KEY_1".into()),
+            (vec![count("2"), key("00")], "GIT_CONFIG_KEY_00".into()),
+            (vec![count("2"), key("+1")], "GIT_CONFIG_KEY_+1".into()),
+        ];
+        for (vars, stray) in cases {
+            let m = Masker::load_with(None, os(&vars));
+            assert_eq!(m.mask_text("dummy.unit.setting").0, format!("[redacted:env:{stray}]"), "{stray}");
+            assert_eq!(m.secret_names_among(vars), vec![stray.clone()], "{stray}");
+        }
+        // a stray KEY beside a whole group goes alone
+        let vars = git_vars(&[("GIT_CONFIG_KEY_2", "dummy.unit.setting")]);
+        let m = Masker::load_with(None, os(&vars));
+        assert_eq!(m.secret_names_among(vars), ["GIT_CONFIG_KEY_2"]);
+        assert_eq!(m.mask_text("credential.interactive").0, "credential.interactive");
+    }
+
+    #[test]
+    fn a_git_config_group_with_a_known_secret_value_goes_whole() {
+        // a value another secret-named variable holds
+        let shared = "dummy-unit-shared-1";
+        let vars = git_vars(&[("GIT_CONFIG_VALUE_0", shared), ("RD_UNIT_GIT_SECRET", shared)]);
+        let m = Masker::load_with(None, os(&vars));
+        let mut want: Vec<&str> = GROUP.to_vec();
+        want.push("RD_UNIT_GIT_SECRET");
+        want.sort();
+        assert_eq!(m.secret_names_among(vars), want);
+        assert_eq!(m.mask_text(shared).0, "[redacted:env:RD_UNIT_GIT_SECRET]");
+
+        // a key format in a KEY's value, masked under its own kind
+        let token = gh();
+        let vars = git_vars(&[("GIT_CONFIG_COUNT", "3"), ("GIT_CONFIG_KEY_2", &token), ("GIT_CONFIG_VALUE_2", "x")]);
+        let m = Masker::load_with(None, os(&vars));
+        let mut want: Vec<&str> = GROUP.to_vec();
+        want.extend(["GIT_CONFIG_KEY_2", "GIT_CONFIG_VALUE_2"]);
+        want.sort();
+        assert_eq!(m.secret_names_among(vars), want);
+        assert_eq!(m.mask_text(&token).0, "[redacted:github-token]");
+
+        // a stored value, padded as the masking trims it
+        let stored = "dummyUnitStoredGit1";
+        let value = format!(" {stored}\n");
+        let padded = git_vars(&[("GIT_CONFIG_VALUE_1", &value)]);
+        let m = Masker::from_pairs(&[(stored, "thoth:secrets.json")]);
+        assert_eq!(m.secret_names_among(padded), GROUP);
     }
 
     fn html_escape(s: &str) -> String {

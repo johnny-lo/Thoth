@@ -13,7 +13,8 @@ const OUTSIDE_ABS: &str = "/etc";
 
 /// The scripts every `settled_run` repo holds, as (stem, Windows body, Linux
 /// body). `ex N` exits N; `say X` prints X; `mark` writes `marker.txt` in its
-/// cwd; `long` runs far longer than the 1s `--timeout` it is used with;
+/// cwd; `long` runs (about 120 s) far longer than the `--timeout` it is used
+/// with (1 s or 10 s), so a timeout, not its end, is what stops it;
 /// `detached` exits at once, leaving a detached child that still holds its
 /// pipes; `needscand` passes only where `cand.txt` exists (the run's worktree
 /// has it, a checkout of the base commit does not); `args A B` prints
@@ -22,7 +23,7 @@ const SCRIPTS: &[(&str, &str, &str)] = &[
     ("ex", "exit /b %1", "exit \"$1\""),
     ("say", "echo %1", "echo \"$1\""),
     ("mark", "echo x> marker.txt", "echo x > marker.txt"),
-    ("long", "ping -n 30 127.0.0.1", "sleep 30"),
+    ("long", "ping -n 120 127.0.0.1", "sleep 120"),
     ("detached", "start /b ping -n 15 127.0.0.1", "sleep 15 &"),
     ("needscand", "if exist cand.txt (exit /b 0) else (exit /b 4)", "test -f cand.txt"),
     ("args", "echo [%1] [%2]", "echo \"[$1] [$2]\""),
@@ -463,12 +464,17 @@ fn verify_rejects_an_unsafe_or_missing_cwd_without_aborting_the_batch() {
 fn verify_records_a_timed_out_check_as_a_failure_and_still_runs_the_next_one() {
     let f = common::fixture();
     let (_task_id, run_id, _, _) = settled_run(&f, common::Fixture::SPEC);
-    // runs for far longer than the 1s --timeout below
+    // runs (about 120 s) for far longer than the 10 s --timeout below
     add_check(&f, "a-long", &script("long", ""));
     add_check(&f, "b-ok", &script("ex", "0"));
     approve(&f, None);
 
-    let v = verify(&f, &run_id, &["--timeout", "1s"], false);
+    // FLAKY-1: --timeout is one limit for every check, so it has to cover
+    // starting the shell and running the passing `ex 0` too. With 1 s, a busy
+    // machine timed b-ok out as well (failures 2): that measured process
+    // start-up, not Thoth. 10 s leaves b-ok room, and `long` still runs many
+    // times longer than the limit, so the timeout path is still what is tested.
+    let v = verify(&f, &run_id, &["--timeout", "10s"], false);
     assert_eq!(v["failures"], 1);
     let results = v["results"].as_array().unwrap();
     assert_eq!(results.len(), 2, "the timeout must not abort the batch");
@@ -482,6 +488,7 @@ fn verify_records_a_timed_out_check_as_a_failure_and_still_runs_the_next_one() {
 
     // Fix round 2 / R2: the human line for a timed-out check says TIMEOUT,
     // not REFUSED; and the human form exits non-zero just like --json.
+    // (1 s stays here: none of these assertions needs b-ok to finish.)
     let a = f.cmd().args(["verify", &run_id, "--timeout", "1s"]).assert();
     let code = a.get_output().status.code();
     assert!(code.is_some() && code != Some(0), "a timed-out check must fail the command, got {code:?}");
@@ -1148,6 +1155,32 @@ fn verify_runs_the_in_tree_argv_program_when_thoth_starts_in_another_directory()
     }
 }
 
+/// FLAKY-1: rewrites a program file the previous `verify` just ran. No Thoth
+/// process holds it once `verify` has returned, but on Windows a holder
+/// outside Thoth can still have it open without write sharing for a moment,
+/// and the write fails with ERROR_SHARING_VIOLATION (os error 32). So on
+/// Windows only that error is retried, every 100 ms for up to 30 s; any other
+/// error, or 32 still after 30 s, panics with the error. Elsewhere it is one
+/// plain write.
+#[cfg(any(windows, target_os = "linux"))]
+fn write_program_after_it_ran(path: &std::path::Path, bytes: &[u8]) {
+    #[cfg(windows)]
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match std::fs::write(path, bytes) {
+                Ok(()) => return,
+                Err(e) if e.raw_os_error() == Some(32) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => panic!("rewriting {} failed: {e}", path.display()),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    std::fs::write(path, bytes).unwrap_or_else(|e| panic!("rewriting {} failed: {e}", path.display()));
+}
+
 /// AC13 (b): an argv check whose in-tree program path holds a space, written
 /// in double quotes, runs that file with its fingerprint matching; one byte
 /// changed in the file is then refused as an `exe=` change.
@@ -1185,7 +1218,7 @@ fn verify_runs_a_quoted_argv_program_whose_path_has_a_space() {
     // one byte changed in the program: refused as an exe= change
     let mut bytes = std::fs::read(&real).unwrap();
     bytes.push(b'\n');
-    std::fs::write(&real, bytes).unwrap();
+    write_program_after_it_ran(&real, &bytes);
     let v = verify(&f, &run_id, &[], false);
     let err = v["results"][0]["error"].as_str().unwrap_or_default();
     assert!(err.contains("exe="), "{v:#}");

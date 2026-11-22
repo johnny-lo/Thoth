@@ -558,14 +558,11 @@ pub fn latest_diff(conn: &Connection, run: &crate::db::state::Run) -> Result<Opt
 /// Every `(path, status)` approved for `run_id` by a `protected_change_approved`
 /// event (`checks approve --run`), oldest first.
 pub fn approved_pairs(conn: &Connection, run_id: &str) -> Result<Vec<(String, String)>> {
-    let mut stmt =
-        conn.prepare("SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq")?;
-    let details = stmt
-        .query_map(
-            rusqlite::params![run_id, crate::model::event_type::PROTECTED_CHANGE_APPROVED],
-            |r| r.get::<_, String>(0),
-        )?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
+    let details = crate::db::state::event_details_of_run(
+        conn,
+        run_id,
+        crate::model::event_type::PROTECTED_CHANGE_APPROVED,
+    )?;
     let mut out: Vec<(String, String)> = Vec::new();
     for d in details {
         let v: Value = serde_json::from_str(&d).unwrap_or(Value::Null);

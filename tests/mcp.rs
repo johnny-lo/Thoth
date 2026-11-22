@@ -25,7 +25,7 @@ impl Server {
         scenario: &str,
         task: Option<&str>,
     ) -> Self {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .args(extra)
             .current_dir(f.repo.path())
@@ -55,7 +55,7 @@ impl Server {
     /// AGY-1: a server whose agy launches go to fake-agy with `data` as
     /// agy's data directory, logging argv to `log`.
     fn start_agy(f: &common::Fixture, scenario: &str, task: &str, data: &std::path::Path, log: &std::path::Path) -> Self {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .current_dir(f.repo.path())
             .env("THOTH_HOME", f.home.path())
@@ -158,6 +158,7 @@ fn old_and_new_protocols_and_bad_input() {
         "thoth_pipeline_start",
         "thoth_pipeline_show",
         "thoth_pipeline_stop",
+        "thoth_pipeline_new",
         "thoth_guide",
     ];
     let at: Vec<usize> = order
@@ -335,7 +336,7 @@ fn init_and_status_are_cli_documents() {
 #[test]
 fn worker_environment_refuses_before_stdout() {
     let f = common::fixture();
-    let out = Command::new(env!("CARGO_BIN_EXE_thoth"))
+    let out = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")))
         .arg("mcp")
         .env("THOTH_HOME", f.home.path())
         .env("THOTH_RUN_ID", "run")
@@ -349,7 +350,7 @@ fn worker_environment_refuses_before_stdout() {
 #[test]
 fn eof_exits_cleanly_and_help_lists_mcp() {
     let f = common::fixture();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_thoth"))
+    let mut child = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")))
         .arg("mcp")
         .env("THOTH_HOME", f.home.path())
         .env_remove("THOTH_RUN_ID")
@@ -360,7 +361,7 @@ fn eof_exits_cleanly_and_help_lists_mcp() {
         .unwrap();
     drop(child.stdin.take());
     assert!(child.wait().unwrap().success());
-    let out = Command::new(env!("CARGO_BIN_EXE_thoth"))
+    let out = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")))
         .arg("--help")
         .output()
         .unwrap();
@@ -921,7 +922,8 @@ fn secret_like_vars() -> Vec<std::ffi::OsString> {
         .map(|(name, _)| name)
         .filter(|name| {
             let upper = name.to_string_lossy().to_uppercase();
-            ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w))
+            // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+            ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_")
         })
         .collect()
 }
@@ -951,7 +953,7 @@ fn dispatch_past_the_quota_reserve_is_a_tool_error() {
     std::fs::write(cfg.join("sessions").join("rollout.jsonl"), format!("{line}\n")).unwrap();
     thoth(&["config", "set", "quota-reserve-percent", "5"]);
 
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
     c.arg("mcp")
         .current_dir(f.repo.path())
         .env("THOTH_HOME", f.home.path())
@@ -1013,7 +1015,7 @@ fn dispatch_without_a_timeout_gets_the_default_for_its_effort() {
     let created: Value = serde_json::from_slice(&thoth(&["task", "create", "-f", &shown, "--json"])).unwrap();
     let task = created["task_id"].as_str().unwrap().to_owned();
 
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
     c.arg("mcp")
         .current_dir(f.repo.path())
         .env("THOTH_HOME", f.home.path())

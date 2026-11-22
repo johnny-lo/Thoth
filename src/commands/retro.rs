@@ -12,7 +12,7 @@
 
 use crate::commands::usage;
 use crate::config::Paths;
-use crate::db::state;
+use crate::db::{reports, state};
 use crate::output;
 use crate::review_json::{category_blocks, CATEGORIES, FIX_SIZES};
 use anyhow::Result;
@@ -240,18 +240,22 @@ fn findings_of(review: &ReviewRow) -> Vec<(String, Item)> {
 }
 
 pub fn run(paths: &Paths, days: u32, json_output: bool) -> Result<i32> {
-    let (rows, providers) = load(paths)?;
+    let (rows, providers, attempts) = load(paths)?;
     let now = OffsetDateTime::now_utc();
     let retro = summarise(&rows, days, now);
     let split = provider_split(&rows, &providers, days, now);
+    let fbb = fixed_by_behaviour(&rows, &attempts, &providers, days, now);
     let mut v = to_json(&retro);
     if let Some(o) = v.as_object_mut() {
         o.insert("provider_split".to_string(), split.to_json());
+        o.insert("fixed_by_behaviour".to_string(), fbb.to_json());
     }
     let mut text = human(&retro);
     if retro.reviews > 0 {
         text.push('\n');
         text.push_str(&split.human());
+        text.push('\n');
+        text.push_str(&fbb.human());
     }
     output::emit(json_output, &v, &text);
     Ok(0)
@@ -385,58 +389,244 @@ fn provider_split(
 
 type Providers = std::collections::HashMap<(String, String), state::ReviewProviders>;
 
-/// Every review of every registered repo whose state.db exists, and (MEAS-0)
-/// each review's verdict and run providers keyed by (repo root, review id).
-/// No global.db means nothing has been reviewed on this machine yet.
-fn load(paths: &Paths) -> Result<(Vec<ReviewRow>, Providers)> {
+/// MEAS-1: one review with its task and its target run's attempt; a repo's
+/// rows in age order.
+#[derive(Debug, Clone)]
+pub struct AttemptRow {
+    pub repo: String,
+    pub review_id: String,
+    pub task_id: String,
+    pub attempt: Option<i64>,
+    pub verdict: String,
+}
+
+/// MEAS-1: the four answers' counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Marked {
+    yes: usize,
+    no: usize,
+    not_fixed: usize,
+    unmarked: usize,
+}
+
+impl Marked {
+    fn add(&mut self, other: Marked) {
+        self.yes += other.yes;
+        self.no += other.no;
+        self.not_fixed += other.not_fixed;
+        self.unmarked += other.unmarked;
+    }
+
+    fn total(self) -> usize {
+        self.yes + self.no + self.not_fixed + self.unmarked
+    }
+
+    fn to_json(self) -> Value {
+        json!({"yes": self.yes, "no": self.no, "not_fixed": self.not_fixed, "unmarked": self.unmarked})
+    }
+
+    fn human(self) -> String {
+        format!("yes {} no {} not_fixed {} unmarked {}", self.yes, self.no, self.not_fixed, self.unmarked)
+    }
+
+    /// A stored check's `counts`.
+    fn of_counts(c: &Value) -> Marked {
+        let n = |k: &str| c[k].as_u64().unwrap_or(0) as usize;
+        Marked { yes: n("yes"), no: n("no"), not_fixed: n("not_fixed"), unmarked: n("unmarked") }
+    }
+}
+
+/// MEAS-1 (AC7): `fixed_by_behaviour`, the marks on previous rejections.
+#[derive(Debug, Clone, Default)]
+pub struct FixedByBehaviour {
+    reviews: usize,
+    not_recorded: usize,
+    total: Marked,
+    /// By the rejected finding's category, in output order.
+    categories: Vec<(String, Marked)>,
+    /// `Side::ALL` order.
+    sides: [Marked; 3],
+}
+
+impl FixedByBehaviour {
+    pub fn to_json(&self) -> Value {
+        let mut sides = serde_json::Map::new();
+        for (side, m) in Side::ALL.iter().zip(&self.sides) {
+            sides.insert(side.key().to_string(), m.to_json());
+        }
+        json!({
+            "reviews": self.reviews,
+            "not_recorded": self.not_recorded,
+            "findings": self.total.total(),
+            "yes": self.total.yes,
+            "no": self.total.no,
+            "not_fixed": self.total.not_fixed,
+            "unmarked": self.total.unmarked,
+            "categories": self.categories.iter().map(|(c, m)| json!({
+                "category": c,
+                "blocking": category_blocks(Some(c)),
+                "count": m.total(),
+                "yes": m.yes,
+                "no": m.no,
+                "not_fixed": m.not_fixed,
+                "unmarked": m.unmarked,
+            })).collect::<Vec<_>>(),
+            "by_rejecting_review": Value::Object(sides),
+        })
+    }
+
+    pub fn human(&self) -> String {
+        let mut lines = vec![
+            format!(
+                "fixed by behaviour (marks on the previous rejection): {} reviews, {} not recorded (before MEAS-1)",
+                self.reviews, self.not_recorded
+            ),
+            format!("  {}", self.total.human()),
+        ];
+        for (c, m) in &self.categories {
+            let class = if category_blocks(Some(c)) { "blocking" } else { "advisory" };
+            lines.push(format!("  {c}: {}  ({class})", m.human()));
+        }
+        for (side, m) in Side::ALL.iter().zip(&self.sides) {
+            lines.push(format!("  rejected by {}: {}", side.key(), m.human()));
+        }
+        lines.join("\n")
+    }
+}
+
+/// MEAS-1 (AC7): the marks of the reviews `summarise` counts (same window,
+/// unreadable `created_at` skipped, an author check's record left out so an
+/// edit-then-confirm chain counts once). A review counts when its record
+/// stores a check with status `checked`; a code review that had a REJECT to
+/// mark by `prior_rejection`'s rule but stores no check (written before
+/// MEAS-1) is `not_recorded` and counts in no bucket. `attempts` holds each
+/// repo's reviews in age order; `providers` gives the rejecting review's
+/// side (unknown when it is not found).
+pub fn fixed_by_behaviour(
+    rows: &[ReviewRow],
+    attempts: &[AttemptRow],
+    providers: &Providers,
+    days: u32,
+    now: OffsetDateTime,
+) -> FixedByBehaviour {
+    let since = now - Duration::days(i64::from(days));
+    let mut out = FixedByBehaviour::default();
+    for review in rows {
+        match OffsetDateTime::parse(&review.created_at, &Rfc3339) {
+            Ok(t) if t >= since => {}
+            _ => continue,
+        }
+        if author_check_copied(review).is_some() {
+            continue;
+        }
+        let stored: Value = serde_json::from_str(&review.findings).unwrap_or(Value::Null);
+        if stored.get("sources").and_then(Value::as_array).is_some_and(|s| !s.is_empty()) {
+            continue;
+        }
+        let check = stored.get(crate::prior_rejection::CHECK_KEY).filter(|c| c.is_object());
+        match check {
+            Some(c) if c["status"] == "checked" => {
+                out.reviews += 1;
+                out.total.add(Marked::of_counts(&c["counts"]));
+                for e in c["entries"].as_array().into_iter().flatten() {
+                    let name = e["category"]
+                        .as_str()
+                        .filter(|n| CATEGORIES.iter().any(|cat| cat.name == *n))
+                        .unwrap_or(UNCLASSIFIED)
+                        .to_string();
+                    let mut one = Marked::default();
+                    match (e["marked"].as_bool(), e["fixed_by_behaviour"].as_str()) {
+                        (Some(true), Some("yes")) => one.yes = 1,
+                        (Some(true), Some("no")) => one.no = 1,
+                        (Some(true), Some("not_fixed")) => one.not_fixed = 1,
+                        _ => one.unmarked = 1,
+                    }
+                    match out.categories.iter_mut().find(|(c, _)| *c == name) {
+                        Some((_, m)) => m.add(one),
+                        None => out.categories.push((name, one)),
+                    }
+                }
+                let rejecting = c["review_id"].as_str().unwrap_or_default().to_string();
+                let side = Side::of(providers.get(&(review.repo.clone(), rejecting)));
+                let at = Side::ALL.iter().position(|s| *s == side).unwrap_or(2);
+                out.sides[at].add(Marked::of_counts(&c["counts"]));
+            }
+            Some(_) => {}
+            None => {
+                if had_reject_to_mark(review, attempts) {
+                    out.not_recorded += 1;
+                }
+            }
+        }
+    }
+    out.categories.sort_by(|a, b| b.1.total().cmp(&a.1.total()).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// MEAS-1: whether `review` had a REJECT to mark by `prior_rejection`'s
+/// rule: the newest earlier record of its task with a lower attempt.
+fn had_reject_to_mark(review: &ReviewRow, attempts: &[AttemptRow]) -> bool {
+    let Some(at) = attempts.iter().position(|a| a.repo == review.repo && a.review_id == review.review_id) else {
+        return false;
+    };
+    let me = &attempts[at];
+    let Some(attempt) = me.attempt else { return false };
+    let earlier: Vec<&AttemptRow> = attempts[..at]
+        .iter()
+        .filter(|a| a.repo == me.repo && a.task_id == me.task_id)
+        .collect();
+    let list: Vec<Option<i64>> = earlier.iter().map(|a| a.attempt).collect();
+    crate::prior_rejection::previous_index(&list, attempt)
+        .is_some_and(|i| earlier[i].verdict.trim() == crate::review_json::Verdict::Reject.as_str())
+}
+
+/// Every review of every registered repo whose state.db exists, (MEAS-0)
+/// each review's verdict and run providers keyed by (repo root, review id),
+/// and (MEAS-1) each review's target attempt. No global.db means nothing has
+/// been reviewed on this machine yet.
+fn load(paths: &Paths) -> Result<(Vec<ReviewRow>, Providers, Vec<AttemptRow>)> {
     if !paths.global_db().is_file() {
-        return Ok((Vec::new(), Providers::new()));
+        return Ok((Vec::new(), Providers::new(), Vec::new()));
     }
     let global = usage::global_read_only(paths)?;
     let mut repos = Vec::new();
-    {
-        let mut stmt = global.prepare(
-            "SELECT repo_id, COALESCE(root_path, '') FROM repos ORDER BY root_path, repo_id",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (repo_id, root) = row?;
-            let path = paths.state_db(&repo_id);
-            if path.is_file() {
-                repos.push((root, usage::read_only(&path)?));
-            }
+    for (repo_id, root) in reports::repo_roots(&global)? {
+        let path = paths.state_db(&repo_id);
+        if path.is_file() {
+            repos.push((root, usage::read_only(&path)?));
         }
     }
     let mut out = Vec::new();
     let mut providers = Providers::new();
+    let mut attempts = Vec::new();
     for (root, conn) in &repos {
         out.extend(load_reviews(root, conn)?);
         for p in state::list_review_providers(conn)? {
             providers.insert((root.clone(), p.review_id.clone()), p);
         }
+        attempts.extend(reports::review_attempts(conn)?.into_iter().map(|a| AttemptRow {
+            repo: root.clone(),
+            review_id: a.review_id,
+            task_id: a.task_id,
+            attempt: a.attempt,
+            verdict: a.verdict,
+        }));
     }
-    Ok((out, providers))
+    Ok((out, providers, attempts))
 }
 
 fn load_reviews(repo: &str, conn: &Connection) -> Result<Vec<ReviewRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT v.review_id, COALESCE(v.created_at, ''), COALESCE(v.findings, ''),
-                COALESCE(r.task_id, ''), COALESCE(t.title, '')
-         FROM reviews v
-         JOIN runs r ON r.run_id = v.target_run_id
-         LEFT JOIN tasks t ON t.task_id = r.task_id",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(ReviewRow {
+    Ok(reports::review_rows_with_task(conn)?
+        .into_iter()
+        .map(|r| ReviewRow {
             repo: repo.to_string(),
-            review_id: r.get(0)?,
-            created_at: r.get(1)?,
-            findings: r.get(2)?,
-            task_id: r.get(3)?,
-            title: r.get(4)?,
+            review_id: r.review_id,
+            created_at: r.created_at,
+            findings: r.findings,
+            task_id: r.task_id,
+            title: r.title,
         })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        .collect())
 }
 
 fn to_json(r: &Retro) -> Value {
@@ -672,5 +862,80 @@ mod tests {
         assert!(text.lines().next().unwrap().contains("4 findings, 2 blocking, 2 advisory"), "{text}");
         assert!(text.lines().any(|l| l.starts_with("docs ") && l.ends_with("(advisory)")), "{text}");
         assert!(text.lines().any(|l| l.starts_with("test_missing ") && l.ends_with("(blocking)")), "{text}");
+    }
+
+    /// MEAS-1 (AC7): a rework record whose previous attempt was rejected but
+    /// that has no stored check (written before MEAS-1) counts in
+    /// `not_recorded` and in no bucket; a record with a check counts its
+    /// marks by category and by the rejecting review's provider relation; a
+    /// rework after a PASS has nothing to mark.
+    #[test]
+    fn retro_counts_a_rework_record_without_a_check_as_not_recorded_only() {
+        let reject = |task: &str, at: &str| row(task, at, &unmet("docs", "S"));
+        let t1_reject = reject("T1", "2026-10-10T00:00:00Z");
+        let t1_old = reject("T1", "2026-10-11T00:00:00Z");
+        let t2_reject = reject("T2", "2026-10-10T00:00:00Z");
+        let check = serde_json::json!({
+            "status": "checked", "review_id": t2_reject.review_id, "previous_verdict": "REJECT",
+            "expected": ["AC1"],
+            "entries": [{"ref": "AC1", "category": "docs", "fix_size": "S", "fixed_by_behaviour": "yes",
+                         "marked": true, "reason": null, "detail": null, "index": 0}],
+            "extra_entries": [], "array_error": null,
+            "counts": {"yes": 1, "no": 0, "not_fixed": 0, "unmarked": 0}
+        });
+        let mut marked: Value = serde_json::from_str(&unmet("spec_mismatch", "M")).unwrap();
+        marked["prior_rejection_check"] = check;
+        let t2_marked = row("T2", "2026-10-11T00:00:00Z", &marked.to_string());
+        let t3_pass = row("T3", "2026-10-10T00:00:00Z", r#"{"criteria":[{"id":"AC1","verdict":"met","evidence":["E001"]}],"extra_findings":[]}"#);
+        let t3_next = reject("T3", "2026-10-11T00:00:00Z");
+        let rows = vec![t1_reject.clone(), t1_old.clone(), t2_reject.clone(), t2_marked.clone(), t3_pass.clone(), t3_next.clone()];
+        let attempt = |r: &ReviewRow, n: i64, verdict: &str| AttemptRow {
+            repo: r.repo.clone(),
+            review_id: r.review_id.clone(),
+            task_id: r.task_id.clone(),
+            attempt: Some(n),
+            verdict: verdict.to_string(),
+        };
+        let attempts = vec![
+            attempt(&t1_reject, 1, "REJECT"),
+            attempt(&t1_old, 2, "REJECT"),
+            attempt(&t2_reject, 1, "REJECT"),
+            attempt(&t2_marked, 2, "REJECT"),
+            attempt(&t3_pass, 1, "PASS"),
+            attempt(&t3_next, 2, "REJECT"),
+        ];
+        let mut providers = Providers::new();
+        providers.insert(
+            (t2_reject.repo.clone(), t2_reject.review_id.clone()),
+            state::ReviewProviders {
+                review_id: t2_reject.review_id.clone(),
+                verdict: "REJECT".to_string(),
+                implementer_provider: Some("anthropic".to_string()),
+                reviewer_provider: Some("anthropic".to_string()),
+            },
+        );
+        let fbb = fixed_by_behaviour(&rows, &attempts, &providers, 7, now());
+        let v = fbb.to_json();
+        assert_eq!(v["reviews"], 1, "{v}");
+        assert_eq!(v["not_recorded"], 1, "T1's rework only; T3's follows a PASS: {v}");
+        assert_eq!(v["findings"], 1, "{v}");
+        assert_eq!((v["yes"].clone(), v["no"].clone(), v["not_fixed"].clone(), v["unmarked"].clone()), (json!(1), json!(0), json!(0), json!(0)), "{v}");
+        assert_eq!(
+            v["categories"],
+            json!([{"category": "docs", "blocking": false, "count": 1, "yes": 1, "no": 0, "not_fixed": 0, "unmarked": 0}]),
+            "{v}"
+        );
+        let zero = json!({"yes": 0, "no": 0, "not_fixed": 0, "unmarked": 0});
+        assert_eq!(v["by_rejecting_review"]["same_provider"], json!({"yes": 1, "no": 0, "not_fixed": 0, "unmarked": 0}), "{v}");
+        assert_eq!(v["by_rejecting_review"]["cross_provider"], zero, "{v}");
+        assert_eq!(v["by_rejecting_review"]["unknown"], zero, "{v}");
+
+        // Nothing at all: every key, zeros and [].
+        let empty = fixed_by_behaviour(&[], &[], &Providers::new(), 7, now()).to_json();
+        assert_eq!(
+            empty,
+            json!({"reviews": 0, "not_recorded": 0, "findings": 0, "yes": 0, "no": 0, "not_fixed": 0, "unmarked": 0,
+                   "categories": [], "by_rejecting_review": {"same_provider": zero, "cross_provider": zero, "unknown": zero}})
+        );
     }
 }

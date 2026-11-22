@@ -117,11 +117,14 @@ impl Choice {
 }
 
 /// Whether `model` on `profile` can run without an effort level: the harness
-/// has no effort setting, the model has none (haiku), or (AGY-1) the agy
-/// model name carries its level itself (`gemini-3.8-flash-high`), in which
-/// case `launch_settings` records that level through `effort::resolve`.
-pub(crate) fn effort_optional(profile: &Profile, model: &str) -> bool {
+/// has no effort setting, the model has none (haiku), (AGY-1) the agy model
+/// name carries its level itself (`gemini-3.8-flash-high`), in which case
+/// `launch_settings` records that level through `effort::resolve`, or agy
+/// refused `--effort` for this model on this profile (the runner's
+/// `effort_refused` record, `model_list::no_effort`).
+pub(crate) fn effort_optional(gconn: &Connection, profile: &Profile, model: &str) -> bool {
     effort::carried_level(&profile.harness, model).is_some()
+        || crate::model_list::no_effort(gconn, profile, model).is_some()
         || matches!(
             effort::supported_levels(&profile.harness, model, Path::new(&profile.config_dir)),
             SupportedLevels::NoEffort | SupportedLevels::NotApplicable
@@ -178,7 +181,7 @@ pub(crate) fn choose(
     if model.is_none() {
         missing.push("--model");
     }
-    let needs_effort = model.as_deref().is_none_or(|m| !effort_optional(profile, m));
+    let needs_effort = model.as_deref().is_none_or(|m| !effort_optional(gconn, profile, m));
     if effort.is_none() && needs_effort {
         missing.push("--effort");
     }
@@ -193,9 +196,10 @@ pub(crate) fn choose(
         };
         bail!(
             "task {}: {} {} missing: Thoth no longer picks the model or effort for you. {when}; \
-             --effort can be left out only for a model without an effort setting (haiku) or an \
-             agy model whose name ends in its level (gemini-3.8-flash-high). thoth recommend \
-             --role {} --task {} shows each profile's quota",
+             --effort can be left out only for a model without an effort setting (haiku), an agy \
+             model whose name ends in its level (gemini-3.8-flash-high), or an agy model agy \
+             refused --effort for on this profile (thoth models shows it as no effort). thoth \
+             recommend --role {} --task {} shows each profile's quota",
             req.task_id,
             missing.join(" and "),
             if missing.len() == 1 { "is" } else { "are" },
@@ -230,8 +234,17 @@ pub(crate) fn require_reason_gate(
 }
 
 /// The launch's `effort::LaunchSettings`: the level asked for, resolved for
-/// the profile's harness and model. Every new run's spec carries it.
-pub(crate) fn launch_settings(choice: &Choice, profile: &Profile) -> effort::LaunchSettings {
+/// the profile's harness and model. Every new run's spec carries it. AGY-1:
+/// an agy model whose effort agy refused on this profile sends none, keeps
+/// the level asked for as `effort_requested`, and says why in the note.
+pub(crate) fn launch_settings(gconn: &Connection, choice: &Choice, profile: &Profile) -> effort::LaunchSettings {
+    if let Some(no_effort) = crate::model_list::no_effort(gconn, profile, &choice.model) {
+        return effort::LaunchSettings {
+            effort_requested: choice.effort.clone(),
+            effort: None,
+            effort_note: Some(no_effort.launch_note(&choice.model, &profile.profile_id)),
+        };
+    }
     let r = effort::resolve(
         &profile.harness,
         &choice.model,

@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 use std::fs;
@@ -259,7 +261,7 @@ fn unknown_mcp_tools(text: &str, available: &BTreeSet<String>) -> Vec<String> {
 
 fn actual_mcp_tools() -> BTreeSet<String> {
     let home = tempfile::tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_thoth"))
+    let mut child = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")))
         .arg("mcp")
         .env("THOTH_HOME", home.path())
         .env_remove("THOTH_RUN_ID")

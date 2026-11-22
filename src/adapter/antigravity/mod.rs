@@ -19,6 +19,22 @@ use std::path::{Path, PathBuf};
 /// The `profiles.harness` value.
 pub const HARNESS_NAME: &str = "antigravity";
 
+/// SMALL-16: where the runner puts an agy prompt too long for the command
+/// line, relative to the run's working directory: `.agent/prompt.md` for an
+/// implementer, `.agent/review-input/prompt.md` for a reviewer or a spec
+/// reviewer (the input folder the reviewer already reads).
+pub fn prompt_file_path(is_review: bool) -> &'static str {
+    if is_review { ".agent/review-input/prompt.md" } else { ".agent/prompt.md" }
+}
+
+/// The `-p` value that stands in for a prompt written to `path`.
+pub fn prompt_file_instruction(path: &str) -> String {
+    format!(
+        "Your full instructions are in the file {path}. Read that whole file with your file tool \
+         before anything else, then do what it says. It is your complete task."
+    )
+}
+
 /// The registry entry (`adapter::HARNESSES`).
 pub const HARNESS: Harness = Harness {
     name: HARNESS_NAME,
@@ -401,9 +417,11 @@ impl HarnessAdapter for AntigravityAdapter {
         if let Some(review) = &req.review_output {
             args.extend(["--json-schema".into(), review.schema.display().to_string()]);
         }
-        // W3: the prompt stays on argv - agy 1.2.17's `-p` always takes the
-        // next token as the prompt (`-p -` is a literal "-"), so a long one
-        // fails the runner's command-line cap instead.
+        // W3: the prompt stays on argv - agy's `-p` always takes the next
+        // token as the prompt (`-p -` is a literal "-"). SMALL-16: a prompt
+        // that would push the command line past the cap is moved into a file
+        // by the runner (`runner::launch`), not here: building a command
+        // writes nothing.
         CommandPlan { program: self.bin.clone(), args, env: req.extra_env.clone(), cwd: req.cwd.clone(), stdin: None }
     }
 

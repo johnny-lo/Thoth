@@ -1,5 +1,10 @@
 //! Offline source checking shared by the three fake harnesses. Never fetches
 //! the network: non-file URLs produce unreachable.
+//!
+//! FAKE_SOURCE_CHECK_CITES=E001,E002 adds one extra finding (severity minor,
+//! category other, which does not block) citing those codes, so a test can
+//! make a source check cite evidence; unset, the document has no extra
+//! findings.
 
 pub fn wait_gate() {
     if let Some(gate) = std::env::var_os("FAKE_REVIEW_GATE") {
@@ -62,5 +67,17 @@ pub fn document(prompt: &str) -> serde_json::Value {
     };
     let verdict =
         std::env::var("FAKE_SOURCE_CHECK_VERDICT").unwrap_or_else(|_| verdict.to_string());
-    serde_json::json!({"verdict": verdict, "findings": {"sources": sources, "extra_findings": []}})
+    let extra: Vec<serde_json::Value> = match std::env::var("FAKE_SOURCE_CHECK_CITES") {
+        Ok(codes) => {
+            let codes: Vec<&str> = codes.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+            vec![serde_json::json!({
+                "severity": "minor",
+                "note": "cited by FAKE_SOURCE_CHECK_CITES",
+                "evidence": codes,
+                "category": "other",
+            })]
+        }
+        Err(_) => Vec::new(),
+    };
+    serde_json::json!({"verdict": verdict, "findings": {"sources": sources, "extra_findings": extra}})
 }

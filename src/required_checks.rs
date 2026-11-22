@@ -86,14 +86,14 @@ pub fn for_run(conn: &Connection, task_id: &str, task_spec: &str, run_id: Option
     }
     let mut details = Vec::new();
     if let Some(run_id) = run_id {
-        let mut stmt = conn.prepare(
-            "SELECT detail FROM events WHERE task_id = ?1 AND run_id = ?2 AND type = ?3 ORDER BY seq",
+        let rows = crate::db::state::event_details_of_task_run(
+            conn,
+            task_id,
+            run_id,
+            event_type::VERIFY_RAN,
         )?;
-        let rows = stmt.query_map(rusqlite::params![task_id, run_id, event_type::VERIFY_RAN], |r| {
-            r.get::<_, String>(0)
-        })?;
         for row in rows {
-            details.push(serde_json::from_str(&row?).unwrap_or(Value::Null));
+            details.push(serde_json::from_str(&row).unwrap_or(Value::Null));
         }
     }
     Ok(not_run(&required, &details))

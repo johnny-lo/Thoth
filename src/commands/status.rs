@@ -16,7 +16,26 @@ pub const STALE_AFTER_SECONDS: i64 = 15;
 
 /// Only a `running` run can be stale; anything unparsable is reported as fresh so
 /// a clock or format problem never fakes a dead runner.
+///
+/// TEST-7b: in a debug build whose environment carries the test-only switch
+/// `THOTH_TEST_HEARTBEAT_MS` (see `runner::test_heartbeat_ms`), the threshold
+/// is three of its beats instead of `STALE_AFTER_SECONDS`; release builds
+/// never read the switch.
 pub fn heartbeat_is_stale(now_rfc3339: &str, heartbeat: Option<&str>, run_status: &str) -> bool {
+    heartbeat_is_stale_with_beat(now_rfc3339, heartbeat, run_status, crate::runner::test_heartbeat_ms())
+}
+
+/// TEST-7b: the staleness rule with the test switch's value passed in.
+/// `None` (the switch off, always so in a release build) is today's rule:
+/// more than `STALE_AFTER_SECONDS` whole seconds. `Some(n)` is stale when
+/// more than 3 x n milliseconds old, compared in milliseconds - the same 3x
+/// ratio as the runner's 5 s beat and the 15 s threshold.
+fn heartbeat_is_stale_with_beat(
+    now_rfc3339: &str,
+    heartbeat: Option<&str>,
+    run_status: &str,
+    test_beat_ms: Option<u64>,
+) -> bool {
     if run_status != "running" {
         return false;
     }
@@ -27,7 +46,11 @@ pub fn heartbeat_is_stale(now_rfc3339: &str, heartbeat: Option<&str>, run_status
     ) else {
         return false;
     };
-    (now - then).whole_seconds() > STALE_AFTER_SECONDS
+    let age = now - then;
+    match test_beat_ms {
+        None => age.whole_seconds() > STALE_AFTER_SECONDS,
+        Some(beat_ms) => age.whole_milliseconds() > i128::from(beat_ms) * 3,
+    }
 }
 
 /// What a run's `run_usage` event recorded: `models` maps model id to output
@@ -207,6 +230,9 @@ fn run_json(
         "timeout_seconds": r.timeout_seconds,
         "effort_requested": launch.as_ref().and_then(|l| l.effort_requested.clone()),
         "effort": launch.as_ref().and_then(|l| l.effort.clone()),
+        // AGY-1 (second part): why the effort sent differs from the one asked
+        // for (a carried level, a lowered one, one agy refused); null when none.
+        "effort_note": launch.as_ref().and_then(|l| l.effort_note.clone()),
         "run_dir": r.run_dir,
         "error_text": r.error_text,
         "models_used": usage.map(|u| u.models.clone()).unwrap_or(serde_json::Value::Null),
@@ -298,12 +324,7 @@ fn run_outside(paths: &Paths, json: bool) -> Result<i32> {
     let mut repos = Vec::new();
     if paths.global_db().is_file() {
         let global = crate::commands::usage::global_read_only(paths)?;
-        let mut stmt = global.prepare(
-            "SELECT repo_id, COALESCE(root_path, '') FROM repos ORDER BY root_path, repo_id",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (repo_id, root) = row?;
+        for (repo_id, root) in crate::db::reports::repo_roots(&global)? {
             let path = paths.state_db(&repo_id);
             if path.is_file() {
                 repos.push((root, crate::commands::usage::read_only(&path)?));
@@ -345,6 +366,17 @@ pub fn run(paths: &Paths, cwd: &Path, task: Option<&str>, json: bool) -> Result<
     }
     let (_repo_id, root, conn) = crate::commands::task::open_repo(paths, cwd)?;
     let now = ids::now_rfc3339();
+    // SMALL-11 (4): a run whose runner is gone is settled before anything is
+    // shown, so the output says what is true now.
+    match crate::runner::settle_dead_runners(&conn, &now) {
+        // REVFIX-1: a settled run changed a run and maybe a task status, so
+        // an existing report.html is rewritten as after every other command
+        // that changes one (best effort, prints nothing). A status that
+        // settles nothing leaves the page and its modification time alone.
+        Ok(settled) if !settled.is_empty() => crate::commands::report::refresh_if_present(paths),
+        Ok(_) => {}
+        Err(e) => masked_eprintln!("warning: could not settle runs whose runner is gone: {e:#}"),
+    }
 
     match task {
         None => {
@@ -577,6 +609,31 @@ mod tests {
         assert!(!heartbeat_is_stale(now, None, "queued"));
         assert!(!heartbeat_is_stale(now, Some("nonsense"), "running"));
         assert_eq!(STALE_AFTER_SECONDS, 15);
+    }
+
+    /// TEST-7b: without the test switch (always so in a release build) the
+    /// threshold is today's fifteen whole seconds; with a 500 ms beat it is
+    /// three beats, compared in milliseconds.
+    #[test]
+    fn staleness_keeps_fifteen_whole_seconds_without_the_switch_and_three_beats_with_it() {
+        let now = "2026-09-14T10:00:30Z";
+        let stale = |hb: &str, beat: Option<u64>| heartbeat_is_stale_with_beat(now, Some(hb), "running", beat);
+        // off: 15.9 s is still fifteen whole seconds, 16 s is stale
+        assert!(!stale("2026-09-14T10:00:14.1Z", None));
+        assert!(stale("2026-09-14T10:00:14Z", None));
+        assert!(!stale("2026-09-14T10:00:15Z", None));
+        assert!(!stale("2026-09-14T10:00:28Z", None));
+        // the parser gives the switch's off value exactly the same rule
+        assert_eq!(crate::runner::parse_test_heartbeat_ms(None), None);
+        // on, 500 ms beats: 1.5 s is fresh, 1.501 s stale
+        assert!(!stale("2026-09-14T10:00:28.5Z", Some(500)));
+        assert!(stale("2026-09-14T10:00:28.499Z", Some(500)));
+        assert!(!stale("2026-09-14T10:00:29.9Z", Some(500)));
+        assert!(stale("2026-09-14T10:00:14Z", Some(500)));
+        // the run status and unparsable values still win over the switch
+        assert!(!heartbeat_is_stale_with_beat(now, Some("2026-09-14T10:00:00Z"), "completed", Some(500)));
+        assert!(!heartbeat_is_stale_with_beat(now, None, "running", Some(500)));
+        assert!(!heartbeat_is_stale_with_beat(now, Some("nonsense"), "running", Some(500)));
     }
 
     fn run(status: &str, reason: Option<&str>, session: bool) -> Run {

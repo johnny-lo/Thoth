@@ -21,7 +21,7 @@ use crate::redact::{Counts, Masker};
 use crate::review_json::{self, ExtraFinding, Findings, Verdict};
 use crate::spec_edits::{self, ReviewMode};
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -45,25 +45,14 @@ pub fn fix_branch(task_id: &str, attempt: i64) -> String {
 
 /// A reviewer run's newest `review_started` detail.
 pub fn started_detail(conn: &Connection, run_id: &str) -> Result<Option<Value>> {
-    let detail: Option<String> = conn
-        .query_row(
-            "SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
-            rusqlite::params![run_id, event_type::REVIEW_STARTED],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let detail: Option<String> =
+        state::latest_event_detail_of_run(conn, run_id, event_type::REVIEW_STARTED)?;
     Ok(detail.and_then(|d| serde_json::from_str(&d).ok()))
 }
 
 /// The seq of a reviewer run's newest `review_started` event.
 fn started_seq(conn: &Connection, run_id: &str) -> Result<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT seq FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
-            rusqlite::params![run_id, event_type::REVIEW_STARTED],
-            |r| r.get(0),
-        )
-        .optional()?)
+    state::latest_event_seq_of_run(conn, run_id, event_type::REVIEW_STARTED)
 }
 
 /// The mode a `review_started` detail records; `review` for one written
@@ -113,13 +102,8 @@ pub fn verify_ok(detail: &Value) -> bool {
 
 /// A run's newest `verify_ran`: (seq, detail).
 pub fn latest_verify(conn: &Connection, run_id: &str) -> Result<Option<(i64, Value)>> {
-    let row: Option<(i64, String)> = conn
-        .query_row(
-            "SELECT seq, detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
-            rusqlite::params![run_id, event_type::VERIFY_RAN],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
+    let row: Option<(i64, String)> =
+        state::latest_event_seq_detail_of_run(conn, run_id, event_type::VERIFY_RAN)?;
     Ok(row.map(|(seq, d)| (seq, serde_json::from_str(&d).unwrap_or(Value::Null))))
 }
 
@@ -383,6 +367,9 @@ pub fn ingest_edit(
     // applied records no verdict: the confirm does, and holds the fix's own
     // verify to the rule; a refused fix puts the report back under it.
     let gate = review::required_checks_gate(conn, task, &doc, target_run_id);
+    // MEAS-1: the marks on the previous REJECT, checked once; whichever row
+    // this report writes (plain, applied fix or refused fix) carries them.
+    let marks = crate::prior_rejection::for_review(conn, task, target_run_id, json_text);
     let raw: Value = serde_json::from_str(review::strip_bom(json_text)).unwrap_or(Value::Null);
     let items = match review_fix_edits::edit_list(&raw) {
         Ok(i) => i,
@@ -402,7 +389,7 @@ pub fn ingest_edit(
             Ok(list) => list,
             Err((why, detail)) => return review::review_invalid(conn, run, why, detail),
         };
-        return write_plain(conn, run, target_run_id, &doc, &cited, verdict, &not_run, json!({"mode": "edit", "fix": null}), None);
+        return write_plain(conn, run, target_run_id, &doc, &cited, verdict, &not_run, &marks, json!({"mode": "edit", "fix": null}), None);
     }
 
     let started = started_detail(conn, &run.run_id).ok().flatten().unwrap_or(Value::Null);
@@ -414,7 +401,7 @@ pub fn ingest_edit(
 
     let attempt = try_fix(conn, ctx, run, task, &wt, &candidate, &branch, &items, &doc.findings);
     let refusal = match attempt {
-        Ok(fix) => match write_applied(conn, ctx, run, target_run_id, &doc, &review_id, &candidate, &branch, &wt, branch_before.as_deref(), &fix) {
+        Ok(fix) => match write_applied(conn, ctx, run, target_run_id, &doc, &marks, &review_id, &candidate, &branch, &wt, branch_before.as_deref(), &fix) {
             Ok(()) => {
                 // A review writes no `result_ingested`, so its run note keeps
                 // this text.
@@ -473,6 +460,7 @@ pub fn ingest_edit(
         &cited,
         verdict,
         &not_run,
+        &marks,
         json!({"mode": "edit", "fix": {"applied": false, "stage": refusal.stage}}),
         Some((review_id, refused)),
     );
@@ -492,12 +480,12 @@ fn write_plain(
     cited: &[String],
     verdict: Verdict,
     not_run: &[crate::required_checks::NotRun],
+    marks: &crate::prior_rejection::Marks,
     extra: Value,
     refused: Option<(String, Value)>,
 ) -> ReviewIngest {
-    let opened = review::opened_codes(conn, &run.run_id).unwrap_or_default();
-    let unopened: Vec<String> = cited.iter().filter(|c| !opened.contains(c)).cloned().collect();
-    let mut row = review::new_review_row(target_run_id.to_string(), Some(run.run_id.clone()), verdict, &doc.findings);
+    let review::Opened { opened, in_stream, unopened } = review::opened_or_none(conn, &run.run_id, cited);
+    let mut row = review::new_review_row(target_run_id.to_string(), Some(run.run_id.clone()), verdict, &doc.findings, marks);
     if let Some((id, _)) = &refused {
         row.review_id = id.clone();
     }
@@ -509,9 +497,11 @@ fn write_plain(
         cited,
         opened: Some(&opened),
         unopened: Some(&unopened),
+        opened_in_stream: Some(&in_stream),
         source: None,
         // REV-3: what the edit review was checked against.
         checks_not_run: Some(not_run),
+        prior_rejection: marks.event_value(),
     });
     if let (Some(d), Some(x)) = (detail.as_object_mut(), extra.as_object()) {
         for (k, v) in x {
@@ -664,6 +654,7 @@ fn write_applied(
     run: &Run,
     target_run_id: &str,
     doc: &review_json::ReviewDocument,
+    marks: &crate::prior_rejection::Marks,
     review_id: &str,
     candidate: &str,
     branch: &str,
@@ -700,7 +691,7 @@ fn write_applied(
     let commit_code = evidence::record_review_fix_commit(&tx, &ectx, ctx.root, &fix.fix_commit).map_err(restore)?;
     let row = state::Review {
         review_id: review_id.to_string(),
-        ..review::new_review_row(target_run_id.to_string(), Some(run.run_id.clone()), Verdict::Reject, &doc.findings)
+        ..review::new_review_row(target_run_id.to_string(), Some(run.run_id.clone()), Verdict::Reject, &doc.findings, marks)
     };
     state::insert_review(&tx, &row).map_err(restore)?;
     let edits: Vec<Value> = fix
@@ -882,11 +873,7 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
         // GATE-1: the fix's protected changes, approved on the edit review
         // run, checked again under the write lock before a PASS is written.
         if verdict == Verdict::Pass {
-            let why = match state::get_run(&tx, &edit_run_id)? {
-                None => Some(format!("the edit review's run {edit_run_id} is gone")),
-                Some(edit_run) => review::protected_refusal(&tx, &run.task_id, &edit_run, &[], None)?,
-            };
-            if let Some(why) = why {
+            if let Some(why) = pass_protected_stop(&tx, &run.task_id, &edit_run_id)? {
                 return Ok(Err((stage::PROTECTED, why)));
             }
         }
@@ -903,6 +890,10 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
         };
         let mut stored = serde_json::to_value(&findings)?;
         stored["author_check"] = json!({"confirms_review_id": confirms, "copied_extra_findings": copied});
+        // MEAS-1 (D6): the edit review's marks and check, copied unchanged;
+        // retro counts them on the edit review only.
+        let marks = crate::prior_rejection::Marks::from_stored(&edit_row.findings);
+        marks.add_to(&mut stored);
         let row = state::Review {
             review_id: crate::ids::new_review_id(),
             target_run_id: edit_row.target_run_id.clone(),
@@ -918,8 +909,7 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
         }
         let doc_view = review_json::ReviewDocument { verdict: verdict.as_str().to_string(), findings: findings.clone() };
         let cited = review_json::cited_codes(&doc_view);
-        let opened = review::opened_codes(&tx, &run.run_id).unwrap_or_default();
-        let unopened: Vec<String> = cited.iter().filter(|c| !opened.contains(c)).cloned().collect();
+        let review::Opened { opened, in_stream, unopened } = review::opened_or_none(&tx, &run.run_id, &cited);
         let mut detail = review::verdict_event_detail(review::VerdictEventShape {
             verdict,
             review_id: &row.review_id,
@@ -928,9 +918,11 @@ pub fn ingest_confirm(conn: &Connection, ctx: &Ctx<'_>, run: &Run, json_text: &s
             cited: &cited,
             opened: Some(&opened),
             unopened: Some(&unopened),
+            opened_in_stream: Some(&in_stream),
             source: None,
             // REV-3: the required checks not run on the fix's verify run.
             checks_not_run: Some(&not_run),
+            prior_rejection: marks.event_value(),
         });
         if let Some(d) = detail.as_object_mut() {
             d.insert("source".into(), json!(SOURCE_AUTHOR_CHECK));
@@ -1180,6 +1172,17 @@ pub fn merge_target(
     }
 }
 
+/// GATE-1: why a confirm may not write a PASS - the edit review's run is gone,
+/// or the fix's protected changes (the edit run's newest diff evidence) are not
+/// all approved or not readable. `None` when the PASS may go on. Read inside
+/// the confirm's write transaction.
+fn pass_protected_stop(conn: &Connection, task_id: &str, edit_run_id: &str) -> Result<Option<String>> {
+    Ok(match state::get_run(conn, edit_run_id)? {
+        None => Some(format!("the edit review's run {edit_run_id} is gone")),
+        Some(edit_run) => review::protected_refusal(conn, task_id, &edit_run, &[], None)?,
+    })
+}
+
 /// `wait --run`'s `pending_fix` for one run: `null` for a run that is not a
 /// code review; otherwise whether the task has a pending fix this run is the
 /// edit review of, or a confirm of.
@@ -1198,4 +1201,131 @@ pub fn pending_fix_for_run(conn: &Connection, run: &Run) -> Result<Value> {
     }
     let d = started_detail(conn, &run.run_id)?.unwrap_or(Value::Null);
     Ok(json!(d["confirms_review_id"].as_str() == Some(row.review_id.as_str())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TESTGAP-2: the PASS-time recheck of the confirm's write transaction.
+    /// No CLI test reaches it: the earlier gate of `review confirm` has
+    /// already refused by then. Built over an in-memory state database.
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::migrate_state(&conn).unwrap();
+        state::insert_task(
+            &conn,
+            &state::Task {
+                task_id: "T1".into(),
+                title: "t".into(),
+                spec: "{}".into(),
+                risk: "normal".into(),
+                status: "in_review".into(),
+                base_commit: "abc".into(),
+                created_at: "2026-11-22T00:00:00Z".into(),
+                updated_at: "2026-11-22T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        state::insert_run(
+            &conn,
+            &state::Run {
+                run_id: "R1".into(),
+                task_id: "T1".into(),
+                attempt: 1,
+                role: role::REVIEWER.into(),
+                provider: "anthropic".into(),
+                account: "claude-a".into(),
+                model: "sonnet".into(),
+                harness_session_id: None,
+                config_dir: "/cfg".into(),
+                allowed_tools: "Bash".into(),
+                worktree: "/wt".into(),
+                base_commit: "abc".into(),
+                candidate_commit: None,
+                spec: "{}".into(),
+                status: "completed".into(),
+                interrupted_reason: None,
+                exit_code: Some(0),
+                input_tokens: None,
+                output_tokens: None,
+                started_at: None,
+                ended_at: None,
+                runner_pid: None,
+                worker_pid: None,
+                heartbeat_at: None,
+                cancel_requested: 0,
+                timeout_seconds: 1800,
+                run_dir: "/rd".into(),
+                error_text: None,
+                harness_bin: None,
+            },
+        )
+        .unwrap();
+        conn
+    }
+
+    fn diff_evidence(conn: &Connection, code: &str, detail: Value) {
+        state::insert_evidence(
+            conn,
+            &state::Evidence {
+                evidence_id: format!("id-{code}"),
+                code: code.into(),
+                task_id: "T1".into(),
+                run_id: Some("R1".into()),
+                kind: "diff".into(),
+                collected_by: "thoth".into(),
+                label: "diff".into(),
+                sha256: None,
+                bytes: None,
+                blob_path: None,
+                detail: detail.to_string(),
+                created_at: "2026-11-22T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn protected_test_change() -> Value {
+        json!({
+            "protected_changes": [{"path": "tests/a.rs", "status": "modified", "kind": "test"}],
+            "inline_test_errors": []
+        })
+    }
+
+    #[test]
+    fn the_pass_recheck_stops_a_gone_edit_run() {
+        let conn = db();
+        let why = pass_protected_stop(&conn, "T1", "R-gone").unwrap().expect("a stop");
+        assert_eq!(why, "the edit review's run R-gone is gone");
+    }
+
+    #[test]
+    fn the_pass_recheck_stops_an_unapproved_protected_change_and_lets_an_approved_one_through() {
+        let conn = db();
+        diff_evidence(&conn, "E1", protected_test_change());
+        let why = pass_protected_stop(&conn, "T1", "R1").unwrap().expect("a stop");
+        assert!(why.contains("tests/a.rs"), "{why}");
+        assert!(why.contains("nobody has approved"), "{why}");
+
+        state::append_event(
+            &conn,
+            &NewEvent {
+                task_id: Some("T1".into()),
+                run_id: Some("R1".into()),
+                event_type: event_type::PROTECTED_CHANGE_APPROVED.into(),
+                detail: json!({"changes": [{"path": "tests/a.rs", "status": "modified"}]}),
+            },
+        )
+        .unwrap();
+        assert_eq!(pass_protected_stop(&conn, "T1", "R1").unwrap(), None);
+    }
+
+    #[test]
+    fn the_pass_recheck_stops_a_diff_evidence_without_a_readable_list() {
+        let conn = db();
+        diff_evidence(&conn, "E1", json!({"files_changed": []}));
+        let why = pass_protected_stop(&conn, "T1", "R1").unwrap().expect("a stop");
+        assert!(why.contains("no readable protected_changes"), "{why}");
+    }
 }

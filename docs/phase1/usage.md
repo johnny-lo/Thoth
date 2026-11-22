@@ -522,7 +522,8 @@ continues the same session.
 **Temporary problems.** An error whose text contains one of the transient markers
 (`overloaded`, `There was a network issue`, `TLS handshake timeout`,
 `Eligibility check failed`, `The stream was interrupted`,
-`stream disconnected before completion`, `Failed to refresh OAuth token`, in any
+`stream disconnected before completion`, `Failed to refresh OAuth token`,
+`No capacity available for model` (agy's 503 answer), in any
 letter case) is `runs.status=interrupted`, `runs.interrupted_reason=transient`; the
 quota match is checked first, so a text that also names a quota is still a quota
 stop. The profile is not touched and no quota event is written.
@@ -745,6 +746,18 @@ shows `heartbeat_stale: true` once a `running` run's heartbeat is more than 15
 seconds old — its runner has probably died or lost the ability to write to the
 database. `thoth cancel <run>` escalates past the (now unreachable) runner
 and settles the row directly.
+
+(SMALL-11, behaviour change of `status`.) When the runner's recorded pid is
+also no running thoth process (no process has that pid, or it now runs another
+program), `thoth status` (with or without a task, and the MCP `thoth_status`)
+settles the run itself before it prints: `interrupted`, `interrupted_reason`
+`crash`, an `error_text` naming the runner pid, and a `status_change` event with
+`detail.settled_by` `status`. An implementer run's task becomes `interrupted`;
+a reviewer or spec reviewer run leaves its task as it is, so the review can be
+started again. A run whose runner is alive, or that has no recorded
+`runner_pid`, is never settled this way; `cancel` stays the way to stop it.
+`profile usage`'s `live_runs`, `recommend`'s live-run count and the live quota
+refresh no longer count such a run, even before `status` has settled it.
 
 **`runner-error.log`.** A detached runner has no stderr a human will ever see,
 so anything it cannot otherwise report (a DB write that failed, a kill that did

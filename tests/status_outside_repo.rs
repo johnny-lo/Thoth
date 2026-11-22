@@ -191,7 +191,7 @@ struct Server {
 
 impl Server {
     fn start(f: &Fixture, default_repo: &Path) -> Self {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp").arg("--default-repo").arg(default_repo).current_dir(default_repo);
         for var in [
             "THOTH_RUN_ID",

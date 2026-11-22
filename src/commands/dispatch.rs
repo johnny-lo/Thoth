@@ -706,7 +706,7 @@ pub fn run(paths: &Paths, cwd: &Path, args: DispatchArgs<'_>) -> Result<i32> {
     let mut warnings: Vec<String> = Vec::new();
     warnings.extend(model_warning);
     warnings.extend(reserve_note);
-    let launch = auto_pick::launch_settings(&choice, &profile);
+    let launch = auto_pick::launch_settings(&gconn, &choice, &profile);
     // SMALL-9b: the effort sent picks the limit; the previous run's is never kept.
     let timeout_seconds = args
         .timeout_seconds

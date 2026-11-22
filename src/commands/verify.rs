@@ -32,7 +32,7 @@ use crate::result_json::VerificationRequest;
 use crate::test_scope::{self, ScopePlan};
 use crate::worktree;
 use anyhow::{bail, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use std::path::{Path, PathBuf};
 
@@ -60,13 +60,8 @@ pub fn requests_for_run(
 ) -> Result<(Vec<VerificationRequest>, String, Option<String>)> {
     let path = Path::new(&run.worktree).join(".agent").join("result.json");
 
-    let detail: Option<String> = conn
-        .query_row(
-            "SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
-            rusqlite::params![run.run_id, event_type::RESULT_INGESTED],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let detail: Option<String> =
+        state::latest_event_detail_of_run(conn, &run.run_id, event_type::RESULT_INGESTED)?;
     let from_event = detail.as_deref().and_then(|d| {
         let v: serde_json::Value = serde_json::from_str(d).ok()?;
         let doc: crate::result_json::WorkerResult =
@@ -142,6 +137,9 @@ pub fn requests_for_run(
 pub(crate) struct BaseWorktree {
     pub(crate) root: PathBuf,
     pub(crate) path: PathBuf,
+    /// SWEEP-1: the checkout's owner record, let go of after the checkout is
+    /// removed (`None` when it could not be made).
+    pub(crate) hold: Option<crate::baseline_hold::Hold>,
 }
 
 impl Drop for BaseWorktree {
@@ -154,7 +152,46 @@ impl Drop for BaseWorktree {
                 e.detail()
             );
         }
+        if let Some(hold) = self.hold.take() {
+            hold.release(&self.path);
+        }
     }
+}
+
+/// SWEEP-1: the sweep of leftover baseline checkouts, the owner record, then
+/// the detached checkout of `commit` at `baseline-worktrees/NAME`, guarded.
+/// `what` names the checkout in the refusal to reuse one. Shared by `verify
+/// --at-base` and `suite run`; the sweep's stderr lines are printed here.
+pub(crate) fn make_baseline_checkout(
+    paths: &Paths,
+    repo_id: &str,
+    root: &Path,
+    name: &str,
+    commit: &str,
+    what: &str,
+) -> Result<(BaseWorktree, crate::baseline_hold::Sweep)> {
+    let swept = crate::baseline_hold::sweep(paths, repo_id, root);
+    crate::baseline_hold::warn(&swept);
+    let path = crate::baseline_hold::checkouts_dir(paths, repo_id).join(name);
+    let hold = crate::baseline_hold::acquire(paths, repo_id, name);
+    // Forget registrations whose directory is already gone.
+    worktree::prune_worktrees(root);
+    let ensured = match worktree::ensure_detached_worktree(root, &path, commit) {
+        Ok(e) => e,
+        Err(e) => {
+            if let Some(h) = hold {
+                h.release(&path);
+            }
+            return Err(e);
+        }
+    };
+    if ensured.outcome == worktree::EnsureOutcome::Reused {
+        if let Some(h) = hold {
+            h.discard();
+        }
+        bail!("{what} {} already exists; refusing to reuse it", path.display());
+    }
+    Ok((BaseWorktree { root: root.to_path_buf(), path, hold }, swept))
 }
 
 /// The message when there is nothing approved to run (`--json`:
@@ -350,7 +387,52 @@ pub fn run(
 ) -> Result<i32> {
     let (repo_id, root, conn) = crate::commands::task::open_repo(paths, cwd)?;
     let run_id = ids::resolve_prefix(&state::list_run_ids(&conn)?, needle)?;
-    let run = state::get_run(&conn, &run_id)?
+    // SMALL-11 (5): while the checks run, the run's worktree is held against
+    // every sweep. A dry run and `--at-base` run nothing in it.
+    let hold = (!dry_run && !at_base)
+        .then(|| crate::verify_hold::acquire(paths, &repo_id, &run_id))
+        .flatten();
+    let result = run_held(paths, &repo_id, &root, &conn, &run_id, dry_run, timeout_secs, at_base, json);
+    if hold.is_some() {
+        // Whatever the result, and after the hold is let go: if the task is
+        // finished by now, its worktrees go, by the checks every sweep runs.
+        drop(hold);
+        if !crate::commands::worktrees::inside_a_run()
+            && !crate::commands::worktrees::cwd_inside_worktrees(paths, &repo_id, cwd)
+        {
+            sweep_task_after_verify(paths, &repo_id, &root, &conn, &run_id);
+        }
+    }
+    result
+}
+
+/// The sweep a verify runs for its run's task once it holds nothing; never
+/// changes verify's output or exit code.
+fn sweep_task_after_verify(paths: &Paths, repo_id: &str, root: &Path, conn: &Connection, run_id: &str) {
+    use crate::commands::worktrees::{sweep, Scope, SOURCE_VERIFY};
+    let Ok(Some(run)) = state::get_run(conn, run_id) else {
+        return;
+    };
+    if let Err(e) = sweep(paths, repo_id, root, conn, Scope::Task(&run.task_id), SOURCE_VERIFY) {
+        masked_eprintln!("thoth: warning: worktree cleanup failed: {e:#}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_held(
+    paths: &Paths,
+    repo_id: &str,
+    root: &Path,
+    conn: &Connection,
+    run_id: &str,
+    dry_run: bool,
+    timeout_secs: u64,
+    at_base: bool,
+    json: bool,
+) -> Result<i32> {
+    let (repo_id, root) = (repo_id.to_string(), root.to_path_buf());
+    let run_id = run_id.to_string();
+    let run = state::get_run(conn, &run_id)?
         .ok_or_else(|| anyhow::anyhow!("run {run_id} disappeared"))?;
 
     // Fix round 1 / R3, reworked in fix round 2 / R4: a queued/running run's
@@ -370,7 +452,7 @@ pub fn run(
     }
 
     // P7-1b: what the worker declared is listed for reference and never run.
-    let (declared, _declared_from, warning) = requests_for_run(&conn, &run)?;
+    let (declared, _declared_from, warning) = requests_for_run(conn, &run)?;
     let warnings: Vec<String> = warning.into_iter().collect();
     if !json {
         for w in &warnings {
@@ -382,11 +464,11 @@ pub fn run(
         .map(|r| serde_json::json!({"cmd": r.cmd, "cwd": r.cwd}))
         .collect();
 
-    let task = state::get_task(&conn, &run.task_id)?
+    let task = state::get_task(conn, &run.task_id)?
         .ok_or_else(|| anyhow::anyhow!("task {} disappeared", run.task_id))?;
     let spec_ids = spec_check_ids(&task.spec);
     let (check_ids, source) = if spec_ids.is_empty() {
-        let all: Vec<String> = checks::list_checks(&conn)?
+        let all: Vec<String> = checks::list_checks(conn)?
             .into_iter()
             .map(|c| c.check_id)
             .collect();
@@ -396,7 +478,7 @@ pub fn run(
     };
     let catalogue: Vec<Option<Check>> = check_ids
         .iter()
-        .map(|id| checks::get_check(&conn, id))
+        .map(|id| checks::get_check(conn, id))
         .collect::<Result<_>>()?;
 
     // The *task's* base_commit, not the run's: a rework run's own base_commit
@@ -410,14 +492,14 @@ pub fn run(
 
     // CK-1: the approved checks now, against those the previous verify (any
     // task, any run) saw.
-    let approved_checks: Vec<String> = checks::list_checks(&conn)?
+    let approved_checks: Vec<String> = checks::list_checks(conn)?
         .into_iter()
         .filter(|c| c.approved_at.is_some())
         .map(|c| c.check_id)
         .collect();
-    let previous = state::latest_event_of_type(&conn, event_type::VERIFY_RAN, None)?;
+    let previous = state::latest_event_of_type(conn, event_type::VERIFY_RAN, None)?;
     let (previous_verify, missing_since_last_verify) =
-        compare_with_previous(&conn, &approved_checks, previous.as_ref())?;
+        compare_with_previous(conn, &approved_checks, previous.as_ref())?;
     let previous_line = missing_line(&previous_verify, &missing_since_last_verify);
 
     // An empty catalogue, or a spec none of whose ids is in it: nothing to
@@ -454,24 +536,23 @@ pub fn run(
     // checkout of base_commit under THOTH_HOME (removed by the guard on
     // every exit path, including a `?`). A dry run only names the path.
     let mut _base_guard: Option<BaseWorktree> = None;
+    // SWEEP-1: what the sweep before this run's checkout did (`--json`:
+    // `baseline_sweep`); only once the checkout is being made.
+    let mut baseline_sweep: Option<serde_json::Value> = None;
     let worktree = if at_base {
-        let base_dir = paths.repo_dir(&repo_id).join("baseline-worktrees");
         // A nonce keeps the path unique, so a checkout an interrupted run left
         // behind can never be picked up as this run's baseline.
-        let path = base_dir.join(format!("{}-{}", run.run_id, ids::new_run_id()));
+        let name = format!("{}-{}", run.run_id, ids::new_run_id());
+        let path = crate::baseline_hold::checkouts_dir(paths, &repo_id).join(&name);
         if !dry_run {
-            // Forget registrations whose directory an interrupted `--at-base`
-            // (Ctrl-C / SIGKILL skip the drop guard) left dangling.
-            worktree::prune_worktrees(&root);
+            // The guard's drop is skipped when the command is killed (SIGKILL,
+            // Ctrl-C, a reboot); the checkout's owner record then lets the
+            // next sweep (here, `suite run` or `worktrees prune`) remove it.
             let base = at_commit.as_deref().unwrap_or_default();
-            let ensured = worktree::ensure_detached_worktree(&root, &path, base)?;
-            if ensured.outcome == worktree::EnsureOutcome::Reused {
-                bail!("baseline checkout {} already exists; refusing to reuse it", path.display());
-            }
-            _base_guard = Some(BaseWorktree {
-                root: root.clone(),
-                path: path.clone(),
-            });
+            let (guard, swept) =
+                make_baseline_checkout(paths, &repo_id, &root, &name, base, "baseline checkout")?;
+            baseline_sweep = Some(swept.to_json());
+            _base_guard = Some(guard);
         }
         path
     } else {
@@ -522,7 +603,7 @@ pub fn run(
     // look in (or fingerprint) yet.
     let tree_exists = !(dry_run && at_base);
     let blobs_dir = paths.blobs_dir(&repo_id);
-    let store = Store { conn: &conn, blobs_dir: &blobs_dir };
+    let store = Store { conn, blobs_dir: &blobs_dir };
     for (i, (id, row)) in check_ids.iter().zip(&catalogue).enumerate() {
         let cmd = row.as_ref().map(|c| c.cmd.clone()).unwrap_or_default();
         let check_cwd = row.as_ref().map(|c| c.cwd.clone()).unwrap_or_else(|| ".".into());
@@ -623,7 +704,7 @@ pub fn run(
         if let Some(reason) = &refusal {
             failures += 1;
             let code = evidence::record_control_plane_command(
-                &conn,
+                conn,
                 &ctx,
                 label_prefix,
                 &cmd,
@@ -663,7 +744,7 @@ pub fn run(
                 let reason = format!("failed to run: {e:#}");
                 let argv = process::shell_argv(shell, &program, &run_cmd);
                 let code = evidence::record_control_plane_command(
-                    &conn,
+                    conn,
                     &ctx,
                     label_prefix,
                     &cmd,
@@ -722,7 +803,7 @@ pub fn run(
             Some(error_parts.join("; "))
         };
         let code = evidence::record_control_plane_command(
-            &conn,
+            conn,
             &ctx,
             label_prefix,
             &cmd,
@@ -769,7 +850,7 @@ pub fn run(
     });
     if !dry_run {
         // The new rows belong in the index the worker and reviewer read.
-        if let Err(e) = evidence::refresh_index(&conn, &run.task_id, &run_worktree) {
+        if let Err(e) = evidence::refresh_index(conn, &run.task_id, &run_worktree) {
             masked_eprintln!("thoth: warning: could not republish the evidence index: {e:#}");
         }
         let mut detail = serde_json::json!({
@@ -794,7 +875,7 @@ pub fn run(
             detail[k] = v.clone();
         }
         state::append_event(
-            &conn,
+            conn,
             &NewEvent {
                 task_id: Some(run.task_id.clone()),
                 run_id: Some(run.run_id.clone()),
@@ -903,6 +984,9 @@ pub fn run(
     }
     for (k, v) in head_keys.as_object().into_iter().flatten() {
         doc[k] = v.clone();
+    }
+    if let Some(s) = baseline_sweep {
+        doc["baseline_sweep"] = s;
     }
     output::emit(json, &doc, &human);
     // Non-zero when a check failed (or was refused/timed out), so a script

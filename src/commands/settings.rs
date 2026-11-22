@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,15 +333,31 @@ pub(crate) fn resolve(home: &Path, key: &str) -> Option<Resolved> {
     Some(resolve_in(s, &load(home).map, &secrets_for(s, Some(home))))
 }
 
-/// For callers without a `Paths`: never fails, prints nothing. Falls back to
-/// the environment variable and the default when the state directory cannot
-/// be worked out.
+/// Set by the commands that report config.json themselves (`config ...` and
+/// `doctor`): `effective` then leaves the warning to them.
+static FILE_REPORTED_BY_COMMAND: AtomicBool = AtomicBool::new(false);
+
+/// The running command reports an unusable config.json in its own output, so
+/// `effective` does not also warn about it on stderr.
+pub(crate) fn command_reports_the_file() {
+    FILE_REPORTED_BY_COMMAND.store(true, Ordering::Relaxed);
+}
+
+/// For callers without a `Paths`: never fails. Falls back to the environment
+/// variable and the default when the state directory cannot be worked out.
+/// When config.json cannot be used it says so once per process on stderr
+/// (`warn_once`), except in the commands that report the file themselves.
 pub(crate) fn effective(key: &str) -> String {
     let Some(s) = find(key) else { return String::new() };
     let home = match std::env::var_os("THOTH_HOME") {
         Some(v) => Some(PathBuf::from(v)),
         None => config::probe_state_dir().ok().map(|p| p.home),
     };
+    if let Some(h) = home.as_deref() {
+        if !FILE_REPORTED_BY_COMMAND.load(Ordering::Relaxed) {
+            warn_once(h);
+        }
+    }
     let map = home.as_deref().map(|h| load(h).map).unwrap_or_default();
     resolve_in(s, &map, &secrets_for(s, home.as_deref())).value
 }

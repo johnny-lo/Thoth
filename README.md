@@ -69,7 +69,9 @@ flowchart LR
    `UNVERIFIED` → `unverified`.
 6. After a `reject`, the next `thoth dispatch` starts a new attempt from the rejected
    commit, with the reviewer's findings folded into the worker's prompt.
-7. You merge the passing branch yourself. Thoth never merges and never deletes a worktree.
+7. You merge the passing branch yourself. Thoth never merges, and it removes a worktree
+   only once its task is finished (pass, cancelled or accepted) and the worktree is clean
+   (`thoth worktrees prune`).
 
 ## Why trust it
 
@@ -228,7 +230,7 @@ claude plugin install thoth@thoth
 It adds the skill `thoth-dispatch`, which teaches your Claude Code session the
 whole loop: write the spec, dispatch, wait, read the review packet, judge from
 evidence only, record the verdict, and handle rework, interruptions and
-`unverified`. It also adds an MCP server (`thoth mcp`) with 32 tools for the same
+`unverified`. It also adds an MCP server (`thoth mcp`) whose tools run the same
 commands. The `thoth` executable must be on your `PATH`. Details:
 [docs/mcp.md](docs/mcp.md).
 
@@ -244,7 +246,7 @@ written down as an interface contract:
 
 **Claims are not facts.** The worker ends by writing `.agent/result.json`: its
 claims (`test_result`, `doc_reference`, `behavior`, `completion`,
-`protected_change`), each citing evidence codes such as `E004`. Claims and evidence
+`protected_change`, and `research` for a research task), each citing evidence codes such as `E004`. Claims and evidence
 are separate records. A claim with nothing behind it is an assertion, not a finding.
 
 **Evidence is collected beside the worker, not by it.** For Claude Code, a hook
@@ -254,7 +256,8 @@ its transcript. The diff and the candidate commit are
 recorded too. Output is stored by SHA-256, append-only, and re-hashed every time it
 is read. The worker gets a generated index of codes to cite and never edits it.
 
-**Five automatic reasons for `unverified`**, checked before anything is written:
+**Six automatic reasons for `unverified`**, checked before anything is written
+(numbered as the `rule` of the `result_invalid` event; there is no rule 6 any more):
 
 | rule | the task goes `unverified` when |
 |---|---|
@@ -263,6 +266,7 @@ is read. The worker gets a generated index of codes to cite and never edits it.
 | 3 | a claim cites a code that is not evidence of this task |
 | 4 | cited evidence is missing, or no longer matches its recorded hash |
 | 5 | the task is `risk: high` and a claim cites no evidence recorded by Thoth |
+| 7 | the task is a research task, the worker reports it `completed`, and no claim is of kind `research` |
 
 **Protected changes are recorded, then approved.** From the candidate's diff Thoth itself
 lists every existing test file or check input the worker modified or deleted, every existing
@@ -349,7 +353,10 @@ models that may have degraded. Scores are always shown with their source.
 `models --refresh` is the only command with which Thoth itself uses the network
 (`profile usage --refresh` has agy, codex and claude each do it; with
 `live-quota` on, `recommend` has only agy and codex do
-it).
+it), unless you turn on `thoth config set scores-auto-refresh on`: then `models`,
+`report` and `recommend` also refresh a score cache that is missing or at least
+24 hours old, the two keyed sources only when their key is set (the Agent Arena
+leaderboard needs no key).
 
 **Status page.** `thoth report` writes one self-contained, read-only HTML page:
 every account's quota and work, the dispatch decision table (which model at
@@ -385,7 +392,7 @@ set, never inside your repository. `THOTH_CLAUDE_BIN`, `THOTH_CODEX_BIN`, and
 | `thoth decision add` | append a decision to the repository's decision log |
 | `thoth report [--open]` | write the HTML status page |
 | `thoth models [--refresh]` | models per account, Thoth's record, public scores |
-| `thoth config list / get / set / unset / set-secret` | every setting with its source: the three switches, the language, the three CLI paths, the live-quota timeout, the two score URLs and the two score API keys (stored, never displayed) |
+| `thoth config list / get / set / unset / set-secret / unset-secret` | every setting with its value and its source (default, `config.json` or an environment variable), among them the switches, the language, the CLI paths, the score URLs and the score API keys (stored, never displayed) |
 | `thoth guide` / `thoth mcp` | print the commander guide; serve the commands as MCP tools |
 
 Full reference: [docs/phase1/usage.md](docs/phase1/usage.md) (setup, dispatch,

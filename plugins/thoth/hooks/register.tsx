@@ -103,7 +103,6 @@ async function thoth($: EngineInterface, options: Options, args: string[], cwd =
 
 // Per load: a reload drops the timer and starts the cycle over from session.start.
 let timer: { cancel: () => void } | undefined
-let isRefreshing = false
 // The one pending redraw that moves the heading's seconds on.
 let tick: { cancel: () => void } | undefined
 
@@ -116,7 +115,9 @@ async function readChecks($: EngineInterface, options: Options, force: boolean):
   const now = await $.clock.now()
   if (!force && checksAt !== null && now - checksAt < CHECKS_EVERY_MS) return checksKnown
   checksAt = now
-  checksKnown = parseChecks(await thoth($, options, ['checks', 'list', '--json'])) ?? []
+  // A read that fails keeps the rows last read; only a good answer replaces them.
+  const listed = parseChecks(await thoth($, options, ['checks', 'list', '--json']))
+  if (listed !== null) checksKnown = listed
   return checksKnown
 }
 
@@ -149,8 +150,8 @@ async function readLogins($: EngineInterface, options: Options, force: boolean):
 // The decisions plugin's cards, read only; none when it is not installed or unreadable.
 async function cardCount($: EngineInterface): Promise<number> {
   try {
-    const read = (await $.state.get({ plugin: 'decisions', key: 'items' } as never)) as { value?: unknown }
-    return Array.isArray(read.value) ? read.value.length : 0
+    const items = (await $.state.get({ plugin: 'decisions', key: 'items' } as never)) as { value?: unknown }
+    return Array.isArray(items.value) ? items.value.length : 0
   } catch {
     return 0
   }
@@ -262,9 +263,10 @@ function emptyWorker(task_id: string, fetchedAt: number): ThothWorker {
 // One pass over the watched task's newest run; a pass asked for while one runs returns at once.
 let isPolling = false
 
-async function pollOnce($: EngineInterface, options: Options): Promise<void> {
+// Returns the task whose worker the pass read, null when it read none.
+async function pollOnce($: EngineInterface, options: Options): Promise<string | null> {
   const watched = await read($, watching)
-  if (watched === null) return
+  if (watched === null) return null
   const previous = await read($, worker)
   const before = previous !== null && previous.task_id === watched.task_id ? previous : null
   const now = await $.clock.now()
@@ -277,12 +279,12 @@ async function pollOnce($: EngineInterface, options: Options): Promise<void> {
   const runs = parseRuns(await thoth($, options, ['status', watched.task_id, '--json'], watched.repo))
   if (runs === null) {
     await store({ ...(before ?? emptyWorker(watched.task_id, now)), problem: 'status_failed', fetchedAt: now })
-    return
+    return watched.task_id
   }
   const newest = newestRun(runs)
   if (newest === null) {
     await store({ ...(before ?? emptyWorker(watched.task_id, now)), problem: 'no_run', fetchedAt: now })
-    return
+    return watched.task_id
   }
   const same = before !== null && before.run_id === newest.run_id
   const held = same ? before : { ...emptyWorker(watched.task_id, now), run_id: newest.run_id }
@@ -302,7 +304,7 @@ async function pollOnce($: EngineInterface, options: Options): Promise<void> {
   )
   if (read2 === null) {
     await store({ ...head, problem: 'transcript_failed' })
-    return
+    return watched.task_id
   }
   const kept = read2.reset ? [] : head.steps
   const all = [...kept, ...read2.steps]
@@ -316,23 +318,61 @@ async function pollOnce($: EngineInterface, options: Options): Promise<void> {
     dropped: (read2.reset ? 0 : head.dropped) + cut,
     problem: null,
   })
+  return watched.task_id
 }
 
-async function pollWorker($: EngineInterface, options: Options): Promise<void> {
-  if (isPolling) return
+// The task of the last Watch worker press that came while a pass was running; one press is kept.
+let pressedDuring: string | null = null
+
+// `pressed` is the task of a Watch worker press; a request without one (the main refresh) is dropped
+// while a pass runs. A press for another task than the running pass reads is polled right after it.
+async function pollWorker($: EngineInterface, options: Options, pressed: string | null = null): Promise<void> {
+  if (isPolling) {
+    if (pressed !== null) pressedDuring = pressed
+    return
+  }
   isPolling = true
   try {
-    await pollOnce($, options)
-  } catch {
-    // The run pane is a side view: its failure never reaches the main refresh.
+    for (;;) {
+      let polled: string | null = null
+      try {
+        polled = await pollOnce($, options)
+      } catch {
+        // The run pane is a side view: its failure never reaches the main refresh.
+      }
+      const wanted = pressedDuring
+      pressedDuring = null
+      if (wanted === null || wanted === polled) break
+    }
   } finally {
     isPolling = false
+    pressedDuring = null
   }
 }
 
-async function refresh($: EngineInterface, options: Options, force = false): Promise<void> {
-  if (isRefreshing) return
-  isRefreshing = true
+// The refresh that is running, and the one forced refresh that waits for it.
+let running: Promise<void> | null = null
+let forcedNext: Promise<void> | null = null
+
+// A refresh asked for while one runs is dropped, but a forced one (`/thoth`) is kept: it runs right
+// after, so what the person asked for is not older than the command. Forced requests share one.
+function refresh($: EngineInterface, options: Options, force = false): Promise<void> {
+  if (running !== null) {
+    if (!force) return Promise.resolve()
+    forcedNext ??= running.then(() => {
+      forcedNext = null
+      return refresh($, options, true)
+    })
+    return forcedNext
+  }
+  const mine: Promise<void> = refreshNow($, options, force).finally(() => {
+    if (running === mine) running = null
+  })
+  running = mine
+  return mine
+}
+
+async function refreshNow($: EngineInterface, options: Options, force: boolean): Promise<void> {
   let drawn: ThothSnapshot | null = null
   try {
     const fresh = await readSnapshot($, options, force)
@@ -353,8 +393,6 @@ async function refresh($: EngineInterface, options: Options, force = false): Pro
     }
   } catch {
     // A failed step must not stop the cycle: the next refresh is still scheduled below.
-  } finally {
-    isRefreshing = false
   }
   timer?.cancel()
   timer = $.clock.after(nextDelay(drawn), () => {
@@ -567,7 +605,7 @@ export const register: Register = (on, raw) => {
       await update($, watching, () => ({ task_id: task.task_id, title: task.title, repo: outside ? task.repo : '' }))
       await update($, worker, () => null)
       await $.ui.open({ id: RUN_PANE, title: fit(taskName(task.title, lang), 30) })
-      void pollWorker($, options).catch(() => {})
+      void pollWorker($, options, task.task_id).catch(() => {})
     }
     const ask = (title: string, status: string) =>
       $.prompt.submit({ text: t(lang, 'askText', { title: taskName(title, lang), status: statusLabel(status, lang) }) })

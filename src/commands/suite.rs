@@ -14,7 +14,7 @@
 //! not a verify of any run, so it never counts for REV-3.
 
 use crate::checks::{self, Check};
-use crate::commands::verify::{self, BaseWorktree, Compared, Store};
+use crate::commands::verify::{self, Compared, Store};
 use crate::config::Paths;
 use crate::db::state::{self, NewEvent};
 use crate::model::event_type;
@@ -100,17 +100,14 @@ pub fn run(paths: &Paths, cwd: &Path, args: RunArgs<'_>) -> Result<i32> {
     let full = args.checks.is_empty() && args.tests.is_empty();
     let appended: Vec<String> = args.tests.iter().flat_map(|t| ["--test".to_string(), t.clone()]).collect();
 
-    // The temporary checkout, removed by the guard on every exit path.
-    let path = paths
-        .repo_dir(&repo_id)
-        .join("baseline-worktrees")
-        .join(format!("suite-{}", crate::ids::new_run_id()));
-    worktree::prune_worktrees(&root);
-    let ensured = worktree::ensure_detached_worktree(&root, &path, &commit)?;
-    if ensured.outcome == worktree::EnsureOutcome::Reused {
-        bail!("suite checkout {} already exists; refusing to reuse it", path.display());
-    }
-    let _guard = BaseWorktree { root: root.clone(), path: path.clone() };
+    // The temporary checkout, removed by the guard on every exit path; when
+    // the command is killed its owner record lets a later sweep remove it
+    // (SWEEP-1). The sweep of earlier leftovers runs just before.
+    let name = format!("suite-{}", crate::ids::new_run_id());
+    let (guard, swept) =
+        verify::make_baseline_checkout(paths, &repo_id, &root, &name, &commit, "suite checkout")?;
+    let path = guard.path.clone();
+    let _guard = guard;
 
     let timeout = std::time::Duration::from_secs(args.timeout_secs);
     let blobs_dir = paths.blobs_dir(&repo_id);
@@ -206,6 +203,7 @@ pub fn run(paths: &Paths, cwd: &Path, args: RunArgs<'_>) -> Result<i32> {
         "failures": failures,
         "results": results,
         "ok": ok,
+        "baseline_sweep": swept.to_json(),
     });
     state::append_event(
         &conn,
@@ -249,13 +247,11 @@ pub fn run(paths: &Paths, cwd: &Path, args: RunArgs<'_>) -> Result<i32> {
 pub fn show(paths: &Paths, cwd: &Path, json: bool) -> Result<i32> {
     let (_repo_id, root, conn) = crate::commands::task::open_repo(paths, cwd)?;
     let head = worktree::rev_parse_head(&root)?;
-    let mut stmt = conn.prepare("SELECT ts, detail FROM events WHERE type = ?1 ORDER BY seq DESC")?;
-    let rows: Vec<(String, Value)> = stmt
-        .query_map([event_type::SUITE_RAN], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|(ts, d)| (ts, serde_json::from_str(&d).unwrap_or(Value::Null)))
-        .collect();
+    let rows: Vec<(String, Value)> =
+        crate::db::state::event_ts_details_of_type_newest_first(&conn, event_type::SUITE_RAN)?
+            .into_iter()
+            .map(|(ts, d)| (ts, serde_json::from_str(&d).unwrap_or(Value::Null)))
+            .collect();
     let last: Value = rows
         .first()
         .map(|(ts, d)| {

@@ -26,7 +26,8 @@ fn cmd(f: &Fixture) -> assert_cmd::Command {
     let mut c = f.cmd();
     for name in std::env::vars_os().map(|(name, _)| name) {
         let upper = name.to_string_lossy().to_uppercase();
-        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+        // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
             c.env_remove(&name);
         }
     }
@@ -473,7 +474,7 @@ fn review_start_records_a_pre_lean_diff_again_and_judges_the_new_row() {
     assert_eq!(v["protected_approved"], json!([entry("src/inline.rs", "inline_test")]), "{v:#}");
     let started = ok(&st.f, &review_args(&st.task, false), &env);
     wait_run(&st.f, &s(&started["run_id"]));
-    assert_eq!(st.f.wait_for_task_status(&st.task, &["pass", "reject", "unverified"], 60), "pass");
+    assert_eq!(ok(&st.f, &["status", &st.task, "--json"], &[])["status"], "pass");
 }
 
 #[test]
@@ -491,7 +492,7 @@ fn review_start_edit_records_a_pre_lean_diff_again_and_judges_the_new_row() {
     let started = ok(&st.f, &review_args(&st.task, true), &env);
     assert_eq!(started["mode"], "edit");
     wait_run(&st.f, &s(&started["run_id"]));
-    assert_eq!(st.f.wait_for_task_status(&st.task, &["pass", "reject", "unverified"], 60), "pass");
+    assert_eq!(ok(&st.f, &["status", &st.task, "--json"], &[])["status"], "pass");
 }
 
 #[test]
@@ -1128,4 +1129,135 @@ fn rfix2_verify_of_a_docs_fix_whose_listed_checks_are_all_gone_records_nothing()
     assert_eq!(show(&st)["fix"]["verify"], Value::Null);
     let err = confirm_refused(&st);
     assert!(err.contains(&format!("thoth verify {edit_run}")), "{err}");
+}
+
+// --- GATE-1 (2): an unreadable diff recorded again is not a failed recording ---------
+
+/// The refusal for a diff that is still unreadable after it was recorded
+/// again: it names the run and `has no readable protected_changes`, does not
+/// say the recording failed, and the row was recorded one more time.
+fn assert_unreadable_again(out: &Out, run: &str, rows_before: usize, st: &Setup) {
+    assert_eq!(out.code, 1, "stdout {}\nstderr {}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("has no readable protected_changes"), "{}", out.stderr);
+    assert!(out.stderr.contains(run), "{}", out.stderr);
+    assert!(!out.stderr.contains("recording it again failed"), "{}", out.stderr);
+    assert_eq!(diff_rows(&st.f, &st.task, run).len(), rows_before + 1, "the diff was recorded again");
+}
+
+#[test]
+fn an_unreadable_diff_recorded_again_is_not_called_a_failed_recording() {
+    // (a) review start on a pre-LEAN candidate diff that is recorded pre-LEAN again
+    let (st, _code) = pre_lean_implementer();
+    let before = diff_rows(&st.f, &st.task, &st.implementer).len();
+    let env = [("FAKE_SCENARIO", "review_pass"), ("FAKE_TASK_ID", st.task.as_str()), PRE_LEAN];
+    let out = exec(&st.f, &review_args(&st.task, false), &env);
+    assert_unreadable_again(&out, &st.implementer, before, &st);
+
+    // (b) review confirm on a pre-LEAN fix diff that is recorded pre-LEAN again
+    let st = setup();
+    add_green_check(&st);
+    let fix_edit = edit("src/guarded.rs", "plain line\n", "plain line, fixed\n", "AC1");
+    let (edit_run, _fix) = applied_fix(&st, &reject(&st, false, json!([]), json!([fix_edit])), &[PRE_LEAN]);
+    verify_green(&st, &edit_run);
+    let before = diff_rows(&st.f, &st.task, &edit_run).len();
+    let env = [("FAKE_SCENARIO", "fix_confirm_approve"), ("FAKE_TASK_ID", st.task.as_str()), PRE_LEAN];
+    let out = exec(&st.f, &confirm_args(&st.task), &env);
+    assert_unreadable_again(&out, &edit_run, before, &st);
+}
+
+// --- REV-1: the verdict events of an edit review and a confirm -----------------------
+
+/// The `verdict` events of `task` of `mode`, oldest first, as `detail`.
+fn verdicts_of_mode(f: &Fixture, task: &str, mode: &str) -> Vec<Value> {
+    events(f, task, "verdict").into_iter().map(|e| e["detail"].clone()).filter(|d| d["mode"] == mode).collect()
+}
+
+/// REV-1 (AC5): the `verdict` events of edit reviews and a confirm say
+/// whether their findings held a blocking one (read from `thoth events`
+/// only). An edit review whose fix is applied records no verdict while the
+/// fix is pending (docs/adapter-usage.md, `review_fix_applied`), so the edit
+/// reviews that write one are a REJECT whose fix is refused (a) and a REJECT
+/// that attaches no edit (b); the applied fix's verdict comes with the
+/// confirm (c), whose REJECT record carries no category.
+#[test]
+fn edit_review_and_confirm_verdict_events_record_has_blocking_findings() {
+    // (a) AC1 unmet (spec_mismatch) with an edit bound to it, and a blocking
+    // extra finding no edit covers: the fix is refused at `size`
+    let st = setup();
+    let document = reject(
+        &st,
+        false,
+        json!([labelled(extra("major", "unbound", "S"), "error_path")]),
+        json!([edit("src/greet.rs", "line 1\n", "line one\n", "AC1")]),
+    );
+    let (_, w) = edit_review(&st, &document, &[]);
+    assert_eq!(w["verdict"], "REJECT", "{}", st.f.explain_task(&st.task));
+    let edits = verdicts_of_mode(&st.f, &st.task, "edit");
+    assert_eq!(edits.len(), 1, "{edits:#?}");
+    assert_eq!(edits[0]["verdict"], "REJECT", "{edits:#?}");
+    assert_eq!(edits[0]["fix"]["applied"], false, "{edits:#?}");
+    assert_eq!(edits[0]["has_blocking_findings"], true, "{edits:#?}");
+
+    // (a2) SMALL-16: only AC1 unmet, labelled spec_mismatch, no edit and no
+    // extra finding: an unmet blocking criterion alone is blocking
+    let alone = setup();
+    let (_, w) = edit_review(&alone, &reject(&alone, false, json!([]), json!([])), &[]);
+    assert_eq!(w["verdict"], "REJECT", "{}", alone.f.explain_task(&alone.task));
+    let edits = verdicts_of_mode(&alone.f, &alone.task, "edit");
+    assert_eq!(edits.len(), 1, "{edits:#?}");
+    assert_eq!(edits[0]["verdict"], "REJECT", "{edits:#?}");
+    assert_eq!(edits[0]["has_blocking_findings"], true, "{edits:#?}");
+
+    // (b) every finding advisory (AC1 unmet labelled docs, a docs extra
+    // finding), no edit attached
+    let other = setup();
+    let mut advisory = advisory_doc(&other, Some("docs"), None);
+    advisory["findings"]["criteria"][0]["category"] = json!("docs");
+    advisory["edits"] = json!([]);
+    let (_, w) = edit_review(&other, &advisory, &[]);
+    assert_eq!(w["verdict"], "REJECT", "{}", other.f.explain_task(&other.task));
+    let edits = verdicts_of_mode(&other.f, &other.task, "edit");
+    assert_eq!(edits.len(), 1, "{edits:#?}");
+    assert_eq!(edits[0]["verdict"], "REJECT", "{edits:#?}");
+    assert_eq!(edits[0]["fix"], Value::Null, "{edits:#?}");
+    assert_eq!(edits[0]["has_blocking_findings"], false, "{edits:#?}");
+
+    // (c) the applied fix: no verdict yet; verified, a confirm that rejects
+    // writes one with no category on its findings, so it blocks
+    let third = setup();
+    add_green_check(&third);
+    let (edit_run, _) = applied_fix(&third, &reject(&third, false, json!([]), json!([edit("src/greet.rs", "line 1\n", "line one\n", "AC1")])), &[]);
+    assert_eq!(events(&third.f, &third.task, "verdict").len(), 0, "an applied fix records no verdict while it is pending");
+    verify_green(&third, &edit_run);
+    let c = ok(&third.f, &confirm_args(&third.task), &[("FAKE_SCENARIO", "fix_confirm_revise"), ("FAKE_TASK_ID", third.task.as_str())]);
+    assert_eq!(c["mode"], "confirm", "{c}");
+    let w = wait_run(&third.f, &s(&c["run_id"]));
+    assert_eq!(w["verdict"], "REJECT", "{}", third.f.explain_task(&third.task));
+    let confirms = verdicts_of_mode(&third.f, &third.task, "confirm");
+    assert_eq!(confirms.len(), 1, "{confirms:#?}");
+    assert_eq!(confirms[0]["verdict"], "REJECT", "{confirms:#?}");
+    assert_eq!(confirms[0]["has_blocking_findings"], true, "{confirms:#?}");
+    assert_eq!(show(&third)["has_blocking_findings"], true, "{}", show(&third));
+}
+
+// --- BRIEF-1: an edit review and a confirm lead with their own brief -----------------
+
+#[test]
+fn edit_review_and_confirm_runs_lead_with_their_own_brief() {
+    let st = setup();
+    add_green_check(&st);
+    let (edit_run, _) = applied_fix(&st, &reject(&st, false, json!([]), json!([edit("src/greet.rs", "line 1\n", "line one\n", "AC1")])), &[]);
+    let w = wait_run(&st.f, &edit_run);
+    assert_eq!(w["brief_source"], "review", "{w}");
+    let brief = s(&w["brief"]);
+    assert!(brief.starts_with("REJECT: 1/2 criteria met; AC1 unmet"), "{brief}");
+
+    verify_green(&st, &edit_run);
+    let c = ok(&st.f, &confirm_args(&st.task), &confirm_env(&st.task));
+    let w = wait_run(&st.f, &s(&c["run_id"]));
+    assert_eq!(w["verdict"], "PASS", "{}", st.f.explain_task(&st.task));
+    assert_eq!(w["brief_source"], "review", "{w}");
+    let brief = s(&w["brief"]);
+    assert!(brief.starts_with("PASS: "), "{brief}");
+    assert_eq!(brief, s(&show(&st)["brief"]), "the confirm run's brief is the one review show gives");
 }

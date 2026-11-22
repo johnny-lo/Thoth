@@ -593,7 +593,7 @@ fn zh_tw_and_shell_flag() {
 /// A thoth with only the old `~/.agentctl` in a fresh home.
 fn old_dir_only_cmd(f: &common::Fixture, home: &Path) -> assert_cmd::Command {
     std::fs::create_dir(home.join(".agentctl")).unwrap();
-    let mut c = assert_cmd::Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed_assert(assert_cmd::Command::new(env!("CARGO_BIN_EXE_thoth")));
     c.current_dir(f.repo.path())
         .env("USERPROFILE", home)
         .env("HOME", home)

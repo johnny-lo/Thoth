@@ -505,7 +505,8 @@ fn candidates_list_the_models_they_can_run() {
 // --- AC5 ---------------------------------------------------------------------------------
 
 /// CROSS-1: the keys of a model row.
-const MODEL_KEYS: [&str; 6] = ["agent_arena", "ai_stupid_level", "artificial_analysis", "model", "names", "usage"];
+// AGY-1 AC5: `no_effort` (null unless agy refused --effort for the model)
+const MODEL_KEYS: [&str; 7] = ["agent_arena", "ai_stupid_level", "artificial_analysis", "model", "names", "no_effort", "usage"];
 
 /// CROSS-1 AC4: a usage row under a model, without the account and model it
 /// sits under and the account's plan and shared mark.
@@ -1065,7 +1066,7 @@ struct Server {
 
 impl Server {
     fn start(f: &Fixture) -> Self {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .current_dir(f.repo.path())
             .env("THOTH_HOME", f.home.path())

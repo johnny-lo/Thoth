@@ -11,14 +11,14 @@
 //! status keeps its worktrees, because a rework or a resume continues in them.
 //!
 //! The sweeps of `task create` and `worktrees prune` then delete each local
-//! branch `thoth/TASK/aN` of those tasks whose work is already in the task's
+//! branch `thoth/TASK/aN` and `thoth/TASK/aN-fix` of those tasks whose work is already in the task's
 //! base branch: `git branch -d` when the tip is an ancestor of the base, or
 //! `git branch -D` when `git cherry` shows every commit already applied and
 //! there is no merge commit. Anything else keeps the branch, with a reason.
 //!
-//! One function, `sweep`, behind five fixed call sites (the runner when a task
+//! One function, `sweep`, behind six fixed call sites (the runner when a task
 //! settles, `review record` after a PASS, `task close`, `task accept`,
-//! `task create`) and the manual `thoth worktrees prune`.
+//! `task create`, and a `thoth verify` that ends) and the manual `thoth worktrees prune`.
 
 use crate::config::Paths;
 use crate::db::state::{self, NewEvent};
@@ -34,6 +34,8 @@ pub(crate) const SOURCE_TASK_CLOSE: &str = "task_close";
 pub(crate) const SOURCE_TASK_ACCEPT: &str = "task_accept";
 pub(crate) const SOURCE_TASK_CREATE: &str = "task_create";
 pub(crate) const SOURCE_PRUNE: &str = "worktrees_prune";
+/// SMALL-11 (5): the sweep a `thoth verify` runs for its task when it ends.
+pub(crate) const SOURCE_VERIFY: &str = "verify";
 
 /// Why a candidate directory was kept (`worktree_kept.detail.reason`).
 const OUTSIDE_WORKTREES_DIR: &str = "outside_worktrees_dir";
@@ -41,6 +43,8 @@ const UNCOMMITTED_CHANGES: &str = "uncommitted_changes";
 const GIT_ERROR: &str = "git_error";
 const UNREACHABLE_HEAD: &str = "unreachable_head";
 const REMOVE_FAILED: &str = "remove_failed";
+/// SMALL-11 (5): a `thoth verify` is running its checks in this worktree.
+const VERIFY_RUNNING: &str = "verify_running";
 
 /// Why a task branch was kept (`branch_kept.detail.reason`).
 const BRANCH_CHECKED_OUT: &str = "branch_checked_out";
@@ -226,11 +230,15 @@ fn base_branch_of(conn: &Connection, task_id: &str) -> Result<Option<String>> {
         .filter(|b| !b.trim().is_empty()))
 }
 
-/// Whether `branch` is exactly `thoth/TASK/aN` for this task (N digits only).
+/// Whether `branch` is exactly `thoth/TASK/aN` or the reviewer fix branch
+/// `thoth/TASK/aN-fix` for this task (N digits only). Any other name under
+/// `thoth/TASK/` is not Thoth's to delete.
 fn is_task_branch(task_id: &str, branch: &str) -> bool {
-    branch
-        .strip_prefix(&format!("thoth/{task_id}/a"))
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    let Some(n) = branch.strip_prefix(&format!("thoth/{task_id}/a")) else {
+        return false;
+    };
+    let n = n.strip_suffix("-fix").unwrap_or(n);
+    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// What happened to one task branch.
@@ -337,7 +345,8 @@ fn branch_already_kept(conn: &Connection, task_id: &str, branch: &str, reason: &
     Ok(false)
 }
 
-/// The branch half of a full sweep: every local `thoth/TASK/aN` of each
+/// The branch half of a full sweep: every local `thoth/TASK/aN` and
+/// `thoth/TASK/aN-fix` of each
 /// swept task, after the worktrees were handled and git's registrations of
 /// gone directories were pruned.
 fn sweep_branches(
@@ -454,6 +463,19 @@ fn already_kept(conn: &Connection, task_id: &str, path: &str, reason: &str) -> R
     Ok(false)
 }
 
+/// The run id of a running `thoth verify` that holds the worktree `path`
+/// (its run's `worktree`), if any.
+fn verify_holding(paths: &Paths, repo_id: &str, conn: &Connection, path: &str) -> Result<Option<String>> {
+    for run_id in crate::verify_hold::held_runs(paths, repo_id) {
+        if let Some(run) = state::get_run(conn, &run_id)? {
+            if run.worktree == path {
+                return Ok(Some(run_id));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Removes the clean worktrees of `pass`/`cancelled`/`accepted` tasks that have no live
 /// run, and reports the ones it kept (WT-1 AC2). Only a state.db read or
 /// event write fails the sweep; a git problem with one directory keeps that
@@ -501,7 +523,17 @@ pub(crate) fn sweep(
             if path.is_empty() || !Path::new(&path).is_dir() {
                 continue;
             }
-            match check_and_remove(paths, repo_id, repo_root, &path) {
+            // SMALL-11 (5): a worktree a running verify holds is not touched;
+            // that verify sweeps its task when it ends.
+            let held_by = verify_holding(paths, repo_id, conn, &path)?;
+            let outcome = match held_by {
+                Some(run_id) => Outcome::Kept {
+                    reason: VERIFY_RUNNING,
+                    detail: format!("thoth verify of run {run_id} is running its checks in this worktree"),
+                },
+                None => check_and_remove(paths, repo_id, repo_root, &path),
+            };
+            match outcome {
                 Outcome::Gone => {}
                 Outcome::Removed { head, branch } => {
                     state::append_event(
@@ -663,6 +695,9 @@ pub fn prune(paths: &Paths, cwd: &Path, json: bool) -> Result<i32> {
             paths.worktrees_dir(&repo_id).display()
         );
     }
+    // SWEEP-1: the leftover baseline checkouts first, before the task sweep's
+    // `git worktree prune`. It never changes `ok` or the exit code.
+    let baseline = crate::baseline_hold::sweep(paths, &repo_id, &root);
     let s = sweep(paths, &repo_id, &root, &conn, Scope::All, SOURCE_PRUNE)?;
     let ok = !s
         .kept
@@ -675,6 +710,7 @@ pub fn prune(paths: &Paths, cwd: &Path, json: bool) -> Result<i32> {
         "tasks_checked": s.tasks_checked,
         "removed_branches": s.removed_branches.iter().map(removed_branch_json).collect::<Vec<_>>(),
         "kept_branches": s.kept_branches.iter().map(kept_branch_json).collect::<Vec<_>>(),
+        "baseline_sweep": baseline.to_json(),
     });
     let mut human = format!(
         "removed {} worktree(s), kept {} (checked {} finished task(s)); deleted {} branch(es), kept {}",
@@ -726,6 +762,10 @@ pub fn prune(paths: &Paths, cwd: &Path, json: bool) -> Result<i32> {
             "\n  kept     branch  {}  (task {}): {}{tail}",
             k.branch, k.task_id, k.reason
         ));
+    }
+    for line in baseline.human_lines() {
+        human.push('\n');
+        human.push_str(&line);
     }
     crate::output::emit(json, &v, &human);
     Ok(if ok { 0 } else { 1 })

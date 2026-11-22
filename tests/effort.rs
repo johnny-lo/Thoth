@@ -107,10 +107,14 @@ fn write_codex_cache(cfg: &Path) {
     .unwrap();
 }
 
-fn count(f: &common::Fixture, table: &str) -> i64 {
-    f.state_conn()
-        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-        .unwrap()
+/// (runs, events) of the task: the length of `status TASK --json`'s `runs`
+/// and of `events --task TASK --json`'s `events`.
+fn counts(f: &common::Fixture, task_id: &str) -> (usize, usize) {
+    let mut c = f.cmd();
+    c.args(["status", task_id, "--json"]);
+    let status: Value = serde_json::from_slice(&f.run_ok(c, "status --json")).unwrap();
+    let runs = status["runs"].as_array().unwrap_or_else(|| panic!("no runs array: {status}")).len();
+    (runs, f.events_json(task_id).len())
 }
 
 fn run_spec(f: &common::Fixture, run_id: &str) -> Value {
@@ -172,8 +176,7 @@ fn wait_run(f: &common::Fixture, run_id: &str) {
 #[test]
 fn dispatch_rejects_an_unknown_level_with_exit_1_and_writes_nothing() {
     let (f, task_id) = claude_setup();
-    let runs = count(&f, "runs");
-    let events = count(&f, "events");
+    let before = counts(&f, &task_id);
     let out = envd(&f, "ok", &task_id)
         .args(["dispatch", &task_id, "--profile", "claude-a", "--model", "sonnet"])
         .args(["--effort", "extreme"])
@@ -184,8 +187,7 @@ fn dispatch_rejects_an_unknown_level_with_exit_1_and_writes_nothing() {
         .clone();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(stderr.contains("ultra"), "{stderr}");
-    assert_eq!(count(&f, "runs"), runs);
-    assert_eq!(count(&f, "events"), events);
+    assert_eq!(counts(&f, &task_id), before);
     assert_eq!(f.task_status(&task_id), "queued");
 }
 
@@ -193,8 +195,7 @@ fn dispatch_rejects_an_unknown_level_with_exit_1_and_writes_nothing() {
 fn review_start_rejects_an_unknown_level_with_exit_1_and_writes_nothing() {
     let f = common::fixture();
     let task_id = candidate_ready(&f);
-    let runs = count(&f, "runs");
-    let events = count(&f, "events");
+    let before = counts(&f, &task_id);
     let out = envd(&f, "review_pass", &task_id)
         .args(["review", "start", &task_id, "--profile", "claude-a", "--model", "sonnet"])
         .args(["--effort", "extreme"])
@@ -205,8 +206,7 @@ fn review_start_rejects_an_unknown_level_with_exit_1_and_writes_nothing() {
         .clone();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(stderr.contains("ultra"), "{stderr}");
-    assert_eq!(count(&f, "runs"), runs);
-    assert_eq!(count(&f, "events"), events);
+    assert_eq!(counts(&f, &task_id), before);
 }
 
 // AC2, AC3, AC4 (claude) ----------------------------------------------------
@@ -297,13 +297,11 @@ fn codex_lowers_to_the_cache_and_the_run_records_both_levels() {
 
 /// `ARGS...` that must exit 1 naming `--effort`, writing no run or event.
 fn refused_without_effort(f: &common::Fixture, task_id: &str, args: &[&str]) {
-    let runs = count(f, "runs");
-    let events = count(f, "events");
+    let before = counts(f, task_id);
     let out = envd(f, "ok", task_id).args(args).assert().failure().code(1).get_output().clone();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(stderr.contains("--effort is missing"), "{args:?}: {stderr}");
-    assert_eq!(count(f, "runs"), runs, "{args:?}");
-    assert_eq!(count(f, "events"), events, "{args:?}");
+    assert_eq!(counts(f, task_id), before, "{args:?}");
 }
 
 #[test]
@@ -829,7 +827,8 @@ mod timeout_by_effort {
         let mut c = f.cmd();
         for (name, _) in std::env::vars_os() {
             let upper = name.to_string_lossy().to_uppercase();
-            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+            // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
                 c.env_remove(&name);
             }
         }

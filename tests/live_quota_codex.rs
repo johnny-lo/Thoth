@@ -256,11 +256,11 @@ fn ac8_d_timeout_ends_codex_at_once_and_reports_timed_out() {
     let marker = f.home_path().join("codex-finished.txt");
     let started_file = f.home_path().join("codex-hang-started.txt");
     // The stand-in hangs for HANG_SECS, far past the 2 s timeout: the
-    // "ended at once" bound below is the timeout plus 10 s, under half of
-    // that, so a thoth that waited for the stand-in to finish on its own
-    // would still fail, while the few seconds kill_tree's confirmation and
-    // the exit take under load pass.
-    const HANG_SECS: u64 = 30;
+    // "ended at once" bound below is the timeout plus 10 s, under the
+    // HANG_SECS the stand-in would hang on its own, so a thoth that waited
+    // for the stand-in to finish on its own would still fail, while the few
+    // seconds kill_tree's confirmation and the exit take under load pass.
+    const HANG_SECS: u64 = 14;
     let v = refresh_json(&f, |c| {
         c.env("FAKE_CODEX_APP_SERVER", "hang")
             .env("FAKE_CODEX_HANG_SECS", HANG_SECS.to_string())
@@ -276,7 +276,7 @@ fn ac8_d_timeout_ends_codex_at_once_and_reports_timed_out() {
     let since_request = returned.duration_since(requested).unwrap_or_default();
     assert!(
         since_request < std::time::Duration::from_secs(12),
-        "took {since_request:?} after the request; the bound is the 2s timeout plus 10s, under half \
+        "took {since_request:?} after the request; the bound is the 2s timeout plus 10s, under \
          the {HANG_SECS}s the stand-in would hang on its own"
     );
     let refresh = entry(&v["refresh"], "codex-a");
@@ -550,4 +550,32 @@ fn ac1_rule_human_output_has_one_refresh_line_for_codex() {
     let out = thoth(&f).args(["profile", "usage", "--refresh"]).assert().code(0).get_output().stdout.clone();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(text.trim_end().lines().last(), Some("refresh codex-a: refreshed"), "{text}");
+}
+
+/// SMALL-17 (i): `profile usage` names the live reading that makes ordinary
+/// usage not allowed, as recommend does: `usage_not_allowed_at` and one line
+/// after the profile's first line; null and no line after a normal answer.
+#[test]
+fn profile_usage_shows_ordinary_usage_not_allowed() {
+    const LINE: &str = "  ordinary usage not allowed (codex app-server, read at ";
+    let (f, _) = codex_ready();
+    let v = refresh_json(&f, |c| {
+        c.env("FAKE_CODEX_APP_SERVER", "denied_empty");
+    });
+    assert_eq!(entry(&v["refresh"], "codex-a")["status"], "refreshed", "{v}");
+    let usage = parse(&thoth(&f).args(["profile", "usage", "codex-a", "--json"]).assert().code(0).get_output().stdout);
+    let profile = entry(&usage["profiles"], "codex-a");
+    let at = profile["usage_not_allowed_at"].as_str().unwrap_or_else(|| panic!("{usage}")).to_string();
+    assert!(OffsetDateTime::parse(&at, &Rfc3339).is_ok() && at.ends_with('Z'), "{at}");
+    assert_eq!(profile["quota_state"], "exhausted", "{usage}");
+    let human = String::from_utf8(thoth(&f).args(["profile", "usage", "codex-a"]).assert().code(0).get_output().stdout.clone()).unwrap();
+    let lines: Vec<&str> = human.lines().collect();
+    assert_eq!(lines.get(1).copied(), Some(format!("{LINE}{at})").as_str()), "{human}");
+
+    let v = refresh_json(&f, |_| {});
+    assert_eq!(entry(&v["refresh"], "codex-a")["status"], "refreshed", "{v}");
+    let usage = parse(&thoth(&f).args(["profile", "usage", "codex-a", "--json"]).assert().code(0).get_output().stdout);
+    assert_eq!(entry(&usage["profiles"], "codex-a")["usage_not_allowed_at"], Value::Null, "{usage}");
+    let human = String::from_utf8(thoth(&f).args(["profile", "usage", "codex-a"]).assert().code(0).get_output().stdout.clone()).unwrap();
+    assert!(!human.contains("ordinary usage not allowed"), "{human}");
 }

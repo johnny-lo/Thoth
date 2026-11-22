@@ -1,3 +1,5 @@
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::Value;
@@ -9,7 +11,7 @@ fn command(home: &TempDir) -> Command {
 }
 
 fn command_path(home: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut command = common::scrubbed_assert(Command::new(env!("CARGO_BIN_EXE_thoth")));
     command.env("THOTH_HOME", home);
     command.env_remove("THOTH_RUN_ID");
     command

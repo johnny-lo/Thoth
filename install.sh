@@ -6,10 +6,6 @@
 # Do not set THOTH_LOGIN_SKIP_TTY_CHECK; setup needs a real terminal.
 # Offline: put the asset and SHA256SUMS in RELEASE/latest/download, then run
 # THOTH_INSTALL_BASE_URL=./RELEASE THOTH_INSTALL_DIR=./BIN THOTH_INSTALL_NO_SETUP=1 sh install.sh
-# 實測待確認: https://raw.githubusercontent.com/johnny-lo/Thoth/master/install.sh returns 200, UTF-8 without BOM; check curl -fsSI and bytes; fix root placement/README branch URL if needed (also check install.ps1).
-# 實測待確認: latest/download redirects work (including Invoke-WebRequest); test isolated installs on Windows and WSL; fallback: API tag_name then download/<tag>.
-# 實測待確認: curl | sh setup reads /dev/tty in WSL; fallback: print thoth setup for manual execution.
-# 實測待確認: PowerShell 5.1 irm | iex completes and adds user PATH; test isolated directory, new terminal, then remove PATH entry; fix reported 5.1 syntax errors.
 set -eu
 
 unsupported() {

@@ -260,3 +260,99 @@ fn stuck_detection_counts_only_blocking_unmet_criteria() {
         }
     }
 }
+
+/// The line of `prompt` that starts with `prefix`; exactly one must.
+fn the_line_starting<'a>(prompt: &'a str, prefix: &str) -> &'a str {
+    let lines: Vec<&str> = prompt.lines().filter(|l| l.starts_with(prefix)).collect();
+    assert_eq!(lines.len(), 1, "lines starting {prefix:?}: {lines:?}\n{prompt}");
+    lines[0]
+}
+
+/// TESTRULE-1 (AC2): the worker prompt of a rework and of a reroute carries
+/// the reviewers' interface-test rule once, in its place after the added
+/// section; the text is the reviewer prompt's rule 6.
+#[test]
+fn rework_and_reroute_prompts_carry_the_interface_test_rule_line() {
+    const LEAD_IN: &str = "Reviewers apply this rule to the tests you add or change: ";
+    let f = common::fixture();
+    init(&f);
+    f.add_profile("claude-a");
+
+    // (a) a first dispatch, then a review that rejects
+    let (task, _) = f.create_task(Fixture::SPEC_TWO_AC);
+    let first_copy = f.home_path().join("first-prompt.txt");
+    let first_s = first_copy.display().to_string();
+    let skip = ["--skip-spec-review", "REV-2 fixture: the spec review gate is covered elsewhere"];
+    ok(&f, &dispatch_args(&task, &skip), &[("FAKE_SCENARIO", "hooks"), ("FAKE_TASK_ID", task.as_str()), ("FAKE_PROMPT_COPY", first_s.as_str())]);
+    wait_in_review(&f, &task);
+    let first = std::fs::read_to_string(&first_copy).unwrap();
+    let rule_line = the_line_starting(&first, LEAD_IN).to_string();
+    let rule = rule_line.strip_prefix(LEAD_IN).unwrap().to_string();
+    assert!(!rule.is_empty(), "{first}");
+
+    let review_copy = f.home_path().join("review-prompt.txt");
+    let review_s = review_copy.display().to_string();
+    let started = ok(
+        &f,
+        &["review", "start", &task, "--profile", "claude-a", "--model", "haiku", "--effort", "medium", "--reason", REASON, "--json"],
+        &[("FAKE_SCENARIO", "review_reject"), ("FAKE_TASK_ID", task.as_str()), ("FAKE_PROMPT_COPY", review_s.as_str())],
+    );
+    let review_run = started["run_id"].as_str().unwrap_or_else(|| panic!("no run_id: {started}")).to_string();
+    ok(&f, &["wait", "--run", &review_run, "--timeout", "180s", "--json"], &[]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let status = ok(&f, &["status", &task, "--json"], &[]);
+        if status["status"] == "reject" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "task {task} is {}, not reject\n{}", status["status"], f.explain_task(&task));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let reviewer_prompt = std::fs::read_to_string(&review_copy).unwrap();
+    let rule6 = the_line_starting(&reviewer_prompt, "6. ");
+    assert_eq!(rule6.strip_prefix("6. ").unwrap(), rule, "the reviewer prompt's rule 6 differs from the worker's line");
+
+    // (b) the rework
+    let rework_copy = f.home_path().join("rework-prompt.txt");
+    let rework_s = rework_copy.display().to_string();
+    rework(&f, &task, &[], &[("FAKE_PROMPT_COPY", rework_s.as_str())]);
+    let prompt = std::fs::read_to_string(&rework_copy).unwrap();
+    let section = prompt.find("## Previous attempt was rejected").unwrap_or_else(|| panic!("no rework section:\n{prompt}"));
+    assert_eq!(prompt.matches(rule_line.as_str()).count(), 1, "{prompt}");
+    let at = prompt.find(rule_line.as_str()).unwrap();
+    let result = prompt.find("write the file `.agent/result.json`").unwrap();
+    assert!(section < at && at < result, "{prompt}");
+
+    // (c) a reroute after a result.json that was not accepted
+    let (other, _) = f.create_task(Fixture::SPEC_TWO_AC);
+    ok(&f, &dispatch_args(&other, &skip), &[("FAKE_SCENARIO", "bad_result"), ("FAKE_TASK_ID", other.as_str())]);
+    let w = ok(&f, &["wait", &other, "--timeout", "180s", "--json"], &[]);
+    assert_eq!(w["status"], "unverified", "{w}\n{}", f.explain_task(&other));
+    let reroute_copy = f.home_path().join("reroute-prompt.txt");
+    let reroute_s = reroute_copy.display().to_string();
+    ok(&f, &dispatch_args(&other, &skip), &[("FAKE_SCENARIO", "hooks"), ("FAKE_TASK_ID", other.as_str()), ("FAKE_PROMPT_COPY", reroute_s.as_str())]);
+    wait_in_review(&f, &other);
+    let prompt = std::fs::read_to_string(&reroute_copy).unwrap();
+    let section = prompt.find("## Previous run's result.json was not accepted").unwrap_or_else(|| panic!("no reroute section:\n{prompt}"));
+    assert_eq!(prompt.matches(rule_line.as_str()).count(), 1, "{prompt}");
+    let at = prompt.find(rule_line.as_str()).unwrap();
+    let result = prompt.find("write the file `.agent/result.json`").unwrap();
+    assert!(section < at && at < result, "{prompt}");
+}
+
+/// REV-2 (AC4): a first dispatch is not a rework and folds nothing.
+#[test]
+fn a_first_dispatch_folds_no_advisory_finding() {
+    let f = common::fixture();
+    init(&f);
+    let (task, _) = f.create_task(Fixture::SPEC_TWO_AC);
+    let d = ok(
+        &f,
+        &dispatch_args(&task, &["--skip-spec-review", "REV-2 fixture: the spec review gate is covered elsewhere"]),
+        &[("FAKE_SCENARIO", "hooks"), ("FAKE_TASK_ID", task.as_str())],
+    );
+    assert_eq!(d["rework"], false, "{d}");
+    assert_eq!(d["folded_findings"], 0, "{d}");
+    assert_eq!(d["folded_advisory"], 0, "{d}");
+    wait_in_review(&f, &task);
+}

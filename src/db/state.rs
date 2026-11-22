@@ -83,6 +83,150 @@ pub fn latest_event_of_type(
     Ok(row)
 }
 
+/// The `detail` of the newest event (highest `seq`) of `event_type` written on
+/// run `run_id`, or `None` when the run has none (SQL-3).
+pub fn latest_event_detail_of_run(
+    conn: &Connection,
+    run_id: &str,
+    event_type: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
+            params![run_id, event_type],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// The `seq` of the newest event of `event_type` written on run `run_id`.
+pub fn latest_event_seq_of_run(
+    conn: &Connection,
+    run_id: &str,
+    event_type: &str,
+) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT seq FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
+            params![run_id, event_type],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// The `seq` and `detail` of the newest event of `event_type` written on run
+/// `run_id`.
+pub fn latest_event_seq_detail_of_run(
+    conn: &Connection,
+    run_id: &str,
+    event_type: &str,
+) -> Result<Option<(i64, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT seq, detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
+            params![run_id, event_type],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// The `detail` of every event of `event_type` written on run `run_id`,
+/// oldest first; fails as a whole when any row cannot be read.
+pub fn event_details_of_run(
+    conn: &Connection,
+    run_id: &str,
+    event_type: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq",
+    )?;
+    let details = stmt
+        .query_map(
+            params![run_id, event_type],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(details)
+}
+
+/// The `detail` of every event of `event_type` written for task `task_id`,
+/// oldest first; fails as a whole when any row cannot be read (SQL-4).
+pub fn event_details_of_task(
+    conn: &Connection,
+    task_id: &str,
+    event_type: &str,
+) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT detail FROM events WHERE task_id = ?1 AND type = ?2 ORDER BY seq")?;
+    let details = stmt
+        .query_map(params![task_id, event_type], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(details)
+}
+
+/// The `detail` of every event of `event_type` written on run `run_id` of
+/// task `task_id`, oldest first; fails as a whole when any row cannot be read
+/// (SQL-4).
+pub fn event_details_of_task_run(
+    conn: &Connection,
+    task_id: &str,
+    run_id: &str,
+    event_type: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT detail FROM events WHERE task_id = ?1 AND run_id = ?2 AND type = ?3 ORDER BY seq",
+    )?;
+    let details = stmt
+        .query_map(params![task_id, run_id, event_type], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(details)
+}
+
+/// `event_details_of_task_run`, newest first (SQL-4).
+pub fn event_details_of_task_run_newest_first(
+    conn: &Connection,
+    task_id: &str,
+    run_id: &str,
+    event_type: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT detail FROM events WHERE task_id = ?1 AND run_id = ?2 AND type = ?3 ORDER BY seq DESC",
+    )?;
+    let details = stmt
+        .query_map(params![task_id, run_id, event_type], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(details)
+}
+
+/// The `(ts, detail)` of every event of `event_type` in this database,
+/// newest first; fails as a whole when any row cannot be read (SQL-4).
+pub fn event_ts_details_of_type_newest_first(
+    conn: &Connection,
+    event_type: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT ts, detail FROM events WHERE type = ?1 ORDER BY seq DESC")?;
+    let rows = stmt
+        .query_map([event_type], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// `task_id` when the task exists in this database, `None` otherwise.
+pub fn task_id_if_exists(conn: &Connection, task_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT task_id FROM tasks WHERE task_id=?1", [task_id], |r| r.get(0))
+        .optional()?)
+}
+
+/// Every evidence code of a task, in table order (the caller parses them).
+pub fn evidence_codes_of_task(conn: &Connection, task_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT code FROM evidence WHERE task_id = ?1")?;
+    let codes = stmt
+        .query_map([task_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(codes)
+}
+
 /// Strictly `seq > since`, ascending, so a caller can poll with the last seq it saw.
 pub fn events_since(conn: &Connection, since: i64, task_id: Option<&str>) -> Result<Vec<EventRow>> {
     let rows = match task_id {
@@ -399,6 +543,19 @@ pub fn list_runs_for_task(conn: &Connection, task_id: &str) -> Result<Vec<Run>> 
     Ok(rows)
 }
 
+/// SMALL-11 (4): every `running` run that has a recorded runner pid, oldest
+/// first. The caller decides which of them lost their runner.
+pub fn list_running_runs_with_runner(conn: &Connection) -> Result<Vec<Run>> {
+    let sql = format!(
+        "SELECT {RUN_COLS} FROM runs WHERE status = 'running' AND runner_pid IS NOT NULL ORDER BY run_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], row_to_run)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Every run of `task_id` that is still live - one nobody has settled, i.e.
 /// `runs.status` is `queued` or `running`.
 ///
@@ -454,6 +611,17 @@ pub fn set_worker_pid(conn: &Connection, run_id: &str, worker_pid: i64) -> Resul
     conn.execute(
         "UPDATE runs SET worker_pid = ?2 WHERE run_id = ?1",
         params![run_id, worker_pid],
+    )?;
+    Ok(())
+}
+
+/// AGY-1 (second part): the runner rewrote the run's stored launch settings
+/// (`runs.spec`'s `launch` key) after agy refused its effort, so `status`
+/// and a later `thoth resume` see what was really sent.
+pub fn set_run_spec(conn: &Connection, run_id: &str, spec_json: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE runs SET spec = ?2 WHERE run_id = ?1",
+        params![run_id, spec_json],
     )?;
     Ok(())
 }

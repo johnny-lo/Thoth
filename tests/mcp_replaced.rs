@@ -271,7 +271,7 @@ impl Server {
         stderr: bool,
         env: &[(&str, &str)],
     ) -> Self {
-        let mut c = Command::new(&bin.exe);
+        let mut c = common::scrubbed(Command::new(&bin.exe));
         c.arg("mcp")
             .args(extra)
             .envs(env.iter().copied())
@@ -286,21 +286,7 @@ impl Server {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(if stderr { Stdio::piped() } else { Stdio::null() });
-        for var in [
-            "FAKE_TASK_ID",
-            "THOTH_RUN_ID",
-            "THOTH_INBOX_DIR",
-            "THOTH_EXE",
-            "CLAUDE_PLUGIN_ROOT",
-            "CLAUDE_CONFIG_DIR",
-            "CODEX_HOME",
-            "ARTIFICIALANALYSIS_API_KEY",
-            "AISTUPIDLEVEL_API_KEY",
-            "THOTH_RECORDS_DIR",
-            "THOTH_MACHINE_NAME",
-        ] {
-            c.env_remove(var);
-        }
+        c.env_remove("FAKE_TASK_ID");
         let mut child = c.spawn().unwrap();
         let input = child.stdin.take();
         let out = child.stdout.take().unwrap();
@@ -1074,7 +1060,10 @@ fn mcp_replaced_notices_a_server_that_exited_while_idle() {
     let r = s.guide(1);
     assert_notice(&r, &bin);
     s.one_list_changed(&r);
-    std::thread::sleep(Duration::from_secs(2));
+    // the fake exits right after its first answer, and the silence check of
+    // `one_list_changed` has already kept the server idle for two seconds;
+    // this short pause only keeps the second call apart from that check
+    std::thread::sleep(Duration::from_millis(250));
     let r = s.guide(2);
     assert_local(&r, "exited");
     s.one_list_changed(&r);

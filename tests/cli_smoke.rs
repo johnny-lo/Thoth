@@ -1,8 +1,10 @@
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn thoth() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_thoth"))
+    common::scrubbed_assert(Command::new(env!("CARGO_BIN_EXE_thoth")))
 }
 
 #[test]
@@ -11,7 +13,7 @@ fn version_prints_name_and_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("thoth 0.1.20"));
+        .stdout(predicate::str::contains("thoth 0.1.24"));
 }
 
 #[test]

@@ -321,7 +321,7 @@ fn an_added_file_named_like_a_check_word_is_listed_and_approved() {
 }
 
 /// AC11 (d): the worker prompt lists the inputs of every check, approved or
-/// not, the same set rule 6 compares against.
+/// not, the same set the diff evidence's protected_changes is built from.
 #[test]
 fn the_prompt_lists_the_inputs_of_an_unapproved_check() {
     let f = initialised();

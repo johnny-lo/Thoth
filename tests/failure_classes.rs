@@ -764,3 +764,45 @@ fn status_human_lists_the_reason_and_the_next_step_once() {
     assert_eq!(next.len(), 1, "{human}");
     assert!(next[0].contains("quota used up on claude-b"), "{human}");
 }
+
+/// SMALL-17 (d): without `--model`, a profile parked for one quota group is
+/// not usable just because the best group of its reading is another one;
+/// naming a model of another group still makes it usable. Through the CLI
+/// only: the reading is the fake's default one (`Gemini Models` 25%, `Claude
+/// and GPT models` 0%), stored by `profile usage --refresh`.
+#[test]
+fn a_parked_agy_profile_without_a_model_is_not_eligible() {
+    let f = setup();
+    let cfg = f.add_agy_profile("agy-a");
+    f.cmd().args(["config", "set", "live-quota", "on"]).assert().success();
+    let mut refresh = f.cmd();
+    refresh.env("FAKE_AGY_DATA_DIR", &cfg).args(["profile", "usage", "agy-a", "--refresh", "--json"]);
+    let r: Value = serde_json::from_slice(&f.run_ok(refresh, "profile usage --refresh")).unwrap();
+    assert_eq!(r["refresh"][0]["status"], "refreshed", "{r}");
+    let (task, _) = f.create_task(Fixture::SPEC);
+    agy_dispatch(&f, &cfg, &task, "quota", "gemini-3.8-flash-medium");
+    assert_eq!(f.wait_for(&task, "120s").1, "interrupted");
+
+    let rec = recommend_json(&f, &["--role", "implementer"]);
+    let c = candidate(&rec, "agy-a");
+    let reasons: Vec<String> =
+        c["reasons"].as_array().unwrap().iter().map(|r| r.as_str().unwrap().to_string()).collect();
+    assert_eq!(c["eligible"], false, "{c}");
+    assert_eq!(c["quota_group"], OTHER, "{c}");
+    assert_eq!(c["parked_group"], GEMINI, "{c}");
+    assert!(has(&reasons, "status rate_limited; run `thoth profile check agy-a`"), "{c}");
+    assert!(
+        has(&reasons, "parked for quota group Gemini Models; name a model of another group with --model to use this profile"),
+        "{c}"
+    );
+
+    let rec = recommend_json(&f, &["--role", "implementer", "--model", "claude-sonnet-4-6"]);
+    let c = candidate(&rec, "agy-a");
+    let reasons: Vec<String> =
+        c["reasons"].as_array().unwrap().iter().map(|r| r.as_str().unwrap().to_string()).collect();
+    assert_eq!(c["eligible"], true, "{c}");
+    assert!(
+        has(&reasons, "parked for quota group Gemini Models; the selected group Claude and GPT models is unaffected"),
+        "{c}"
+    );
+}

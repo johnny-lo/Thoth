@@ -37,6 +37,44 @@ fn launch_defaults(extra: &[&str], model: &'static str) -> Vec<&'static str> {
     out
 }
 
+/// SMALL-13: the variables of the operator's own environment that must never
+/// reach a thoth child started by a test. Some are what a thoth run exports to
+/// its worker (so a suite run inside a worker neither trips `review record`'s
+/// run guard nor writes into that worker's inbox), some pick the operator's
+/// accounts, benchmark keys or shared records, and `CLAUDE_PLUGIN_ROOT` makes
+/// `thoth mcp` compare the operator's installed plugin and refuse calls. A test
+/// that needs one on purpose sets it again after calling `scrubbed` or
+/// `scrubbed_assert`.
+pub const OPERATOR_ENV: [&str; 10] = [
+    "THOTH_RUN_ID",
+    "THOTH_INBOX_DIR",
+    "THOTH_EXE",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "AISTUPIDLEVEL_API_KEY",
+    "ARTIFICIALANALYSIS_API_KEY",
+    "THOTH_RECORDS_DIR",
+    "THOTH_MACHINE_NAME",
+    "CLAUDE_PLUGIN_ROOT",
+];
+
+/// A `std::process::Command` for a thoth binary without the `OPERATOR_ENV`
+/// variables. Wrap the command right where it is created, before any `.env`.
+pub fn scrubbed(mut c: std::process::Command) -> std::process::Command {
+    for var in OPERATOR_ENV {
+        c.env_remove(var);
+    }
+    c
+}
+
+/// The same for an `assert_cmd::Command`.
+pub fn scrubbed_assert(mut c: assert_cmd::Command) -> assert_cmd::Command {
+    for var in OPERATOR_ENV {
+        c.env_remove(var);
+    }
+    c
+}
+
 pub struct Fixture {
     pub home: TempDir,
     pub repo: TempDir,
@@ -78,19 +116,22 @@ impl Fixture {
     /// `review record`'s run guard nor appends test garbage to that worker's
     /// real inbox. A test that needs one sets it again after this call.
     pub fn cmd(&self) -> assert_cmd::Command {
-        let mut c = assert_cmd::Command::new(env!("CARGO_BIN_EXE_thoth"));
-        for var in ["THOTH_RUN_ID", "THOTH_INBOX_DIR", "THOTH_EXE"] {
-            c.env_remove(var);
-        }
-        c.env_remove("CLAUDE_CONFIG_DIR");
-        c.env_remove("CODEX_HOME");
-        c.env_remove("ARTIFICIALANALYSIS_API_KEY");
-        c.env_remove("AISTUPIDLEVEL_API_KEY");
+        self.cmd_of(env!("CARGO_BIN_EXE_thoth"))
+    }
+
+    /// `cmd`'s environment and cwd for any program path (a copy of the thoth
+    /// binary, say), as an `assert_cmd::Command`.
+    pub fn cmd_of(&self, program: impl AsRef<std::ffi::OsStr>) -> assert_cmd::Command {
+        assert_cmd::Command::from_std(self.std_cmd_of(program))
+    }
+
+    /// `cmd`'s environment and cwd for any program path, as a
+    /// `std::process::Command`, for a test that spawns it and waits.
+    pub fn std_cmd_of(&self, program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+        let mut c = scrubbed(std::process::Command::new(program));
         // RJ-2: Agent Arena needs no key, so point it at a file:// path that
         // does not exist; no test reaches huggingface.co.
         c.env("THOTH_ARENA_URL", offline_arena_url(self.home.path()));
-        c.env_remove("THOTH_RECORDS_DIR");
-        c.env_remove("THOTH_MACHINE_NAME");
         c.env("THOTH_HOME", self.home.path());
         c.env("THOTH_CLAUDE_BIN", env!("CARGO_BIN_EXE_fake-claude"));
         // Never the real codex: every test that launches one gets the fake.

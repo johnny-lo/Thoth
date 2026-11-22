@@ -121,13 +121,19 @@
 //! launch (where `FAKE_PROMPT_COPY` is written; not `--version`, `plugin *`,
 //! `auth status` or the interactive login) append one JSON line
 //! `{"names":[...]}`: the sorted names of its environment variables, never a
-//! value.
+//! value. GITENV-1's `FAKE_GIT_ENV_LOG=<path>` does the same with
+//! `{"git_config":{NAME: VALUE}}`, holding only the variables whose names
+//! start with `GIT_CONFIG_`, with their values.
 //!
 //! BRIEF-1 switches, unset by default: in the scenarios that write a
 //! result.json with a task_id through `write_result_json` (`ok`, `slow`,
 //! `resume`), `FAKE_RESULT_SUMMARY` replaces the summary and
 //! `FAKE_RESULT_BRIEF` adds a `brief`; `FAKE_REVIEW_NOTE` replaces the note of
-//! `review_reject`'s unmet criterion.
+//! `review_reject`'s unmet criterion. SMALL-16: `FAKE_REVIEW_NOTE_TOKEN=1`
+//! also appends a GitHub-token-shaped string to that note, built inside the
+//! fake from two pieces (a token cannot come in through the environment: the
+//! runner strips key-shaped variables from the worker's), for the wait path's
+//! token masking.
 //!
 //! RVI-1 switch, unset by default: in the `hooks` scenario,
 //! `FAKE_RESULT_PATCH=<file>` (a JSON object) sets each of its top-level keys
@@ -179,6 +185,14 @@ fn prompt_text(args: &[String]) -> String {
     buf
 }
 
+/// The task id in the prompt's `{"task_id":"..."` result.json shape.
+fn task_id_in_prompt(prompt: &str) -> Option<String> {
+    let marker = "{\"task_id\":\"";
+    let rest = &prompt[prompt.find(marker)? + marker.len()..];
+    let id = &rest[..rest.find('"')?];
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 /// RD-2: appends `{"names":[...]}` to `FAKE_ENV_LOG`, the sorted names of
 /// this launch's environment variables. Names only, never a value. Unset:
 /// writes nothing.
@@ -189,6 +203,24 @@ fn log_env_names() {
     names.sort();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{}", serde_json::json!({"names": names}));
+    }
+}
+
+/// GITENV-1: appends `{"git_config":{NAME: VALUE, ...}}` to
+/// `FAKE_GIT_ENV_LOG`, only this launch's variables whose names start with
+/// `GIT_CONFIG_`, with their values; no other variable is read. Unset:
+/// writes nothing.
+fn log_git_config_env() {
+    let Some(path) = std::env::var_os("FAKE_GIT_ENV_LOG") else { return };
+    let vars: serde_json::Map<String, serde_json::Value> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let name = k.into_string().ok()?;
+            name.starts_with("GIT_CONFIG_")
+                .then(|| (name, serde_json::Value::String(v.to_string_lossy().into_owned())))
+        })
+        .collect();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", serde_json::json!({"git_config": vars}));
     }
 }
 
@@ -1100,6 +1132,7 @@ fn main() {
         let _ = std::fs::write(path, prompt.as_bytes());
     }
     log_env_names();
+    log_git_config_env();
 
     // E7: the local `/usage` command. Writes no result.json, does not touch
     // `FAKE_ATTEMPTS_FILE` and runs no scenario.
@@ -1107,7 +1140,14 @@ fn main() {
         usage_answer();
     }
 
-    let task_id = std::env::var("FAKE_TASK_ID").unwrap_or_else(|_| "UNKNOWN-TASK".to_string());
+    // ONE-1: `FAKE_TASK_ID=from-prompt` takes the id from the result.json
+    // shape the prompt gives, for a test whose task is created by the same
+    // command that starts the worker (`thoth pipeline new`).
+    let task_id = match std::env::var("FAKE_TASK_ID") {
+        Ok(v) if v == "from-prompt" => task_id_in_prompt(&prompt).unwrap_or_else(|| "UNKNOWN-TASK".to_string()),
+        Ok(v) => v,
+        Err(_) => "UNKNOWN-TASK".to_string(),
+    };
     let resume = arg_value(&args, "--resume");
     let session_id = resume
         .clone()
@@ -1503,6 +1543,13 @@ fn main() {
                         c["note"] = serde_json::json!(std::env::var("FAKE_REVIEW_NOTE").unwrap_or_else(|_| {
                             "no captured evidence shows this criterion being exercised".to_string()
                         }));
+                        // SMALL-16 switch: a token-shaped string, never written whole
+                        // in this source.
+                        if std::env::var("FAKE_REVIEW_NOTE_TOKEN").as_deref() == Ok("1") {
+                            let token = format!("{}{}", ["gh", "p_"].concat(), "dummyDUMMY0123456789dummyDUMMY012345");
+                            let note = c["note"].as_str().unwrap_or_default().to_string();
+                            c["note"] = serde_json::json!(format!("{note} (token {token})"));
+                        }
                         label_finding(&mut c, category.as_deref());
                     }
                     c

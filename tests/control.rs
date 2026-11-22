@@ -66,11 +66,78 @@ fn pid_alive(pid: u32, image: &str) -> bool {
     common::pid_alive(pid, image)
 }
 
-/// The image `dispatch`/`resume` launch the detached runner as: this test
-/// binary's own `thoth`, via `std::env::current_exe`.
-const RUNNER_IMAGE: &str = "thoth";
-/// The image every worker in these tests is, via `THOTH_CLAUDE_BIN`.
+/// The image every worker in these tests is, via `THOTH_CLAUDE_BIN` (except
+/// the escalation test, which runs copies under its own names; see
+/// `isolated_bins`).
 const WORKER_IMAGE: &str = "fake-claude";
+
+/// FLAKY-1: copies of the thoth and fake-claude binaries under names no other
+/// process of the suite runs, so a pid this test's runner or worker freed and
+/// another test's `thoth`, `fake-claude` or `sleep` then took never matches
+/// by image name: neither in this test's own liveness checks nor in
+/// `cancel`'s escalation, which would otherwise kill that other process.
+struct IsolatedBins {
+    thoth: std::path::PathBuf,
+    fake_claude: std::path::PathBuf,
+    /// The stems the copies run as (`/proc/PID/comm`, `tasklist`'s image).
+    runner_image: String,
+    worker_image: String,
+}
+
+/// Makes the copies in the fixture's home. Each name carries this test
+/// process's id as 8 hex digits (fixed width, so no copy's name is a prefix
+/// of another's), stays within the 15 bytes Linux keeps in `/proc/PID/comm`,
+/// keeps `.exe` on Windows, and is no prefix of any image the suite starts.
+/// The thoth copy's name starts with `thoth`, so the dead-runner rule still
+/// counts it as a thoth process.
+fn isolated_bins(f: &common::Fixture) -> IsolatedBins {
+    let tag = format!("{:08x}", std::process::id());
+    let runner_image = format!("thothc{tag}");
+    let worker_image = format!("fakec{tag}");
+    assert!(runner_image.len() <= 15 && worker_image.len() <= 15);
+    let dir = f.home_path().join("isolated-bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = std::env::consts::EXE_SUFFIX;
+    let thoth = dir.join(format!("{runner_image}{exe}"));
+    let fake_claude = dir.join(format!("{worker_image}{exe}"));
+    std::fs::copy(env!("CARGO_BIN_EXE_thoth"), &thoth).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_fake-claude"), &fake_claude).unwrap();
+    IsolatedBins { thoth, fake_claude, runner_image, worker_image }
+}
+
+/// `Fixture::cmd`, but running the thoth copy with `THOTH_CLAUDE_BIN` set to
+/// the fake-claude copy; every other variable and the cwd as `cmd` sets them.
+fn isolated_cmd(f: &common::Fixture, bins: &IsolatedBins) -> assert_cmd::Command {
+    let mut c = f.cmd_of(&bins.thoth);
+    c.env("THOTH_CLAUDE_BIN", &bins.fake_claude);
+    c
+}
+
+/// The state and start time (fields 3 and 22) of `/proc/PID/stat`, and
+/// whether its name field is `(name)`.
+#[cfg(not(windows))]
+fn proc_stat(pid: u32, name: &str) -> Option<(String, u64, bool)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let named = stat[..=close].ends_with(&format!("({name})"));
+    let mut rest = stat[close + 1..].split_whitespace();
+    let state = rest.next()?.to_string();
+    // field 3 was just read; field 22 is 18 further on
+    let start = rest.nth(18)?.parse().ok()?;
+    Some((state, start, named))
+}
+
+/// FLAKY-1: the Linux grandchild counts as alive only while the same pid
+/// still has the start time it had when the test first saw it, still runs
+/// `sleep`, and is no zombie; so a process that later took the freed pid
+/// never reads as the grandchild.
+#[cfg(not(windows))]
+fn grandchild_alive(pid: u32, start: u64) -> bool {
+    match proc_stat(pid, "sleep") {
+        Some((state, s, named)) => named && s == start && !matches!(state.as_str(), "Z" | "X" | "x"),
+        None => false,
+    }
+}
 
 /// Sets `runs.heartbeat_at` directly to `seconds_ago` in the past, so a test
 /// can put a run past `STALE_AFTER_SECONDS` (15s) without actually waiting
@@ -151,6 +218,12 @@ fn cancel_escalates_when_the_runner_is_dead_and_still_settles_the_row() {
     // when nothing is left to kill, exactly as when a kill fails, `cancel`
     // must not just return an error and leave the run stuck `running`.
     let f = common::fixture();
+    // FLAKY-1: the runner and worker run under names unique to this test
+    // process (see `isolated_bins`), so a pid either of them freed and another
+    // test's process took is neither "still alive" here nor killed by cancel.
+    let bins = isolated_bins(&f);
+    let runner_image = bins.runner_image.as_str();
+    let worker_image = bins.worker_image.as_str();
     f.cmd().arg("init").assert().success();
     f.add_profile("claude-b");
     let (task_id, _) = f.create_task(common::Fixture::SPEC);
@@ -160,21 +233,30 @@ fn cancel_escalates_when_the_runner_is_dead_and_still_settles_the_row() {
     // *whole* worker tree, not just its root. Windows keeps the root-only
     // form: its job covers the grandchild as well, but that assertion has not
     // been run on a Windows machine yet.
-    #[cfg(not(windows))]
     let d = {
-        let mut c = f.cmd();
-        c.env("FAKE_SCENARIO", "slow")
-            .env("FAKE_TASK_ID", &task_id)
-            .env("FAKE_SPAWN_CHILD", "1")
-            .args(["dispatch", &task_id, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium"])
+        let mut c = isolated_cmd(&f, &bins);
+        c.env("FAKE_SCENARIO", "slow").env("FAKE_TASK_ID", &task_id);
+        #[cfg(not(windows))]
+        c.env("FAKE_SPAWN_CHILD", "1");
+        c.args(["dispatch", &task_id, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium"])
             .args(["--json", "--timeout", "10m"]);
-        let out = c.assert().success().get_output().stdout.clone();
+        let out = f.run_ok(c, "dispatch");
         serde_json::from_str::<serde_json::Value>(String::from_utf8(out).unwrap().trim()).unwrap()
     };
-    #[cfg(windows)]
-    let d = f.dispatch(&task_id, "claude-b", "slow", &["--timeout", "10m"]);
     let run_id = d["run_id"].as_str().unwrap().to_string();
     let worker_pid = wait_until_running(&f, &run_id) as u32;
+    // FLAKY-1 (new): the isolation is in effect - the worker the runner
+    // started, as `events --json` reports it, is the fake-claude copy.
+    let started = f
+        .events_json(&task_id)
+        .into_iter()
+        .rfind(|e| e["type"] == "run_started" && e["run_id"] == run_id.as_str())
+        .unwrap_or_else(|| panic!("no run_started event for {run_id}"));
+    assert_eq!(
+        common::image_stem(started["detail"]["worker_image"].as_str().unwrap_or_default()),
+        worker_image,
+        "{started}"
+    );
     #[cfg(not(windows))]
     let grandchild: u32 = {
         let stream = std::path::PathBuf::from(d["run_dir"].as_str().unwrap()).join("stream.jsonl");
@@ -193,9 +275,14 @@ fn cancel_escalates_when_the_runner_is_dead_and_still_settles_the_row() {
             std::thread::sleep(Duration::from_millis(100));
         }
     };
+    // FLAKY-1: from here on the grandchild is this pid with this start time.
+    #[cfg(not(windows))]
+    let grandchild_start: u64 = proc_stat(grandchild, "sleep")
+        .map(|(_, start, _)| start)
+        .unwrap_or_else(|| panic!("the grandchild {grandchild} has no /proc stat"));
     #[cfg(not(windows))]
     assert!(
-        common::pid_alive(grandchild, "sleep"),
+        grandchild_alive(grandchild, grandchild_start),
         "the escaped grandchild should be running before the runner dies"
     );
 
@@ -221,24 +308,24 @@ fn cancel_escalates_when_the_runner_is_dead_and_still_settles_the_row() {
     // runner's systemd unit kills its whole cgroup once its main process is
     // gone (Linux).
     let mut tries = 0;
-    while pid_alive(worker_pid, WORKER_IMAGE) && tries < 20 {
+    while pid_alive(worker_pid, worker_image) && tries < 20 {
         std::thread::sleep(Duration::from_millis(250));
         tries += 1;
     }
     assert!(
-        !pid_alive(worker_pid, WORKER_IMAGE),
+        !pid_alive(worker_pid, worker_image),
         "a dead runner must take its still-running worker down with it \
          (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)"
     );
     #[cfg(not(windows))]
     {
         let mut tries = 0;
-        while common::pid_alive(grandchild, "sleep") && tries < 20 {
+        while grandchild_alive(grandchild, grandchild_start) && tries < 20 {
             std::thread::sleep(Duration::from_millis(250));
             tries += 1;
         }
         assert!(
-            !common::pid_alive(grandchild, "sleep"),
+            !grandchild_alive(grandchild, grandchild_start),
             "a dead runner must take the worker's escaped grandchild down too"
         );
     }
@@ -249,8 +336,8 @@ fn cancel_escalates_when_the_runner_is_dead_and_still_settles_the_row() {
     // staleness check itself no longer has to race a wall clock.
     age_heartbeat(&f, &run_id, 30);
 
-    let out = f
-        .cmd()
+    // the thoth copy, so `cancel` expects the runner pid to run its stem
+    let out = isolated_cmd(&f, &bins)
         .args(["cancel", &run_id, "--json"])
         .assert()
         .success()
@@ -292,7 +379,7 @@ fn cancel_escalates_when_the_runner_is_dead_and_still_settles_the_row() {
         ),
         other => panic!("unexpected status {other}: {v}"),
     }
-    assert!(!pid_alive(worker_pid, WORKER_IMAGE), "the worker must be gone either way: {v}");
+    assert!(!pid_alive(worker_pid, worker_image), "the worker must be gone either way: {v}");
 
     // the row is settled, not left half-written
     let conn = f.state_conn();
@@ -349,7 +436,7 @@ fn cancel_escalates_when_the_runner_is_dead_and_still_settles_the_row() {
     // after the escalation, already proves it and nothing between the two
     // could resurrect the worker.
     assert!(
-        !pid_alive(runner_pid, RUNNER_IMAGE),
+        !pid_alive(runner_pid, runner_image),
         "runner must still be gone"
     );
 }

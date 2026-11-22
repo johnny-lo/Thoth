@@ -1154,7 +1154,7 @@ impl Mcp {
     /// `thoth mcp` in `f`'s repo, initialized, its workers given `scenario`
     /// and `envs`.
     fn start_for(f: &Fixture, task: &str, scenario: &str, envs: &[(&str, &str)]) -> Self {
-        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(std::process::Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .current_dir(f.repo.path())
             .env("THOTH_HOME", f.home.path())

@@ -37,8 +37,12 @@ const WRITE_WORDS_EN: &[&str] = &[
     "write", "edit", "modify", "change", "update", "create", "add", "delete", "remove", "move",
     "rename", "replace",
 ];
-const NEGATIONS_ZH: &[&str] = &["不", "別", "勿", "禁", "免", "無", "沒"];
-const NEGATIONS_EN: &[&str] = &["not", "never", "no", "don't", "without"];
+const NEGATIONS_ZH: &[&str] = &["不", "別", "勿", "禁", "免", "無", "沒", "只讀", "唯讀", "取自"];
+const NEGATIONS_EN: &[&str] =
+    &["not", "never", "no", "don't", "without", "read-only", "readonly", "read only"];
+/// SPECLINT-1: the adding words of a list entry (`新增：docs/、.claude/`).
+const ADDING_ZH: &[&str] = &["新增", "加入"];
+const ADDING_EN: &[&str] = &["add"];
 const LINE_NUMBER_EXTENSIONS: &[&str] = &[
     "rs", "md", "json", "toml", "lock", "ts", "js", "py", "sh", "ps1", "txt", "yml", "yaml",
 ];
@@ -138,6 +142,21 @@ pub fn run(paths: &Paths, cwd: &Path, file: &Path, json: bool) -> Result<i32> {
     Ok(if report.errors.is_empty() { 0 } else { 1 })
 }
 
+/// Test seam, debug builds only, so a release build has no such switch and
+/// ignores the variable. When `THOTH_TEST_SPEC_LINT_PRE_LEAN` is set, a spec
+/// over `LARGE_BYTES` (and up to `TOO_LARGE_BYTES`) at risk low or normal gets
+/// the `large` finding as a warning, as before LEAN-1, so a test can store
+/// one through the CLI and check how the later commands refuse it.
+#[cfg(debug_assertions)]
+fn pre_lean_large_is_a_warning() -> bool {
+    std::env::var_os("THOTH_TEST_SPEC_LINT_PRE_LEAN").is_some()
+}
+
+#[cfg(not(debug_assertions))]
+fn pre_lean_large_is_a_warning() -> bool {
+    false
+}
+
 /// Reads only files under `root`; writes nothing.
 pub fn lint(raw: &str, root: &Path, check_ids: &[String]) -> Report {
     let mut errors = Vec::new();
@@ -151,7 +170,7 @@ pub fn lint(raw: &str, root: &Path, check_ids: &[String]) -> Report {
         ));
     } else if bytes > LARGE_BYTES {
         let risk = size_risk(raw);
-        if SMALL_SPEC_RISKS.contains(&risk.as_str()) {
+        if SMALL_SPEC_RISKS.contains(&risk.as_str()) && !pre_lean_large_is_a_warning() {
             errors.push(Finding::new(
                 "large",
                 None,
@@ -207,6 +226,24 @@ pub fn lint(raw: &str, root: &Path, check_ids: &[String]) -> Report {
             }
         }
     }
+    // SMALL-11 (3): verify runs every approved check of the repository for a
+    // spec that lists none, which is rarely what a docs or research task
+    // wants. Only a warning: what verify runs does not change.
+    if spec.checks.is_empty() && !check_ids.is_empty() {
+        if let Some(task_type) = crate::spec::labels(raw)
+            .0
+            .filter(|t| t == "docs" || t == "research")
+        {
+            warnings.push(Finding::new(
+                "no_checks_for_document_task",
+                Some("checks"),
+                format!(
+                    "the spec's task_type is {task_type} and it lists no checks, so verify will run \
+                     every approved check of the repository; list the checks the task needs in checks"
+                ),
+            ));
+        }
+    }
 
     let mut fields = vec![Field::new("goal".into(), &spec.goal)];
     for (i, ac) in spec.acceptance_criteria.iter().enumerate() {
@@ -216,6 +253,7 @@ pub fn lint(raw: &str, root: &Path, check_ids: &[String]) -> Report {
         fields.push(Field::new(format!("constraints[{i}]"), c));
     }
     errors.extend(fields.iter().filter_map(claude_write));
+    errors.extend(unknown_test_targets(&fields, root));
     warnings.extend(missing_paths(&fields, root));
     warnings.extend(missing_names(&fields, root));
     for f in &fields {
@@ -261,12 +299,14 @@ impl Field {
         self.chars[r].iter().collect()
     }
 
-    /// The sentence pieces, split at `。`, `；`, `;`, a newline and `. `.
+    /// The sentence pieces, split at `。`, `；`, `;`, a newline and `. `; a
+    /// separator inside a pair of backticks is part of the quotation.
     fn segments(&self) -> Vec<Range<usize>> {
         let mut out = Vec::new();
         let (mut start, mut i) = (0, 0);
         while i < self.chars.len() {
             let width = match self.chars[i] {
+                _ if self.quoted[i] => 0,
                 '。' | '；' | ';' | '\n' => 1,
                 '.' if self.chars.get(i + 1) == Some(&' ') => 2,
                 _ => 0,
@@ -280,6 +320,45 @@ impl Field {
             }
         }
         out.push(start..self.chars.len());
+        out
+    }
+
+    /// SPECLINT-1: the clauses of one sentence, split at `，` and at an ASCII
+    /// `,` that is followed by a space or the end of the field (`1,000` and
+    /// `a,b` stay whole). `、` does not split, and nothing splits inside
+    /// backticks.
+    fn clauses(&self, sentence: Range<usize>) -> Vec<Range<usize>> {
+        let mut out = Vec::new();
+        let mut start = sentence.start;
+        for i in sentence.clone() {
+            let splits = !self.quoted[i]
+                && match self.chars[i] {
+                    '，' => true,
+                    ',' => self.chars.get(i + 1).is_none_or(|&c| c == ' '),
+                    _ => false,
+                };
+            if splits {
+                out.push(start..i);
+                start = i + 1;
+            }
+        }
+        out.push(start..sentence.end);
+        out
+    }
+
+    /// The matched pairs of parentheses (`（…）`, `(…)`) of a sentence, as the
+    /// positions of the opener and the closer; backticks are skipped and an
+    /// opener with no closer is ignored.
+    fn asides(&self, sentence: Range<usize>) -> Vec<(usize, usize)> {
+        let mut open = Vec::new();
+        let mut out = Vec::new();
+        for i in sentence.filter(|&i| !self.quoted[i]) {
+            match self.chars[i] {
+                '(' | '（' => open.push(i),
+                ')' | '）' => out.extend(open.pop().map(|o| (o, i))),
+                _ => {}
+            }
+        }
         out
     }
 
@@ -329,41 +408,319 @@ fn has_identifier(text: &str, name: &str) -> bool {
     false
 }
 
-/// `.claude` as a folder name: `~/.claude/x` and `.claude/skills` count,
-/// `.claude-plugin`, `.claude.json` and `CLAUDE.md` do not.
-fn names_claude_dir(chars: &[char]) -> bool {
+/// Where `.claude` stands as a folder name in `chars`: `~/.claude/x` and
+/// `.claude/skills` count, `.claude-plugin`, `.claude.json` and `CLAUDE.md`
+/// do not.
+fn claude_dir_starts(chars: &[char]) -> Vec<usize> {
     let pat: Vec<char> = ".claude".chars().collect();
-    (0..chars.len()).any(|i| {
-        chars[i..].starts_with(&pat)
-            && (i == 0 || !chars[i - 1].is_ascii_alphanumeric())
-            && chars
-                .get(i + pat.len())
-                .is_none_or(|&c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    (0..chars.len())
+        .filter(|&i| {
+            chars[i..].starts_with(&pat)
+                && (i == 0 || !chars[i - 1].is_ascii_alphanumeric())
+                && chars
+                    .get(i + pat.len())
+                    .is_none_or(|&c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        })
+        .collect()
+}
+
+const CLAUDE_DIR_LEN: usize = 7;
+
+fn has_write_word(plain: &str) -> bool {
+    WRITE_WORDS_ZH.iter().any(|w| plain.contains(w)) || WRITE_WORDS_EN.iter().any(|w| has_word(plain, w))
+}
+
+fn has_negation(text: &str) -> bool {
+    NEGATIONS_ZH.iter().any(|w| text.contains(w)) || NEGATIONS_EN.iter().any(|w| has_word(text, w))
+}
+
+/// A negation word other than the read-only markers, which count only in
+/// the clause where they stand (`改 .claude/x，內容取自 a.md` is still a write).
+fn has_ban(text: &str) -> bool {
+    let markers = ["只讀", "唯讀", "取自", "read-only", "readonly", "read only"];
+    NEGATIONS_ZH.iter().chain(NEGATIONS_EN).filter(|w| !markers.contains(w)).any(|w| {
+        if w.is_ascii() { has_word(text, w) } else { text.contains(w) }
     })
 }
 
-fn claude_write(f: &Field) -> Option<Finding> {
-    for seg in f.segments() {
-        if !names_claude_dir(&f.chars[seg.clone()]) {
-            continue;
+/// `plain` with each adding word that is directly followed by a colon (spaces
+/// allowed before it) blanked out, and whether there was one.
+fn without_adding_words(plain: &str) -> (String, bool) {
+    let chars: Vec<char> = plain.chars().collect();
+    let lower: Vec<char> = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let mut out = chars.clone();
+    let mut found = false;
+    for (word, ascii) in ADDING_ZH.iter().map(|w| (w, false)).chain(ADDING_EN.iter().map(|w| (w, true))) {
+        let w: Vec<char> = word.chars().collect();
+        let mut i = 0;
+        while i + w.len() <= lower.len() {
+            let whole = !ascii
+                || ((i == 0 || !lower[i - 1].is_ascii_alphanumeric() && lower[i - 1] != '_')
+                    && lower.get(i + w.len()).is_none_or(|c| !c.is_ascii_alphanumeric() && *c != '_'));
+            if lower[i..].starts_with(&w) && whole {
+                let mut j = i + w.len();
+                while chars.get(j) == Some(&' ') {
+                    j += 1;
+                }
+                if matches!(chars.get(j), Some('：') | Some(':')) {
+                    out[i..i + w.len()].iter_mut().for_each(|c| *c = ' ');
+                    found = true;
+                }
+            }
+            i += 1;
         }
-        let plain = f.unquoted(seg.clone());
-        let writes = WRITE_WORDS_ZH.iter().any(|w| plain.contains(w))
-            || WRITE_WORDS_EN.iter().any(|w| has_word(&plain, w));
-        let negated = NEGATIONS_ZH.iter().any(|w| plain.contains(w))
-            || NEGATIONS_EN.iter().any(|w| has_word(&plain, w));
-        if writes && !negated {
-            return Some(Finding::new(
-                "claude_write",
-                f.location(),
-                format!(
-                    "asks to write under a .claude folder (\"{}\"); a worker must not change .claude, so do that step yourself or leave it out",
-                    f.text(seg).trim()
-                ),
-            ));
+    }
+    (out.into_iter().collect(), found)
+}
+
+/// What the rule knows about one clause.
+struct ClauseFacts {
+    range: Range<usize>,
+    /// Where each `.claude` name of the clause starts, except a name inside a
+    /// quoted ban (a backtick fragment with whitespace and a negation word).
+    targets: Vec<usize>,
+    /// REVFIX-1: the clause names another path or a file name
+    /// (`Field::names_path`).
+    names_path: bool,
+    writes: bool,
+    negated: bool,
+    /// An adding word with a colon and no other write word: `新增：…`.
+    list_head: bool,
+}
+
+impl ClauseFacts {
+    /// REVFIX-1: a `.claude` name outside a quoted ban, or another path or
+    /// file name.
+    fn has_target(&self) -> bool {
+        !self.targets.is_empty() || self.names_path
+    }
+}
+
+impl Field {
+    fn clause_facts(&self, range: Range<usize>) -> ClauseFacts {
+        let plain = self.unquoted(range.clone());
+        let targets = claude_dir_starts(&self.chars[range.clone()])
+            .into_iter()
+            .map(|s| s + range.start)
+            .filter(|&s| {
+                !self.fragments.iter().any(|fr| {
+                    let t = self.text(fr.clone());
+                    fr.contains(&s) && t.chars().any(char::is_whitespace) && has_negation(&t)
+                })
+            })
+            .collect();
+        let writes = has_write_word(&plain);
+        let (rest, adding) = without_adding_words(&plain);
+        let names_path = self.names_path(range.clone());
+        ClauseFacts {
+            range,
+            targets,
+            names_path,
+            writes,
+            negated: has_negation(&plain),
+            list_head: adding && !has_write_word(&rest),
+        }
+    }
+
+    /// REVFIX-1: whether `range` names a path or a file name other than a
+    /// `.claude` name: a word (a run of ASCII characters other than spaces,
+    /// backticks, quotes, brackets and `,;`), inside or outside backticks,
+    /// that holds a `/` or a backslash, or that ends, once trailing dots are
+    /// dropped, in a dot followed by letters or digits (`a.txt`, `Cargo.toml`).
+    /// A word with a `.claude` folder name in it is left to `targets`, so a
+    /// name inside a quoted ban is not a target here either.
+    fn names_path(&self, range: Range<usize>) -> bool {
+        let is_word_char = |c: char| {
+            c.is_ascii_graphic() && !matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';')
+        };
+        let mut i = range.start;
+        while i < range.end {
+            if !is_word_char(self.chars[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < range.end && is_word_char(self.chars[i]) {
+                i += 1;
+            }
+            let word = &self.chars[start..i];
+            if !claude_dir_starts(word).is_empty() {
+                continue;
+            }
+            let mut trimmed = word;
+            while let [rest @ .., '.' | ':' | '!' | '?'] = trimmed {
+                trimmed = rest;
+            }
+            let ends_in_extension = trimmed.iter().rposition(|&c| c == '.').is_some_and(|dot| {
+                dot + 1 < trimmed.len() && trimmed[dot + 1..].iter().all(char::is_ascii_alphanumeric)
+            });
+            if word.iter().any(|&c| c == '/' || c == '\\') || ends_in_extension {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the name at `start` is a bare `.claude` or `.claude/` with
+    /// another entry of a list beside it (a `、`, `，` or `,` before or after).
+    fn bare_list_entry(&self, clause: &Range<usize>, sentence: &Range<usize>, start: usize) -> bool {
+        let mut end = start + CLAUDE_DIR_LEN;
+        if self.chars.get(end) == Some(&'/') && end < clause.end {
+            end += 1;
+        }
+        let is_sep = |c: char| matches!(c, '、' | '，' | ',');
+        let ends_clean = end >= clause.end || self.chars[end].is_whitespace() || is_sep(self.chars[end]) || self.chars[end] == '`';
+        let starts_clean = start == clause.start
+            || matches!(self.chars[start - 1], '、' | '，' | ',' | '：' | ':' | '`')
+            || self.chars[start - 1].is_whitespace();
+        if !(ends_clean && starts_clean) {
+            return false;
+        }
+        let mut b = start;
+        if b > sentence.start && self.chars[b - 1] == '`' {
+            b -= 1;
+        }
+        while b > sentence.start && self.chars[b - 1].is_whitespace() {
+            b -= 1;
+        }
+        let mut a = end;
+        if a < sentence.end && self.chars[a] == '`' {
+            a += 1;
+        }
+        while a < sentence.end && self.chars[a].is_whitespace() {
+            a += 1;
+        }
+        (b > sentence.start && is_sep(self.chars[b - 1])) || (a < sentence.end && is_sep(self.chars[a]))
+    }
+
+    /// Whether the clause starts with its first `.claude` name, after spaces,
+    /// a backtick, and one of `和`, `與`, `及`, `and`, `or`.
+    fn starts_with_name(&self, facts: &ClauseFacts) -> bool {
+        let Some(&first) = facts.targets.first() else {
+            return false;
+        };
+        let r = &facts.range;
+        let skip_spaces = |mut i: usize| {
+            while i < r.end && self.chars[i].is_whitespace() {
+                i += 1;
+            }
+            i
+        };
+        let skip_tick = |i: usize| if i < r.end && self.chars[i] == '`' { i + 1 } else { i };
+        let mut i = skip_spaces(r.start);
+        i = skip_spaces(skip_tick(i));
+        if i < r.end && matches!(self.chars[i], '和' | '與' | '及') {
+            i = skip_spaces(i + 1);
+        } else {
+            let word: String = self.chars[i..r.end].iter().take(3).collect::<String>().to_ascii_lowercase();
+            for w in ["and", "or"] {
+                let after = self.chars.get(i + w.len()).filter(|_| i + w.len() < r.end);
+                if word.starts_with(w) && after.is_some_and(|c| c.is_whitespace() || *c == '`') {
+                    i = skip_spaces(i + w.len());
+                    break;
+                }
+            }
+        }
+        i = skip_tick(i);
+        if i < r.end && self.chars[i] == '~' && self.chars.get(i + 1) == Some(&'/') {
+            i += 2;
+        }
+        i == first
+    }
+}
+
+/// SPECLINT-1: for each clause, whether it or a clause that shares a
+/// parenthetical aside with it has a negation. A clause that opens an aside
+/// and the clauses up to the one that closes it are one unit for the
+/// negation only (`不改 a、b（含 c，由指揮官改）、.claude/`): the write words and
+/// the names stay judged clause by clause.
+fn shared_negation(f: &Field, sentence: &Range<usize>, clauses: &[ClauseFacts]) -> Vec<bool> {
+    let clause_of = |pos: usize| clauses.iter().position(|c| c.range.contains(&pos) || c.range.end == pos);
+    // linked[k]: clause k and clause k + 1 are inside one aside
+    let mut linked = vec![false; clauses.len()];
+    for (o, c) in f.asides(sentence.clone()) {
+        if let (Some(i), Some(j)) = (clause_of(o), clause_of(c)) {
+            linked[i..j.max(i)].iter_mut().for_each(|l| *l = true);
+        }
+    }
+    let mut out = vec![false; clauses.len()];
+    let mut k = 0;
+    while k < clauses.len() {
+        let mut end = k;
+        while end < clauses.len() - 1 && linked[end] {
+            end += 1;
+        }
+        let any = clauses[k..=end].iter().any(|c| c.negated);
+        out[k..=end].iter_mut().for_each(|o| *o = any);
+        k = end + 1;
+    }
+    out
+}
+
+fn claude_write(f: &Field) -> Option<Finding> {
+    for sentence in f.segments() {
+        let facts: Vec<ClauseFacts> =
+            f.clauses(sentence.clone()).into_iter().map(|r| f.clause_facts(r)).collect();
+        let mut negated = shared_negation(f, &sentence, &facts);
+        // A trailing negation clause (`…由指揮官之後自己改，這件不碰`): a negation
+        // word, no name and no write word of its own, last in the sentence. It
+        // covers the clauses before it; with a write word of its own
+        // (`改 .claude/x，不改 src/a.rs`) it is a different instruction.
+        if let [before @ .., last] = facts.as_slice() {
+            if has_ban(&f.unquoted(last.range.clone())) && last.targets.is_empty() && !last.writes {
+                negated[..before.len()].iter_mut().for_each(|n| *n = true);
+            }
+        }
+        // (the verdict of the clause before, whether it began a list entry)
+        let mut before: Option<(bool, bool)> = None;
+        for (k, clause) in facts.iter().enumerate() {
+            let range = clause.range.clone();
+            let all_bare = !clause.targets.is_empty()
+                && clause.targets.iter().all(|&s| f.bare_list_entry(&range, &sentence, s));
+            let continuation = before.is_some() && !clause.writes && f.starts_with_name(clause);
+            let (refused, active, list) = match before {
+                Some((active, list)) if continuation => {
+                    (active && !negated[k] && !(list && all_bare), active && !negated[k], list)
+                }
+                _ => {
+                    let active = clause.writes && !negated[k];
+                    let refused = active && !clause.targets.is_empty() && !(clause.list_head && all_bare);
+                    (refused, active, clause.list_head)
+                }
+            };
+            before = Some((active, list));
+            if refused {
+                return Some(claude_write_finding(f, range));
+            }
+            // REVFIX-1: a write with no target of its own writes to the target
+            // of the nearest earlier clause of the sentence that has one
+            // (`在 .claude/x 裡，把第一段改掉`). When that clause names a `.claude`
+            // folder and neither writes nor is negated itself, the sentence is
+            // refused as if the write stood there.
+            if clause.writes && !negated[k] && !clause.has_target() {
+                let nearest = (0..k).rev().find(|&j| facts[j].has_target());
+                if let Some(j) = nearest {
+                    let folder = &facts[j];
+                    if !folder.targets.is_empty() && !folder.writes && !negated[j] {
+                        return Some(claude_write_finding(f, folder.range.start..range.end));
+                    }
+                }
+            }
         }
     }
     None
+}
+
+/// The `claude_write` finding, quoting `quoted` of the field.
+fn claude_write_finding(f: &Field, quoted: Range<usize>) -> Finding {
+    Finding::new(
+        "claude_write",
+        f.location(),
+        format!(
+            "asks to write under a .claude folder (\"{}\"); a worker must not change .claude, so do that step yourself or leave it out",
+            f.text(quoted).trim()
+        ),
+    )
 }
 
 fn is_path_char(c: char) -> bool {
@@ -378,9 +735,28 @@ struct PathRef {
     path: String,
 }
 
+impl PathRef {
+    /// SMALL-17 (b): a path with a `*` in it is a glob.
+    fn is_glob(&self) -> bool {
+        self.path.contains('*')
+    }
+
+    /// SMALL-17 (b): whether `missing_path` checks it: a path whose last part
+    /// has no dot and that does not end in `/` (`plan/log`, `docs/low`) is
+    /// more often a noun than a path, and is checked only when it is the
+    /// whole text of a backtick fragment.
+    fn checked(&self, f: &Field) -> bool {
+        let last = self.path.rsplit('/').next().unwrap_or("");
+        self.path.ends_with('/')
+            || last.contains('.')
+            || f.fragments.iter().any(|fr| fr.start == self.start && fr.end == self.end)
+    }
+}
+
 /// Every run of path characters with a `/` in it that could be a path of
 /// this repository: not after `$~%\:`, not absolute or relative to `.`/`..`,
-/// no `//`, `...` or `..` part.
+/// no `//`, `...` or `..` part. SMALL-17 (b): a run directly followed by `*`
+/// goes on over the `*` and the path characters after it, and is a glob.
 fn path_refs(f: &Field) -> Vec<PathRef> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -390,7 +766,7 @@ fn path_refs(f: &Field) -> Vec<PathRef> {
             continue;
         }
         let start = i;
-        while i < f.chars.len() && is_path_char(f.chars[i]) {
+        while i < f.chars.len() && (is_path_char(f.chars[i]) || f.chars[i] == '*') {
             i += 1;
         }
         let token: String = f.chars[start..i].iter().collect();
@@ -416,22 +792,97 @@ fn under(root: &Path, path: &str) -> PathBuf {
     path.split('/').filter(|p| !p.is_empty()).fold(root.to_path_buf(), |acc, p| acc.join(p))
 }
 
-/// Whether the 12 characters before the path say it is to be created.
+/// SMALL-17 (b): whether `name` matches `pattern`, where `*` matches any run
+/// of characters (inside one path part: the caller matches part by part).
+fn wildcard_match(pattern: &[char], name: &[char]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some(('*', rest)) => (0..=name.len()).any(|k| wildcard_match(rest, &name[k..])),
+        Some((c, rest)) => name.first() == Some(c) && wildcard_match(rest, &name[1..]),
+    }
+}
+
+/// SMALL-17 (b): whether anything under `dir` matches the `/`-separated
+/// `parts`, a directory when `dir_wanted` and it is the last part.
+fn glob_exists(dir: &Path, parts: &[&str], dir_wanted: bool) -> bool {
+    let Some((part, rest)) = parts.split_first() else {
+        return if dir_wanted { dir.is_dir() } else { dir.exists() };
+    };
+    if !part.contains('*') {
+        return glob_exists(&dir.join(part), rest, dir_wanted);
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    let pattern: Vec<char> = part.chars().collect();
+    entries.flatten().any(|e| {
+        let name: Vec<char> = e.file_name().to_string_lossy().chars().collect();
+        wildcard_match(&pattern, &name) && glob_exists(&e.path(), rest, dir_wanted)
+    })
+}
+
+/// SMALL-17 (b): the words that may stand between a new marker and its path
+/// (`new test files P`, `新檔 P`).
+const NEW_MARKER_WORDS: &[&str] = &[
+    "test", "tests", "file", "files", "module", "modules", "fixture", "fixtures", "script", "scripts",
+    "folder", "檔", "檔案", "測試檔", "模組",
+];
+
+/// SMALL-17 (b): the words that may join two paths of one list.
+const LIST_WORDS: &[&str] = &["and", "or", "與", "和", "及", "或"];
+
+/// Whether `text` is only `words` (ASCII words in any case), with spaces,
+/// backticks and the characters `extra_separators` between them.
+fn only_words(text: &[char], words: &[&str], extra_separators: &[char]) -> bool {
+    text.split(|c| c.is_whitespace() || *c == '`' || extra_separators.contains(c))
+        .filter(|w| !w.is_empty())
+        .all(|w| {
+            let w: String = w.iter().collect::<String>().to_ascii_lowercase();
+            words.contains(&w.as_str())
+        })
+}
+
+/// Whether the path is said to be created: a `新`, `new` or `create` in the
+/// 12 characters before it, or (SMALL-17) one earlier in the same sentence
+/// with only `NEW_MARKER_WORDS`, spaces, backticks and colons in between.
 fn marked_new(f: &Field, r: &PathRef) -> bool {
     let before: String = f.chars[r.start.saturating_sub(12)..r.start].iter().collect();
     let lower = before.to_ascii_lowercase();
-    before.contains('新') || lower.contains("new") || lower.contains("create")
+    if before.contains('新') || lower.contains("new") || lower.contains("create") {
+        return true;
+    }
+    let Some(sentence) = f.segments().into_iter().find(|s| s.start <= r.start && r.start <= s.end) else {
+        return false;
+    };
+    let lower: Vec<char> = f.chars.iter().map(char::to_ascii_lowercase).collect();
+    ["新", "new", "create"].iter().any(|marker| {
+        let m: Vec<char> = marker.chars().collect();
+        (sentence.start..r.start).any(|i| {
+            let end = i + m.len();
+            end <= r.start
+                && lower[i..end] == m[..]
+                && only_words(&f.chars[end..r.start], NEW_MARKER_WORDS, &[':', '：'])
+        })
+    })
 }
 
 fn missing_paths(fields: &[Field], root: &Path) -> Vec<Finding> {
     let mut new_paths = BTreeSet::new();
     let mut named = Vec::new();
     for f in fields {
+        // SMALL-17 (b): the end of the path before and whether it was new,
+        // for a list of new paths (`新檔 a.rs、b.rs`).
+        let mut previous: Option<(usize, bool)> = None;
         for r in path_refs(f) {
-            if marked_new(f, &r) {
+            let follows_new = previous.is_some_and(|(end, new)| {
+                new && end <= r.start && only_words(&f.chars[end..r.start], LIST_WORDS, &['、', ',', '，'])
+            });
+            let new = follows_new || marked_new(f, &r);
+            if new {
                 new_paths.insert(r.path.clone());
             }
-            named.push((f, r.path));
+            previous = Some((r.end, new));
+            if r.checked(f) {
+                named.push((f, r.path));
+            }
         }
     }
     let mut reported = BTreeSet::new();
@@ -444,8 +895,13 @@ fn missing_paths(fields: &[Field], root: &Path) -> Vec<Finding> {
         if first.is_empty() || !root.join(first).exists() {
             continue;
         }
-        let target = under(root, &path);
-        let there = if path.ends_with('/') { target.is_dir() } else { target.exists() };
+        let there = if path.contains('*') {
+            let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+            glob_exists(root, &parts, path.ends_with('/'))
+        } else {
+            let target = under(root, &path);
+            if path.ends_with('/') { target.is_dir() } else { target.exists() }
+        };
         if !there {
             out.push(Finding::new(
                 "missing_path",
@@ -456,6 +912,59 @@ fn missing_paths(fields: &[Field], root: &Path) -> Vec<Finding> {
             ));
             reported.insert(path);
         }
+    }
+    out
+}
+
+/// Whether `name` is an integration test target of the repository at `root`:
+/// `tests/NAME.rs` or `tests/NAME/main.rs` is a file there. `name` has only
+/// letters, digits, `_` and `-` (`test_scope` reads no other), so it cannot
+/// leave `tests/`.
+fn is_test_target(root: &Path, name: &str) -> bool {
+    let tests = root.join("tests");
+    tests.join(format!("{name}.rs")).is_file() || tests.join(name).join("main.rs").is_file()
+}
+
+/// Whether targets may live elsewhere or under other names, so a file check
+/// cannot tell: no readable `Cargo.toml` at the top of `root`, or one with
+/// `[workspace]` or `[[test]]`.
+fn targets_unknowable(root: &Path) -> bool {
+    match std::fs::read_to_string(root.join("Cargo.toml")) {
+        Ok(text) => text.contains("[workspace]") || text.contains("[[test]]"),
+        Err(_) => true,
+    }
+}
+
+/// The names after `--test` in a `cargo test` command that verify would append
+/// to the approved test command (`test_scope::cargo_test_names`, the same
+/// reading) and that are no integration test target of `root`. Once per name,
+/// at its first mention. A name whose test file the spec names by path is left: the
+/// task creates the file and verify takes it from the diff.
+fn unknown_test_targets(fields: &[Field], root: &Path) -> Vec<Finding> {
+    let texts: Vec<String> = fields.iter().map(|f| f.chars.iter().collect()).collect();
+    let mut by_path = BTreeSet::new();
+    let mut mentioned = Vec::new();
+    for (f, text) in fields.iter().zip(&texts) {
+        by_path.extend(crate::test_scope::test_path_mentions(text).into_iter().map(|(name, _)| name));
+        mentioned.extend(crate::test_scope::cargo_test_names(text).into_iter().map(|name| (f, name)));
+    }
+    if mentioned.is_empty() || targets_unknowable(root) {
+        return Vec::new();
+    }
+    let mut reported = BTreeSet::new();
+    let mut out = Vec::new();
+    for (f, name) in mentioned {
+        if by_path.contains(&name) || is_test_target(root, &name) || !reported.insert(name.clone()) {
+            continue;
+        }
+        out.push(Finding::new(
+            "unknown_test_target",
+            f.location(),
+            format!(
+                "--test {name} is no integration test target of the main work tree: there is neither tests/{name}.rs nor tests/{name}/main.rs, \
+                 so verify would fail at once with cargo's exit 101 before any test ran; fix the name, or name the new test file by its path in the spec"
+            ),
+        ));
     }
     out
 }
@@ -537,7 +1046,7 @@ fn missing_names(fields: &[Field], root: &Path) -> Vec<Finding> {
     for f in fields {
         for r in path_refs(f) {
             let target = under(root, &r.path);
-            if r.path.ends_with('/') || !target.is_file() {
+            if r.is_glob() || r.path.ends_with('/') || !target.is_file() {
                 continue;
             }
             for name in names_after(f, &r) {
@@ -636,12 +1145,22 @@ fn two_dot_range(t: &str) -> bool {
     [a, b].iter().all(|s| !s.is_empty() && !s.starts_with('/') && !s.ends_with('/'))
 }
 
+/// SMALL-17 (b): `diff` as a whole word, ASCII-case-insensitive: no ASCII
+/// letter, digit or `_` right before or after it (`record_diff`, `different`
+/// and `diffs` are not the word).
+fn diff_word_at(lower: &[char], i: usize) -> bool {
+    let word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
+    lower[i..].starts_with(&['d', 'i', 'f', 'f'])
+        && (i == 0 || !word(&lower[i - 1]))
+        && !lower.get(i + 4).is_some_and(word)
+}
+
 fn two_dot_diff(f: &Field) -> Option<Finding> {
     let lower: Vec<char> = f.chars.iter().map(char::to_ascii_lowercase).collect();
     let diff: Vec<char> = "diff".chars().collect();
     let mut hits: BTreeMap<usize, String> = BTreeMap::new();
     for i in 0..lower.len() {
-        if !lower[i..].starts_with(&diff) {
+        if !diff_word_at(&lower, i) {
             continue;
         }
         let from = i + diff.len();
@@ -659,9 +1178,14 @@ fn two_dot_diff(f: &Field) -> Option<Finding> {
             while j < end && !(f.chars[j].is_whitespace() || f.chars[j] == '`') {
                 j += 1;
             }
+            // SMALL-17 (b): brackets and punctuation around a token are not
+            // part of a range, so Rust's `(..` and `..,` have an empty side.
             let token = f.text(s..j);
-            if two_dot_range(&token) {
-                hits.insert(s, token);
+            let token = token
+                .trim_start_matches(['(', '[', '（'])
+                .trim_end_matches([',', '.', ';', ':', ')', ']', '）', '。', '，', '、']);
+            if two_dot_range(token) {
+                hits.insert(s, token.to_string());
             }
         }
     }

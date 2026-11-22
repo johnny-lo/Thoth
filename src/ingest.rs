@@ -66,8 +66,7 @@ fn reject(
 /// 4. a cited evidence's blob is missing or no longer hashes to its digest
 /// 5. the task is High Risk and a claim cites no `control_plane` evidence
 ///    (`research` claims excepted)
-/// 6. the run's diff modified or deleted a protected file (or added a file
-///    named like a check word) that no `protected_change` claim declares
+/// 6. (retired by LEAN-1: the diff evidence lists the protected changes and the commander approves them; the number is not reused)
 /// 7. the task is a research task, the status is `completed`, and no claim is
 ///    of kind `research`
 ///
@@ -944,8 +943,7 @@ mod tests {
         }
     }
 
-    /// AC4: rule 5 still applies to a `protected_change` claim, and is checked
-    /// before rule 6.
+    /// AC4: rule 5 still applies to a `protected_change` claim (rule 6, which came after it, is retired).
     #[test]
     fn rule5_still_applies_to_a_protected_change_claim() {
         let conn = Connection::open_in_memory().unwrap();

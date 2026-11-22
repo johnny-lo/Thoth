@@ -340,39 +340,48 @@ fn j_a_run_that_was_continued_cannot_be_resumed() {
 // S3-10 AC10, moved from tests/handover.rs (RJ-1 removed the handover; the
 // handoff of a named re-dispatch it checked stays) ---------------------------
 
-/// One implementer run row of the task.
+/// One implementer run of the task, as `thoth status TASK --json` shows it.
 #[derive(Debug, Clone)]
 struct RunRow {
     run_id: String,
     attempt: i64,
     status: String,
     interrupted_reason: Option<String>,
-    spec: Value,
     run_dir: String,
 }
 
-/// The task's implementer runs, oldest first.
+/// The task's implementer runs, oldest first (by run id).
 fn runs(f: &Fixture, task_id: &str) -> Vec<RunRow> {
-    let conn = f.state_conn();
-    let mut stmt = conn
-        .prepare(
-            "SELECT run_id, attempt, status, interrupted_reason, spec, run_dir
-             FROM runs WHERE task_id = ?1 AND role = 'implementer' ORDER BY run_id",
-        )
-        .unwrap();
-    stmt.query_map([task_id], |r| {
-        Ok(RunRow {
-            run_id: r.get(0)?,
-            attempt: r.get(1)?,
-            status: r.get(2)?,
-            interrupted_reason: r.get(3)?,
-            spec: serde_json::from_str(&r.get::<_, String>(4)?).unwrap(),
-            run_dir: r.get(5)?,
+    let mut c = f.cmd();
+    c.args(["status", task_id, "--json"]);
+    let v: Value = serde_json::from_slice(&f.run_ok(c, "status --json")).unwrap();
+    let mut rows: Vec<RunRow> = v["runs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("status {task_id} --json has no runs array: {v}"))
+        .iter()
+        .filter(|r| r["role"] == "implementer")
+        .map(|r| RunRow {
+            run_id: r["run_id"].as_str().unwrap().to_string(),
+            attempt: r["attempt"].as_i64().unwrap(),
+            status: r["status"].as_str().unwrap().to_string(),
+            interrupted_reason: r["interrupted_reason"].as_str().map(str::to_string),
+            run_dir: r["run_dir"].as_str().unwrap().to_string(),
         })
-    })
-    .unwrap()
-    .collect::<rusqlite::Result<Vec<_>>>()
-    .unwrap()
+        .collect();
+    rows.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+    rows
+}
+
+/// The rework section of a run's prompt: from `## Previous attempt was
+/// rejected` up to the next `\n## ` heading (or the end).
+fn rework_section(run_dir: &str) -> String {
+    let prompt = fs::read_to_string(Path::new(run_dir).join("prompt.txt")).unwrap();
+    let start = prompt
+        .find("## Previous attempt was rejected")
+        .unwrap_or_else(|| panic!("no rework section in the prompt of {run_dir}: {prompt}"));
+    let rest = &prompt[start..];
+    let end = rest[3..].find("\n## ").map(|i| i + 3).unwrap_or(rest.len());
+    rest[..end].to_string()
 }
 
 fn wait_task(f: &Fixture, task_id: &str) -> String {
@@ -415,7 +424,7 @@ fn ac10_a_handoff_dispatch_keeps_the_previous_runs_rework() {
     assert_eq!(first.attempt, 2);
     assert_eq!(first.status, "interrupted");
     assert_eq!(first.interrupted_reason.as_deref(), Some("quota"));
-    assert!(first.spec.get("rework").is_some(), "{}", first.spec);
+    let first_rework = rework_section(&first.run_dir);
 
     let d = f.dispatch(&task_id, "a-claude", "ok", &[]);
     assert_ne!(d["handoff"], Value::Null, "{d}");
@@ -425,7 +434,7 @@ fn ac10_a_handoff_dispatch_keeps_the_previous_runs_rework() {
     wait_task(&f, &task_id);
 
     let new = runs(&f, &task_id).into_iter().find(|r| r.run_id == new_id).unwrap();
-    assert_eq!(new.spec["rework"], first.spec["rework"], "{}", new.spec);
+    assert_eq!(rework_section(&new.run_dir), first_rework);
     let prompt = fs::read_to_string(Path::new(&new.run_dir).join("prompt.txt")).unwrap();
     assert!(prompt.contains("## Previous attempt was rejected"), "{prompt}");
     assert!(prompt.contains("This is attempt 2"), "{prompt}");

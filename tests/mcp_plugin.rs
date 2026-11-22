@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const REPO_PLUGIN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugins/thoth");
 const SPEC: &str = r#"{"goal":"say hello","acceptance_criteria":["AC1: prints hello"],"constraints":[],"non_goals":[],"excluded_alternatives":[],"risk":"low"}"#;
-const STATE_CHANGING: [&str; 18] = [
+const STATE_CHANGING: [&str; 21] = [
     "thoth_init",
     "thoth_task_create",
     "thoth_task_update_spec",
@@ -26,6 +26,10 @@ const STATE_CHANGING: [&str; 18] = [
     "thoth_checks_add",
     "thoth_checks_approve",
     "thoth_checks_remove",
+    // SMALL-18 T6
+    "thoth_pipeline_start",
+    "thoth_pipeline_stop",
+    "thoth_pipeline_new",
 ];
 
 struct Server {
@@ -35,7 +39,7 @@ struct Server {
 }
 
 fn command(f: &common::Fixture, extra: &[&str], env_root: Option<&Path>) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
     c.arg("mcp")
         .args(extra)
         .current_dir(f.repo.path())

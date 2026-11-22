@@ -101,6 +101,8 @@ type World = {
   closed: string[]
   /** How many times `thoth models --json` ran. */
   modelRuns: () => number
+  /** One-shot: the next thoth call with these arguments (joined with spaces) waits for `until` before it answers. */
+  hold?: { key: string; until: Promise<void> }
 }
 
 const json = (value: unknown): Reply => ({ stdout: JSON.stringify(value) })
@@ -167,8 +169,13 @@ function world(on: On, replies: Record<string, Reply>): World {
     w.submitted.push(e.text)
     return { text: e.text }
   })
-  on('process.run', (_, e) => {
+  on('process.run', async (_, e) => {
     w.calls.push({ argv: e.argv, env: e.init?.env, cwd: e.init?.cwd })
+    if (w.hold !== undefined && e.argv[0] !== 'git' && e.argv.slice(1).join(' ') === w.hold.key) {
+      const { until } = w.hold
+      w.hold = undefined
+      await until
+    }
     if (e.argv[0] === 'git') {
       return { value: { exitCode: 0, stdout: '/repo/.git\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
@@ -2021,4 +2028,195 @@ test('panel3_a_refused_dispatch_is_told', async ($, on) => {
   await w.clock.settle()
   expect(w.toasts).toContain('MOD-2 stream: profile claude-b failed its auth check')
   expect(w.toasts.filter(text => text.startsWith('Dispatched again'))).toEqual([])
+})
+
+// ---- SMALL-15: the MOD-1d and MOD-2 plugin bugs ----
+
+const THOTH_COMMAND = {
+  command: 'thoth',
+  args: '',
+  origin: { kind: 'composer' },
+  presentation: { isFullscreen: true, columns: 160 },
+} as const
+
+/** Makes the next call with these thoth arguments wait; the returned function lets it answer. */
+function holdNext(w: World, key: string): () => void {
+  let release: () => void = () => {}
+  const until = new Promise<void>(resolve => {
+    release = resolve
+  })
+  w.hold = { key, until }
+  return release
+}
+
+const ranCount = (w: World, args: string) => w.calls.filter(call => call.argv.slice(1).join(' ') === args).length
+
+const SMALL15_REPLIES = (): Record<string, Reply> => ({
+  ...TABLE_REPLIES(),
+  'checks list --json': CHECKS_REPLY,
+})
+
+test('small15_a_forced_command_during_a_refresh_runs_again_after_it', async ($, on) => {
+  const w = world(on, SMALL15_REPLIES())
+  const release = holdNext(w, 'status --json')
+  await start($, w)
+  expect(ranCount(w, 'status --json')).toBe(1)
+  // The command waits for the running refresh and the forced one after it: do not await it before the release.
+  const command = $.command.run(THOTH_COMMAND)
+  release()
+  const ran = await command
+  await w.clock.settle()
+  expect(ranCount(w, 'status --json')).toBe(2)
+  expect(ranCount(w, 'checks list --json')).toBe(2)
+  expect(ranCount(w, 'models --json')).toBe(2)
+  expect(ranCount(w, 'profile list --json')).toBe(2)
+  expect(w.opened).toEqual(['thoth'])
+  expect(ran).toMatchObject({ text: expect.any(String) })
+  expect((ran as { text: string }).text.length).toBeGreaterThan(0)
+})
+
+test('small15_unforced_requests_during_a_refresh_are_still_dropped', async ($, on) => {
+  const w = world(on, SMALL15_REPLIES())
+  const release = holdNext(w, 'status --json')
+  await start($, w)
+  await $.prompt.submit({ text: 'hello', wait: false, origin: { kind: 'composer' } })
+  await w.clock.settle()
+  expect(ranCount(w, 'status --json')).toBe(1)
+  const first = $.command.run(THOTH_COMMAND)
+  const second = $.command.run(THOTH_COMMAND)
+  release()
+  await Promise.all([first, second])
+  await w.clock.settle()
+  expect(ranCount(w, 'status --json')).toBe(2)
+  expect(ranCount(w, 'checks list --json')).toBe(2)
+  // One timer is pending after the last refresh, not two.
+  await w.clock.advance(10_000)
+  expect(ranCount(w, 'status --json')).toBe(3)
+})
+
+const bandCounts = async ($: Engine) => {
+  const line = await band($, 'terminal')
+  const text = (await line.find({ type: 'Text', text: /Thoth · / }))?.text ?? ''
+  await line.unmount()
+  return text
+}
+
+const LINT_ROW = "● lint waiting for the commander's approval"
+const KEPT_ROWS = ["● plugin-test changed, waiting for the commander's approval again", LINT_ROW]
+
+test('small15_a_failing_checks_list_keeps_the_rows_last_read', async ($, on) => {
+  const w = world(on, SMALL15_REPLIES())
+  await start($, w)
+  const failures: Reply[] = [{ exitCode: 1, stderr: 'boom' }, { stdout: 'not json' }, { stdout: '{}' }]
+  for (const failure of failures) {
+    w.replies['checks list --json'] = failure
+    const before = ranCount(w, 'checks list --json')
+    await $.command.run(THOTH_COMMAND)
+    await w.clock.settle()
+    expect(ranCount(w, 'checks list --json')).toBe(before + 1)
+    let ui = await pane($, 'terminal')
+    expect((await between(ui, 1, 2)).slice(3)).toEqual(KEPT_ROWS)
+    for (const text of await texts(ui)) expect(text).not.toContain('boom')
+    await ui.unmount()
+    expect(await bandCounts($)).toContain('5 with the commander')
+    expect(w.toasts.filter(text => text.includes('boom'))).toEqual([])
+
+    // A failed read still counts as a read: one more in the next minute, not one at every refresh.
+    for (let i = 0; i < 6; i++) await w.clock.advance(10_000)
+    expect(ranCount(w, 'checks list --json')).toBe(before + 2)
+    ui = await pane($, 'terminal')
+    expect((await between(ui, 1, 2)).slice(3)).toEqual(KEPT_ROWS)
+    await ui.unmount()
+    expect(await bandCounts($)).toContain('5 with the commander')
+  }
+})
+
+test('small15_a_checks_list_that_works_again_replaces_the_rows', async ($, on) => {
+  const w = world(on, SMALL15_REPLIES())
+  await start($, w)
+  const rows = async () => {
+    const ui = await pane($, 'terminal')
+    const found = (await between(ui, 1, 2)).slice(3)
+    await ui.unmount()
+    return found
+  }
+  w.replies['checks list --json'] = { exitCode: 1, stderr: 'boom' }
+  await $.command.run(THOTH_COMMAND)
+  await w.clock.settle()
+  expect(await rows()).toEqual(KEPT_ROWS)
+
+  w.replies['checks list --json'] = json({ checks: [] })
+  await $.command.run(THOTH_COMMAND)
+  await w.clock.settle()
+  expect(await rows()).toEqual([])
+  expect(await bandCounts($)).toContain('3 with the commander')
+
+  w.replies['checks list --json'] = { exitCode: 1, stderr: 'boom' }
+  await $.command.run(THOTH_COMMAND)
+  await w.clock.settle()
+  expect(await rows()).toEqual([])
+
+  w.replies['checks list --json'] = json({ checks: [{ check_id: 'doc', status: 'pending' }] })
+  await $.command.run(THOTH_COMMAND)
+  await w.clock.settle()
+  expect(await rows()).toEqual(["● doc waiting for the commander's approval"])
+
+  // A new session starts from no rows, even when the first read of it fails.
+  w.replies['checks list --json'] = { exitCode: 1, stderr: 'boom' }
+  await start($, w)
+  expect(await rows()).toEqual([])
+})
+
+const T1_RUNS = { task_id: 'T1', title: 'S3-9 handoff', status: 'in_review', runs: [ROW_C] }
+const ROW_T4 = runRow(RUN_Q, 'implementer', 'running', 'claude-b', 'sonnet')
+const T4_WATCH = { task_id: 'T4', title: 'MOD-2 stream', status: 'failed', runs: [ROW_T4] }
+
+const WATCH_PRESS_REPLIES = (): Record<string, Reply> => ({
+  ...WATCH_REPLIES(),
+  'status T1 --json': json(T1_RUNS),
+  [`transcript ${RUN_C} --offset 0 --json`]: json(transcript(RUN_C, [step('message', { text: 'Reviewing' })], { next_offset: 50 })),
+  'status T4 --json': json(T4_WATCH),
+  [`transcript ${RUN_Q} --offset 0 --json`]: json(transcript(RUN_Q, [step('message', { text: 'Fixing' })], { next_offset: 30 })),
+})
+
+test('small15_a_watch_press_during_another_tasks_poll_polls_the_pressed_task_at_once', async ($, on) => {
+  const w = world(on, WATCH_PRESS_REPLIES())
+  await watchT2($, w)
+  const main = await pane($, 'terminal')
+  const release = holdNext(w, 'status T2 --json')
+  // The main refresh's poll for T2 waits at the hold.
+  await w.clock.advance(10_000)
+  expect(ranCount(w, 'status T2 --json')).toBe(2)
+  await main.press({ key: 'watch:T1' })
+  release()
+  await w.clock.settle()
+  await main.unmount()
+  expect(ranCount(w, 'status T1 --json')).toBe(1)
+  expect(ranCount(w, `transcript ${RUN_C} --offset 0 --json`)).toBe(1)
+  const ui = await runPane($, 'terminal')
+  const lines = await textsOf(ui)
+  expect(lines[0]).toBe('S3-9 handoff · reviewer · claude-b · opus · running')
+  expect(lines).toContain('│ Reviewing')
+  expect(lines).not.toContain('● ran cargo test')
+  await ui.unmount()
+})
+
+test('small15_several_presses_during_one_poll_poll_only_the_last_task', async ($, on) => {
+  const w = world(on, WATCH_PRESS_REPLIES())
+  await watchT2($, w)
+  const main = await pane($, 'terminal')
+  const release = holdNext(w, 'status T2 --json')
+  await w.clock.advance(10_000)
+  await main.press({ key: 'watch:T1' })
+  await main.press({ key: 'watch:T4' })
+  release()
+  await w.clock.settle()
+  await main.unmount()
+  expect(ranCount(w, 'status T4 --json')).toBe(1)
+  expect(ranCount(w, 'status T1 --json')).toBe(0)
+  const ui = await runPane($, 'terminal')
+  const lines = await textsOf(ui)
+  expect(lines[0]).toBe('MOD-2 stream · implementer · claude-b · sonnet · running')
+  expect(lines).toContain('│ Fixing')
+  await ui.unmount()
 })

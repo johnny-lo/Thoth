@@ -321,11 +321,11 @@ fn claude_live_timeout_ends_claude_at_once() {
     let marker = f.home_path().join("claude-finished.txt");
     let started_file = f.home_path().join("claude-hang-started.txt");
     // The stand-in hangs for HANG_SECS, far past the 2 s timeout: the
-    // "ended at once" bound below is the timeout plus 10 s, under half of
-    // that, so a thoth that waited for the stand-in to finish on its own
-    // would still fail, while the few seconds kill_tree's confirmation and
-    // the exit take under load pass.
-    const HANG_SECS: u64 = 30;
+    // "ended at once" bound below is the timeout plus 10 s, under the
+    // HANG_SECS the stand-in would hang on its own, so a thoth that waited
+    // for the stand-in to finish on its own would still fail, while the few
+    // seconds kill_tree's confirmation and the exit take under load pass.
+    const HANG_SECS: u64 = 14;
     let v = refresh_json(&f, |c| {
         c.env("FAKE_CLAUDE_USAGE", "hang")
             .env("FAKE_CLAUDE_HANG_SECS", HANG_SECS.to_string())
@@ -341,7 +341,7 @@ fn claude_live_timeout_ends_claude_at_once() {
     let since_start = returned.duration_since(started).unwrap_or_default();
     assert!(
         since_start < std::time::Duration::from_secs(12),
-        "took {since_start:?} after the start; the bound is the 2s timeout plus 10s, under half the \
+        "took {since_start:?} after the start; the bound is the 2s timeout plus 10s, under the \
          {HANG_SECS}s the stand-in would hang on its own"
     );
     assert_eq!(refresh_of(&v)["status"], "failed", "{v}");

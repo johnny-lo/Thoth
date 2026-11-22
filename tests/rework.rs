@@ -699,7 +699,7 @@ fn a_task_that_moves_to_another_entry_status_mid_dispatch_is_refused() {
         .unwrap();
 
     let marker = f.home_path().join("auth-probe-started");
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_thoth"))
+    let child = common::scrubbed(std::process::Command::new(env!("CARGO_BIN_EXE_thoth")))
         .args(["dispatch", &task_id, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium"])
         .current_dir(f.repo_path())
         .env("THOTH_HOME", f.home_path())

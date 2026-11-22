@@ -2,7 +2,9 @@
 """tests-no-db check: tests must not open the database (TESTS-1).
 
 Scans every ``.rs`` file under ``tests/`` for lines that mention rusqlite,
-``Connection::open``, ``state.db`` or ``global.db``, and compares the count per
+``Connection::open``, ``state.db``, ``global.db``, ``state_conn`` or
+``global_conn`` (the last two are the Fixture methods that return a
+connection; counted since TESTGAP-2), and compares the count per
 file with ``scripts/tests_db_allowlist.txt``. The allowlist records what is
 allowed *today*; a file not in it must have no such line, a listed file may
 not grow, and a listed file that shrank must have its number lowered. The
@@ -36,7 +38,7 @@ import re
 import sys
 from pathlib import Path, PurePosixPath
 
-TOKENS = ("rusqlite", "Connection::open", "state.db", "global.db")
+TOKENS = ("rusqlite", "Connection::open", "state.db", "global.db", "state_conn", "global_conn")
 DEFAULT_ALLOWLIST = "scripts/tests_db_allowlist.txt"
 TESTS_DIR = "tests"
 MAX_LINES_SHOWN = 5

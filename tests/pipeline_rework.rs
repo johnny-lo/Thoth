@@ -38,7 +38,8 @@ fn cmd(f: &Fixture) -> assert_cmd::Command {
     let mut c = f.cmd();
     for name in std::env::vars_os().map(|(name, _)| name) {
         let upper = name.to_string_lossy().to_uppercase();
-        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+        // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+        if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
             c.env_remove(&name);
         }
     }
@@ -1251,6 +1252,9 @@ fn grouped_quota_is_decided_by_the_models_group() {
     let seq = Seq::new(&f, &task, "ok,review_pass");
     let mut env = seq.env();
     env.push(("FAKE_AGY_DATA_DIR", data_s.as_str()));
+    // TEST-7a: the runner never finds this transcript, so no index row can
+    // appear before the stream ends; the fake gives up after 500 ms, not 30 s
+    env.push(("FAKE_AGY_INDEX_WAIT_MS", "500"));
     start(
         &f,
         &task,
@@ -1295,6 +1299,8 @@ fn an_unknown_quota_group_never_lets_another_groups_window_hold_an_entry_back() 
     let seq = Seq::new(&f, &task, "ok,review_pass");
     let mut env = seq.env();
     env.push(("FAKE_AGY_DATA_DIR", data_s.as_str()));
+    // TEST-7a: as in grouped_quota_is_decided_by_the_models_group
+    env.push(("FAKE_AGY_INDEX_WAIT_MS", "500"));
     env.push(("THOTH_TEST_PIPELINE_PREFLIGHT", "recommend_exit"));
     start(&f, &task, &["agy-a:claude-sonnet-4-6:medium"], &[REVIEW], &["--quota-threshold", "90"], &env);
     let doc = wait_show(&f, &task, "the agy dispatch", |v| !steps(v, "dispatch").is_empty());
@@ -1554,11 +1560,12 @@ struct McpServer {
 impl McpServer {
     fn start(f: &Fixture, envs: &[(&str, &str)]) -> Self {
         use std::process::Stdio;
-        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(std::process::Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp").arg("--default-repo").arg(f.repo_path()).arg("--max-wait").arg("5s").current_dir(f.repo_path());
         for name in std::env::vars_os().map(|(name, _)| name) {
             let upper = name.to_string_lossy().to_uppercase();
-            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+            // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
                 c.env_remove(&name);
             }
         }
@@ -1570,7 +1577,9 @@ impl McpServer {
             .env("THOTH_CODEX_BIN", env!("CARGO_BIN_EXE_fake-codex"))
             .env("THOTH_AGY_BIN", env!("CARGO_BIN_EXE_fake-agy"))
             .env("THOTH_ARENA_URL", common::offline_arena_url(f.home.path()))
-            .env("FAKE_CHECK_DIR", f.home_path().join("check-gates"));
+            .env("FAKE_CHECK_DIR", f.home_path().join("check-gates"))
+            // TEST-7a: the 100 ms poll Fixture::cmd sets (TEST-2), for the runners and waits this server starts
+            .env("THOTH_TEST_POLL_MS", "100");
         for (k, v) in envs {
             c.env(k, v);
         }

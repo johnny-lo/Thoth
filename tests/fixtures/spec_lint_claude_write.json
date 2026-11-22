@@ -1,0 +1,229 @@
+{
+  "false_blocks": [
+    {
+      "name": "measured_ag1_copy_source",
+      "rule": "AC2",
+      "from": "10d816df28504a3716bdf4cea90291f45f0cd59a:docs/post-phase2/process/plugin/specs/spec-AG1.json",
+      "field": "acceptance_criteria",
+      "text": "AC5: 公開版 skill。plugins/thoth/skills/thoth-dispatch/SKILL.md 在 Codex worker 那一條之後加一條 Antigravity worker，內容取自 .claude/skills/thoth-dispatch/SKILL.md 的 Antigravity 段落，五點都要有（模型、帳號、工具鎖、證據、審查者）；profile 名稱當成範例寫（`agy-a`），不含任何本機路徑或人名。同一份檔裡凡是寫「兩種 harness」或只列 Claude 與 codex 兩種審查者的句子，改成三種都涵蓋。tests/plugin.rs 的禁字清單拿掉 `antigravity` 與 `agy` 兩項，其他禁字不動；加一個斷言：公開版 skill 含 `Antigravity worker`。`thoth guide` 的內容來自同一份檔（src/guide.rs 的 include_str），加或改一個測試，斷言 `thoth guide` 的輸出含 `agy-a`。.claude/ 底下的檔不要改。"
+    },
+    {
+      "name": "measured_f4_read_only_marker",
+      "rule": "AC4",
+      "from": "a991b11a6b0e914143c40355d724fe32b0629001:docs/post-phase2/process/plugin/specs/spec-F4-a2.json",
+      "field": "acceptance_criteria",
+      "text": "AC4: 公開版 skill（plugins/thoth/skills/thoth-dispatch/SKILL.md）補三個從私下版改寫時掉了的細節，措辭以私下版 .claude/skills/thoth-dispatch/SKILL.md（只讀）為準、用英文：(a) interrupted 的 quota 那一格：重置時間還很久的話，告訴人類之後結束這一輪，之後的回合再 resume；(b) 提到 `verify --at-base` 的地方：不要自己在 base_commit 上手動跑檢查，--at-base 會在一個暫時的 worktree 裡重跑；提到一般的 `thoth verify RUN` 的地方：它把重跑記成新的證據碼，審查者可以引用；(c) failed 那一格：`task close` 之後任務會離開 `thoth status`，但 worktree 還在；第 5 步：移除 worktree 之前，先從 `thoth status TASK --json` 的 `runs[].worktree` 取得清單。tests/plugin.rs 的 ac4_skill_keeps_the_workflow_steps_and_details 加上這三項各一個斷言（斷言文件裡出現關鍵的指令或字串，例如 `runs[].worktree`）。既有的禁字檢查與工具名交叉檢查照過。"
+    },
+    {
+      "name": "measured_pub2_quoted_ban",
+      "rule": "AC5",
+      "from": "c965ed7a6da649d64501ef7ed71efee3fb57f8cc:docs/post-phase2/process/public-release/specs/spec-PUB-2.json",
+      "field": "acceptance_criteria",
+      "text": "AC3: tests/help.rs 只改 `no_doc_points_a_profile_at_the_operators_own_claude_config_dir` 的第一行註解（master 799beef 第 311 行，以 `// Global Constraint: never touch ` 開頭）：`never touch ` 與 `. A worker writes into` 之間的個人路徑換成 `the operator's own ~/.claude`，改完那一行是 `    // Global Constraint: never touch the operator's own ~/.claude. A worker writes into`。其他行一個位元組都不改。檢查：`git diff --numstat master...HEAD -- tests/help.rs` 是 `1 1`。"
+    },
+    {
+      "name": "measured_a2_2_list_entry",
+      "rule": "AC6",
+      "from": "7e573282c8fbd09c5ebcaa17bf14eef8d39e1f9f:docs/post-phase2/process/public-release/specs/spec-A2-2.json",
+      "field": "acceptance_criteria",
+      "text": "AC2: 排除清單新增：docs/phase0/、docs/phase1/、docs/phase2/、docs/post-phase2/、docs/trial/、docs/superpowers/、agent-control-plane-plan-v6.md、CLAUDE.md、.claude/、scripts/trial-summary.py。公開樹的 docs/ 恰好是 usage.md、evidence-and-review.md、commander-contract.md、design.md、field-results.md 五個檔；scripts/ 只剩 clippy-windows-from-linux.sh；根目錄沒有 CLAUDE.md、.claude/、agent-control-plane-plan-v6.md。"
+    },
+    {
+      "name": "measured_dt5_aside_in_a_ban_list",
+      "rule": "AC2",
+      "from": "0e93fe9559803ab5f98ae7548a22109e07e4580b:docs/post-phase2/process/plugin/specs/spec-DT-5.json",
+      "field": "constraints",
+      "text": "不加 crate；不改 Cargo.toml、Cargo.lock、scripts/、plugins/thoth/（含 skills，由指揮官改）、.claude/。模型名稱只經 tier.rs 的函式比對，不用 regex。"
+    },
+    {
+      "name": "measured_tests1_aside_with_commas",
+      "rule": "AC2",
+      "from": "9fc7cdd0d839d86a9c6dc83b48050e97baec90e6:docs/post-phase2/process/plugin/specs/spec-TESTS-1.json",
+      "field": "constraints",
+      "text": "不准改：tests/ 下除了 tests/common/mod.rs 與本件新增的檔以外的任何檔（B、C 兩類留給 TESTS-2、TESTS-3；AGY-1 已合併，它對 tests/antigravity.rs、tests/effort.rs 的改動原樣保留）；`.claude/`、`plugins/`（插件內容一改就要升版，本件不碰，所以不升 Cargo.toml 與 plugin.json 的版本）、Cargo.toml、Cargo.lock、scripts/public_tree.py、scripts/public_tree.exclude、scripts/test_public_tree.py（新腳本留在公開樹，不加排除）、`docs/post-phase2/backlog.md`、`docs/post-phase2/decisions.md`、CLAUDE.md、`.github/`；`seed_run`、`state_conn`、`global_conn` 的行為；`evidence show` 寫 evidence_opened 的行為；別件的功能範圍（RJ-2、RJ-3、SMALL-9、AUTO-1、BRIEF-1、LEAN-1、AGY-1）；共用提示與文件的疊加依下述合併協調，不以同檔就算越界。"
+    },
+    {
+      "name": "measured_pub2_aside_before_a_list",
+      "rule": "AC2",
+      "from": "cdc546c47254ea9e55478708089ccc6376da8dbc:docs/post-phase2/process/public-release/specs/spec-PUB-2.json",
+      "field": "acceptance_criteria",
+      "text": "AC8: 實際產生公開樹並掃描。D 是 worktree 外一個還不存在的新路徑（例如系統暫存資料夾底下），不進 commit。依序單獨執行，每次輸出當證據：(1) 用 Grep 工具在 scripts/public_tree.exclude 搜 regex `^CLAUDE\\.md\\s*$`，記下有沒有命中（有命中表示 PUB-1 已合併）。(2) `python scripts/public_tree.py --dest D` → exit 0。(3) 只有 (1) 沒有命中時才做：用一條 `rm -rf` 指令一次帶齊 D 底下的下列 23 個路徑（PUB-1 排除清單的 22 條，加上 PUB-1 AC5 (3) 會清的 docs/phase1/usage.md）：`.claude`、`.gitattributes`、`CLAUDE.md`、`agent-control-plane-plan-v6.md`、`plan`、`docs/phase0`、`docs/phase1/acceptance-quickstart.md`、`docs/phase1/acceptance-results.md`、`docs/phase1/acceptance.md`、`docs/phase1/design-brief.md`、`docs/phase1/rulings.md`、`docs/phase2/acceptance-results.md`、`docs/phase2/acceptance.md`、`docs/phase2/design-brief.md`、`docs/phase2/rulings.md`、`docs/post-phase2`、`docs/superpowers`、`docs/trial`、`tests/internal_docs.rs`、`scripts/public_tree.py`、`scripts/public_tree.exclude`、`scripts/test_public_tree.py`、`docs/phase1/usage.md`；summary 寫明「PUB-1 未合併，掃描前從 D 刪了這 23 個路徑」。(1) 有命中時不刪任何檔。(4) `python docs/post-phase2/process/public-release/scan_personal_data.py D` → exit 0，最後一行是 `pub2-scan: 0 hits in M files`。命中若落在這件不准改的檔（例如開工後才合併進 master 的內容）：不要改那些檔，停下來在 summary 列出命中的 `路徑:行號` 與規則代號。D 寫不進 worktree 外的位置時：停下來在 summary 說明，不要把 D 放進 worktree。"
+    },
+    {
+      "name": "measured_ck1_trailing_negation",
+      "rule": "AC2",
+      "from": "e86589f8d5aec68deb427104670d5327403588e0:docs/post-phase2/process/plugin/specs/spec-CK-1.json",
+      "field": "acceptance_criteria",
+      "text": "AC5: 文件與 skill。(1) docs/post-phase2/adapter-usage.md：`### \\`thoth status --json\\`` 段加一句 additive 講 `last_verify`（鍵與 null 的條件）；`### \\`thoth status TASK --json\\`` 段加一句 additive 講 `verify` 物件的每個鍵；`verify RUN … --json →` 那一條（現在第 377 行）加一句 additive 講 `approved_checks`、`previous_verify`、`missing_since_last_verify`（含「上次」的定義：這個 repo 最新的 verify_ran，不分任務；比較已核准集合；`now` 的兩個值；`ok` 與 exit code 不受影響；四條路都有）；`verify_ran` 事件那句加這三個新鍵；`thoth checks remove ID --json →` 那一條（現在第 389 行）加 `was_approved`；`### \\`thoth events …\\`` 段加一條 `additive (new keys, CK-1)` 講 `verify_ran` 的三個新鍵與 `check_removed` 的 `was_approved`、`approved_at`。(2) docs/mcp.md 第 82 行最後那句 `\\`thoth_checks_remove\\` takes effect at once and needs no approval: later verify jobs do not run that check.` 後面接一句：`The next verify result (thoth_job_status's result) and thoth_status list an approved check that was removed or replaced since the previous verify under missing_since_last_verify; report it to the human.`；其餘不動。(3) plugins/thoth/skills/thoth-dispatch/SKILL.md 第 86–87 行那張 verify 錯誤對照表加一列：第一欄 `\\`missing_since_last_verify\\` is not empty`，第二欄 `An approved check was removed or replaced since the previous verify, so this verify ran fewer checks. Name each one to the human in your report; only a human can decide that was intended and re-add and approve it. It is not a failure of this run.`；其他行不動，tests/plugin.rs 的 ac4、ac5 原樣通過。.claude/skills/ 的私下版由指揮官之後自己改，這件不碰。"
+    },
+    {
+      "name": "clause_source_then_other_file",
+      "rule": "AC2",
+      "field": "acceptance_criteria",
+      "text": "read a file in .claude/x, then change src/a.rs"
+    },
+    {
+      "name": "aside_keeps_the_ban_list_whole",
+      "rule": "AC2",
+      "field": "constraints",
+      "text": "不改 Cargo.toml、plugins/thoth/（含 skills，由指揮官改）、.claude/"
+    },
+    {
+      "name": "clause_zh_read_then_edit_other",
+      "rule": "AC2",
+      "field": "constraints",
+      "text": "讀 .claude/skills/x，改 plugins/y"
+    },
+    {
+      "name": "quoted_ban_comment_line",
+      "rule": "AC5",
+      "field": "acceptance_criteria",
+      "text": "改完那一行是 `// never touch the operator's own ~/.claude`"
+    },
+    {
+      "name": "quoted_ban_do_not_edit",
+      "rule": "AC5",
+      "field": "constraints",
+      "text": "update the comment to `do not edit ~/.claude`"
+    },
+    {
+      "name": "read_only_marker_zh",
+      "rule": "AC4",
+      "field": "acceptance_criteria",
+      "text": "以 .claude/x（只讀）為準，改 a.txt"
+    },
+    {
+      "name": "read_only_marker_en",
+      "rule": "AC4",
+      "field": "constraints",
+      "text": "edit a.txt, copy it from .claude/x (read-only)"
+    },
+    {
+      "name": "continuation_after_read",
+      "rule": "AC3",
+      "field": "constraints",
+      "text": "read src/a.rs, .claude/x"
+    },
+    {
+      "name": "continuation_after_negated_write",
+      "rule": "AC3",
+      "field": "constraints",
+      "text": "不改 plugins/x，.claude/y"
+    },
+    {
+      "name": "list_entry_zh",
+      "rule": "AC6",
+      "field": "acceptance_criteria",
+      "text": "排除清單新增：docs/、.claude/、scripts/x.py"
+    },
+    {
+      "name": "list_entry_comma_clauses",
+      "rule": "AC6",
+      "field": "constraints",
+      "text": "add: docs/, .claude/, scripts/x.py"
+    },
+    {
+      "name": "trailing_negation_clause",
+      "rule": "AC2",
+      "field": "constraints",
+      "text": ".claude/skills/ 的私下版由指揮官之後自己改，這件不碰"
+    }
+  ],
+  "true_blocks": [
+    {
+      "name": "aside_negation_ends_with_the_aside",
+      "field": "constraints",
+      "text": "不改 a.txt（見 b，c），改 .claude/x"
+    },
+    {
+      "name": "zh_edit_skill",
+      "field": "acceptance_criteria",
+      "text": "改 .claude/skills/x/SKILL.md"
+    },
+    {
+      "name": "en_delete_agent",
+      "field": "acceptance_criteria",
+      "text": "delete ~/.claude/agents/y.md"
+    },
+    {
+      "name": "goal_two_sentences",
+      "field": "goal",
+      "text": "Edit .claude/a. Also update .claude/b"
+    },
+    {
+      "name": "constraint_write",
+      "field": "constraints",
+      "text": "write ~/.claude/x/y"
+    },
+    {
+      "name": "update_backticked_path",
+      "field": "acceptance_criteria",
+      "text": "update `.claude/skills/x/SKILL.md`"
+    },
+    {
+      "name": "comma_list_en",
+      "field": "acceptance_criteria",
+      "text": "edit src/a.rs, .claude/skills/x/SKILL.md"
+    },
+    {
+      "name": "comma_list_zh",
+      "field": "acceptance_criteria",
+      "text": "改 plugins/x，.claude/y"
+    },
+    {
+      "name": "read_then_delete",
+      "field": "acceptance_criteria",
+      "text": "read a.txt, then delete ~/.claude/x"
+    },
+    {
+      "name": "negation_in_other_clause",
+      "field": "acceptance_criteria",
+      "text": "不改 a.txt，改 .claude/x"
+    },
+    {
+      "name": "read_only_in_other_clause",
+      "field": "acceptance_criteria",
+      "text": "只讀 a.txt，改 .claude/x"
+    },
+    {
+      "name": "backticked_path_with_never",
+      "field": "acceptance_criteria",
+      "text": "改 `.claude/never/x`"
+    },
+    {
+      "name": "backticked_command_with_spaces",
+      "field": "acceptance_criteria",
+      "text": "刪 `rm -rf ~/.claude/x`"
+    },
+    {
+      "name": "add_only_entry",
+      "field": "acceptance_criteria",
+      "text": "新增：.claude/"
+    },
+    {
+      "name": "add_path_goes_on",
+      "field": "acceptance_criteria",
+      "text": "新增：.claude/skills/x/SKILL.md、docs/"
+    },
+    {
+      "name": "delete_is_not_an_adding_word",
+      "field": "acceptance_criteria",
+      "text": "刪除：docs/、.claude/"
+    },
+    {
+      "name": "add_without_colon",
+      "field": "acceptance_criteria",
+      "text": "新增 .claude/、docs/"
+    },
+    {
+      "name": "add_list_with_another_write_word",
+      "field": "acceptance_criteria",
+      "text": "新增：docs/、.claude/ 並刪 .claude/x"
+    },
+    {
+      "name": "trailing_negation_with_own_write_word",
+      "field": "constraints",
+      "text": "改 .claude/x，不改 src/a.rs"
+    }
+  ]
+}

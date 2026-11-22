@@ -1,9 +1,11 @@
+mod common;
+
 use assert_cmd::Command;
 
 /// `thoth profile list` with both state variables cleared and both home
 /// variables pointed at `home`.
 fn thoth(home: &std::path::Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed_assert(Command::new(env!("CARGO_BIN_EXE_thoth")));
     c.env_remove("THOTH_HOME");
     c.env_remove("AGENTCTL_HOME");
     c.env("USERPROFILE", home);

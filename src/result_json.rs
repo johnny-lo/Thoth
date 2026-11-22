@@ -76,10 +76,15 @@ pub enum ResultError {
     TaskIdMismatch { expected: String, got: String },
     #[error("result.json status must be completed or blocked, got '{0}'")]
     BadStatus(String),
-    #[error("result.json claim kind must be one of test_result/doc_reference/completion/behavior/protected_change/research, got '{0}'")]
+    /// CLAIMKIND-1: the second sentence tells the worker which kind a note, a
+    /// decision or a finding takes, so a re-dispatch quoting this reason does
+    /// not move the claim to `research`.
+    #[error("result.json claim kind must be one of test_result/doc_reference/completion/behavior/protected_change/research, got '{0}'. For a note, a decision or a finding use the kind behavior or completion; research is only for a research task and needs sources.")]
     BadClaimKind(String),
     /// `claim` is 1-based, like every other per-claim message in ingest.
-    #[error("result.json claim {claim} is kind research but its 'sources' is empty")]
+    /// CLAIMKIND-1: the second sentence is for a worker of a code task that
+    /// reached for `research`.
+    #[error("result.json claim {claim} is kind research but its 'sources' is empty. On a task that is not a research task, use the kind behavior or completion instead.")]
     ResearchWithoutSources { claim: usize },
     #[error("result.json claim {claim} source {source_no}: 'url' must start with http://, https:// or file:// and contain no whitespace, got '{url}'")]
     BadSourceUrl {

@@ -127,6 +127,9 @@ pub(crate) fn account(a: Account, tables: &Value, usage: &[Row]) -> (Map<String,
         let mut row = Map::new();
         row.insert("model".into(), json!(m.model));
         row.insert("names".into(), json!(own));
+        // AGY-1 (second part): agy refused `--effort` for it on this
+        // profile; the model stays listed and eligible.
+        row.insert("no_effort".into(), m.no_effort.as_ref().map_or(Value::Null, crate::model_list::NoEffort::json));
         let mut missing = Vec::new();
         for (table, name_key) in TABLES {
             let value = cell(&own, table, name_key, table_rows(table));
@@ -377,6 +380,13 @@ pub(crate) fn human_block(c: &Value, unmatched: &[Value], lang: Lang) -> Vec<Str
             x["model"].as_str().unwrap_or(""),
             x["seen_at"].as_str().unwrap_or("unknown"),
             x["reason"].as_str().unwrap_or("")
+        ));
+    }
+    for m in models_rows.iter().filter(|m| m["no_effort"].is_object()) {
+        lines.push(format!(
+            "  no effort: {} since {}",
+            m["model"].as_str().unwrap_or(""),
+            m["no_effort"]["seen_at"].as_str().unwrap_or("unknown")
         ));
     }
     for u in unmatched.iter().filter(|u| u["profile_id"] == c["profile_id"]) {

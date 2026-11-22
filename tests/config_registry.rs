@@ -383,6 +383,58 @@ fn a_broken_or_odd_config_file_is_named_by_list_and_doctor_and_warned_once_elsew
 }
 
 #[test]
+fn a_broken_config_file_is_warned_once_by_a_command_that_reads_only_the_language_or_a_cli_path() {
+    let f = common::fixture();
+    f.cmd().arg("init").assert().success();
+    f.add_profile("claude-b");
+    let path = config_json(&f);
+    let needle = format!("warning: {} cannot be used (", path.display());
+
+    // `profile list`, the command that shows the operator's setup.
+    let g = common::fixture();
+    g.cmd().arg("init").assert().success();
+    let list_path = config_json(&g);
+    let list_needle = format!("warning: {} cannot be used (", list_path.display());
+    fs::write(&list_path, "broken").unwrap();
+    let out = g.cmd().args(["profile", "list", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert_eq!(json_of(&out), json!({"profiles": []}));
+    let e = stderr_of(&out);
+    assert_eq!(e.matches(&list_needle).count(), 1, "{e}");
+    let out = g.cmd().args(["profile", "list"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let e = stderr_of(&out);
+    assert_eq!(e.matches(&list_needle).count(), 1, "{e}");
+    fs::write(&list_path, r#"{"live_quota":true}"#).unwrap();
+    for args in [&["profile", "list", "--json"][..], &["profile", "list"][..]] {
+        let out = g.cmd().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        assert!(!stderr_of(&out).contains("warning:"), "{args:?}: {}", stderr_of(&out));
+    }
+
+    // `profile check` reads the claude-bin setting and nothing else from the file.
+    fs::write(&path, "broken").unwrap();
+    let out = f.cmd().args(["profile", "check", "claude-b", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert_eq!(json_of(&out)["logged_in"], true);
+    let e = stderr_of(&out);
+    assert_eq!(e.matches(&needle).count(), 1, "{e}");
+
+    let out = f.cmd().args(["profile", "check", "claude-b"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let e = stderr_of(&out);
+    assert_eq!(e.matches(&needle).count(), 1, "{e}");
+
+    // a usable file: neither form warns
+    fs::write(&path, r#"{"live_quota":true}"#).unwrap();
+    for args in [&["profile", "check", "claude-b", "--json"][..], &["profile", "check", "claude-b"][..]] {
+        let out = f.cmd().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        assert!(!stderr_of(&out).contains("warning:"), "{args:?}: {}", stderr_of(&out));
+    }
+}
+
+#[test]
 fn doctor_knows_every_stored_key_and_flags_only_unknown_ones() {
     let f = common::fixture();
     healthy_repo(&f);
@@ -434,7 +486,7 @@ struct Server {
 
 impl Server {
     fn start(f: &common::Fixture, extra_env: &[(&str, &str)]) -> Self {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .current_dir(f.repo.path())
             .env("THOTH_HOME", f.home.path())

@@ -19,7 +19,8 @@ const SHORT_BRIEF: &str = "Delivered the greeting; both checks pass. No decision
 /// KEY, TOKEN, SECRET or PASSWORD, in any case. Names only are read.
 fn secret_named(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w))
+    // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+    ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_")
 }
 
 fn inherited_secret_names() -> Vec<std::ffi::OsString> {
@@ -184,7 +185,7 @@ impl T {
     }
 
     fn mcp(&self) -> Server {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .current_dir(self.f.repo.path())
             .env("THOTH_HOME", self.f.home.path())
@@ -866,4 +867,160 @@ impl T {
         let text = self.ok(args, envs);
         serde_json::from_str(text.trim()).unwrap_or_else(|e| panic!("{args:?}: {e}: {text}"))
     }
+}
+
+impl T {
+    /// `review start TASK` (edit mode with `edit`) by claude-a with `envs`;
+    /// the run id.
+    fn review_start(&self, task: &str, edit: bool, envs: &[(&str, &str)]) -> String {
+        let mut args = vec!["review", "start", task, "--profile", "claude-a", "--model", "haiku", "--effort", "medium", "--reason", REASON, "--json"];
+        if edit {
+            args.push("--edit");
+        }
+        let mut all = vec![("FAKE_TASK_ID", task)];
+        all.extend_from_slice(envs);
+        self.json_with(&args, &all)["run_id"].as_str().unwrap().to_string()
+    }
+
+    /// `spec review start TASK` by claude-a with `envs`; the run id.
+    fn spec_review_start(&self, task: &str, envs: &[(&str, &str)]) -> String {
+        let mut all = vec![("FAKE_TASK_ID", task)];
+        all.extend_from_slice(envs);
+        let args = ["spec", "review", "start", task, "--profile", "claude-a", "--model", "haiku", "--reason", REASON, "--json"];
+        self.json_with(&args, &all)["run_id"].as_str().unwrap().to_string()
+    }
+
+    /// A new file under THOTH_HOME holding `body`; its path.
+    fn home_file(&self, name: &str, body: &str) -> String {
+        let p = self.f.home_path().join(name);
+        std::fs::write(&p, body).unwrap();
+        p.display().to_string()
+    }
+}
+
+/// A task whose implementer run is done (`in_review`); its first evidence code.
+fn delivered(t: &T) -> (String, String) {
+    let task = t.create(NORMAL);
+    let run = t.dispatch(&task, "claude-b", "sonnet", "ok", &[]);
+    t.wait_run(&run);
+    let code = t.first_code(&task);
+    (task, code)
+}
+
+/// BRIEF-1 (AC5, AC8): a reviewer run's and a spec reviewer run's brief, cut
+/// at 1,000 characters, names where the full text is; one whose document was
+/// refused has no brief at all.
+#[test]
+fn reviewer_and_spec_reviewer_runs_name_their_full_text_and_have_no_brief_when_invalid() {
+    let t = T::new();
+
+    // (a) a reviewer run (edit mode) whose PASS has five long extra findings
+    let (task, code) = delivered(&t);
+    let extras: Vec<Value> = (0..5).map(|i| json!({"severity": "minor", "note": format!("{i}{}", "w".repeat(199)), "evidence": []})).collect();
+    let doc = json!({"verdict": "PASS", "edits": [], "findings": {
+        "criteria": [
+            {"id": "AC1", "verdict": "met", "evidence": [code]},
+            {"id": "AC2", "verdict": "met", "evidence": [code]}
+        ],
+        "extra_findings": extras}});
+    let plan = t.home_file("brief-fix-plan.json", &json!({"document": doc}).to_string());
+    let run = t.review_start(&task, true, &[("FAKE_SCENARIO", "review_fix"), ("FAKE_FIX_PLAN", &plan)]);
+    let w = t.wait_run(&run);
+    assert_eq!(w["verdict"], "PASS", "{}", t.f.explain_run(&run));
+    assert_eq!(w["brief_source"], "review", "{w}");
+    assert_eq!(w["brief_truncated"], true, "{w}");
+    assert_eq!(w["brief"].as_str().unwrap().chars().count(), 1000, "{w}");
+    let human = t.ok(&["wait", "--run", &run, "--timeout", "180s"], &[]);
+    assert!(human.contains(&format!("(cut at 1000 chars; full text: thoth review show {task})")), "{human}");
+
+    // (b) a spec reviewer run whose revise criteria hold long findings
+    let spec_task = t.create(NORMAL);
+    let finding = |i: usize| json!({"check": "verifiable", "location": format!("AC{i}"), "note": format!("{i}{}", "n".repeat(199))});
+    let spec_doc = json!({"verdict": "REVISE", "criteria": [
+        {"id": "AC1", "verdict": "revise", "findings": [finding(1), finding(2), finding(3)]},
+        {"id": "AC2", "verdict": "revise", "findings": [finding(4), finding(5), finding(6)]}
+    ]});
+    let doc_file = t.home_file("brief-spec-review-doc.json", &spec_doc.to_string());
+    let run = t.spec_review_start(&spec_task, &[("FAKE_SCENARIO", "spec_review_doc_file"), ("FAKE_SPEC_REVIEW_DOC", &doc_file)]);
+    let w = t.wait_run(&run);
+    assert_eq!(w["verdict"], "REVISE", "{}", t.f.explain_run(&run));
+    assert_eq!(w["brief_source"], "spec_review", "{w}");
+    assert_eq!(w["brief_truncated"], true, "{w}");
+    let human = t.ok(&["wait", "--run", &run, "--timeout", "180s"], &[]);
+    assert!(human.contains(&format!("(cut at 1000 chars; full text: thoth spec review show {spec_task})")), "{human}");
+
+    // (c) a refused document leaves no brief
+    let (bad_task, _) = delivered(&t);
+    let run = t.review_start(&bad_task, false, &[("FAKE_SCENARIO", "review_bad")]);
+    t.wait_run(&run);
+    t.newest(&bad_task, &run, "review_invalid");
+    let w = t.wait_run(&run);
+    assert_null_keys(&w, &BRIEF_KEYS);
+    let human = t.ok(&["wait", "--run", &run, "--timeout", "180s"], &[]);
+    assert!(!human.lines().any(|l| l.starts_with("brief:")), "{human}");
+
+    let bad_spec = t.create(NORMAL);
+    let run = t.spec_review_start(&bad_spec, &[("FAKE_SCENARIO", "spec_review_bad")]);
+    t.wait_run(&run);
+    t.newest(&bad_spec, &run, "spec_review_invalid");
+    let w = t.wait_run(&run);
+    assert_null_keys(&w, &BRIEF_KEYS);
+    let human = t.ok(&["wait", "--run", &run, "--timeout", "180s"], &[]);
+    assert!(!human.lines().any(|l| l.starts_with("brief:")), "{human}");
+}
+
+/// BRIEF-1 (AC9): a reviewer run's `wait` masks a known secret value, and the
+/// MCP spec review readout a token and a known value, before the brief is cut.
+#[test]
+fn a_reviewer_wait_and_the_spec_review_show_tool_mask_secrets() {
+    let t = T::with_env(vec![(SECRET_VAR.to_string(), exact_value())]);
+
+    // (a) a rejecting reviewer whose note holds the known value inside text.
+    // A token cannot go this way: the runner takes every variable that holds
+    // a key format out of the worker's environment, so the fake never sees it.
+    let (task, _) = delivered(&t);
+    let note = format!("see {} here and on", exact_value());
+    let run = t.review_start(&task, false, &[("FAKE_SCENARIO", "review_reject"), ("FAKE_REVIEW_NOTE", &note)]);
+    let (code, raw, err) = t.run(&["wait", "--run", &run, "--timeout", "180s", "--json"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!raw.contains(&token_piece()) && !raw.contains(&exact_value()), "{raw}");
+    let w: Value = serde_json::from_str(raw.trim()).unwrap();
+    assert_eq!(w["verdict"], "REJECT", "{}", t.f.explain_run(&run));
+    assert!(w["brief"].as_str().unwrap().contains("[redacted:"), "{w}");
+
+    // (a2) SMALL-16: the token format on the same path. The reviewer's note
+    // holds a token-shaped string (fake-claude builds it itself, since the
+    // runner takes key-shaped variables out of the worker's environment).
+    let (task2, _) = delivered(&t);
+    let run2 = t.review_start(&task2, false, &[("FAKE_SCENARIO", "review_reject"), ("FAKE_REVIEW_NOTE_TOKEN", "1")]);
+    let (code, raw, err) = t.run(&["wait", "--run", &run2, "--timeout", "180s", "--json"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!raw.contains(&token_piece()), "the token reached wait's output: {raw}");
+    let w2: Value = serde_json::from_str(raw.trim()).unwrap();
+    assert_eq!(w2["verdict"], "REJECT", "{}", t.f.explain_run(&run2));
+    assert!(w2["brief"].as_str().unwrap().contains("[redacted:github-token]"), "{w2}");
+
+    // (b) an external spec review with a token in a location and the exact
+    // value in a note, read through the MCP tool
+    let spec_task = t.create(NORMAL);
+    let location = format!("src/{} {}", "l".repeat(185), token());
+    let spec_note = format!("{}{} tail", "q".repeat(196), exact_value());
+    let doc = json!({"verdict": "REVISE", "criteria": [
+        {"id": "AC1", "verdict": "ok", "findings": []},
+        {"id": "AC2", "verdict": "revise", "findings": [{"check": "verifiable", "location": location, "note": spec_note}]}
+    ]});
+    let path = t.home_file("brief-spec-review-mcp.json", &doc.to_string());
+    t.json(&["spec", "review", "record", &spec_task, "-f", &path, "--json"]);
+    let shown = t.json(&["spec", "review", "show", &spec_task, "--json"]);
+    let want = shown["brief"].as_str().expect("the CLI's brief").to_string();
+    assert!(want.contains("[redacted:"), "{want}");
+
+    let mut s = t.mcp();
+    let reply = s.send(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"thoth_spec_review_show","arguments":{"task": spec_task}}}));
+    drop(s);
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(reply["result"]["structuredContent"]["brief"], want.as_str(), "{reply}");
+    let whole = reply["result"].to_string();
+    assert!(!whole.contains(&token_piece()) && !whole.contains(&exact_value()), "{whole}");
 }

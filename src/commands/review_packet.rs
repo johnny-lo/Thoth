@@ -41,14 +41,14 @@ const SPEC_LIST_KEYS: [(&str, &str); 4] = [
 ];
 
 pub fn run(paths: &Paths, cwd: &Path, needle: &str, out: Option<&Path>, json: bool) -> Result<i32> {
-    let (_repo_id, _root, conn) = crate::commands::task::open_repo(paths, cwd)?;
+    let (_repo_id, root, conn) = crate::commands::task::open_repo(paths, cwd)?;
     let task_id = ids::resolve_prefix(&state::list_task_ids(&conn)?, needle)
         .map_err(|e| anyhow::anyhow!("task '{needle}': {e}"))?;
     if state::get_task(&conn, &task_id)?.is_none() {
         anyhow::bail!("task '{needle}': no such task {task_id}");
     }
     let masker = Masker::load(Some(&paths.home));
-    let (doc, _rows, mut redactions) = packet_doc(&conn, &task_id, &masker)?;
+    let (doc, _rows, mut redactions) = packet_doc(&conn, &root, &task_id, &masker)?;
 
     let mut text = if json {
         serde_json::to_string(&doc)?
@@ -116,13 +116,15 @@ fn code_order(code: &str) -> (u64, String) {
 }
 
 /// The Markdown `review packet TASK` prints, byte for byte, plus the
-/// evidence rows it lists and what was masked in it.
+/// evidence rows it lists and what was masked in it. `git_dir` is a work
+/// tree of the repository, where the spec-named tests are looked up.
 pub(crate) fn packet_markdown(
     conn: &Connection,
+    git_dir: &Path,
     task_id: &str,
     masker: &Masker,
 ) -> Result<(String, Vec<state::Evidence>, Redactions)> {
-    let (doc, rows, mut redactions) = packet_doc(conn, task_id, masker)?;
+    let (doc, rows, mut redactions) = packet_doc(conn, git_dir, task_id, masker)?;
     let (reasons, counts) = handoff_reasons(conn, task_id, masker)?;
     redactions.counts.merge(&counts);
     let mut text = render_markdown(&doc, &reasons);
@@ -154,6 +156,25 @@ fn execution_error(row: &state::Evidence) -> Option<String> {
         .filter(|e| !e.trim().is_empty())
         .map(str::to_string)
 }
+
+/// SMALL-11 (2): the stderr a command row stored, when it stored one. Its
+/// blob (`detail.stderr_sha`) sits in the same content-addressed directory as
+/// the row's stdout blob, lossily decoded. None for any other row, for a
+/// command with no stderr blob, and for one whose blob is gone.
+fn stored_stderr(row: &state::Evidence) -> Option<String> {
+    if row.kind != "command" {
+        return None;
+    }
+    let detail: Value = serde_json::from_str(&row.detail).ok()?;
+    let sha = detail["stderr_sha"].as_str().filter(|s| !s.is_empty())?;
+    let dir = Path::new(row.blob_path.as_deref()?).parent()?;
+    let bytes = std::fs::read(dir.join(sha)).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// SMALL-11 (2): how a review-input evidence file begins for a command whose
+/// stdout was empty and whose stderr follows.
+const STDERR_FILE_HEADER: &str = "[thoth: this command printed nothing on stdout; its stderr follows]";
 
 /// SMALL-9c (AC3): the line under a diff's heading: its start and end
 /// commits, which rule chose the start (a row recorded before SMALL-9c has
@@ -225,7 +246,9 @@ pub(crate) fn write_review_input(
     let evidence_dir = dir.join("evidence");
     std::fs::create_dir_all(&evidence_dir)
         .with_context(|| format!("creating {}", evidence_dir.display()))?;
-    let (markdown, rows, mut redactions) = packet_markdown(conn, task_id, masker)?;
+    // The review worktree is a linked worktree of the repository: it shares
+    // the object store, so the spec-named tests are looked up there.
+    let (markdown, rows, mut redactions) = packet_markdown(conn, worktree, task_id, masker)?;
     std::fs::write(dir.join("packet.md"), markdown.as_bytes())
         .with_context(|| format!("writing {}", dir.join("packet.md").display()))?;
     for row in &rows {
@@ -239,6 +262,15 @@ pub(crate) fn write_review_input(
             let (error, counts) = masker.mask_text(&error);
             redactions.note(&row.code, &counts);
             text.push_str(&format!("{EXECUTION_ERROR_FILE_PREFIX}{}]\n", one_line(&error)));
+        }
+        if blob.total == 0 {
+            if let Some(stderr) = stored_stderr(row).filter(|e| !e.is_empty()) {
+                let (stderr, counts) = masker.mask_text(&stderr);
+                redactions.note(&row.code, &counts);
+                text.push_str(STDERR_FILE_HEADER);
+                text.push('\n');
+                text.push_str(&stderr);
+            }
         }
         text.push_str(&blob.shown);
         let path = evidence_dir.join(format!("{}.txt", row.code));
@@ -265,6 +297,7 @@ pub(crate) fn write_review_input(
 /// what was masked in it (the handoff reasons only the Markdown shows aside).
 fn packet_doc(
     conn: &Connection,
+    git_dir: &Path,
     task_id: &str,
     masker: &Masker,
 ) -> Result<(Value, Vec<state::Evidence>, Redactions)> {
@@ -280,30 +313,42 @@ fn packet_doc(
     let mut protected_changes = Vec::new();
     for row in &rows {
         let (label, mut row_counts) = masker.mask_text(&row.label);
-        let output_tail = if row.kind == "command" {
+        let (output_tail, output_stream) = if row.kind == "command" {
             let (body, _total, _verified) = read_blob(row, u64::MAX);
-            // A failed command has an empty blob (PostToolUseFailure carries
-            // no tool_response); its output is in `detail.error`.
-            let body = if body.is_empty() {
-                serde_json::from_str::<Value>(&row.detail)
-                    .ok()
-                    .and_then(|d| d["error"].as_str().map(str::to_string))
-                    .unwrap_or_default()
+            // SMALL-11 (2): stdout first; a check that printed nothing on
+            // stdout shows its stderr; a failed command with nothing stored
+            // (PostToolUseFailure carries no tool_response) has its output in
+            // `detail.error`.
+            let (text, stream) = if !body.is_empty() {
+                (body, Value::from("stdout"))
+            } else if let Some(err) = stored_stderr(row).filter(|e| !e.is_empty()) {
+                (err, Value::from("stderr"))
+            } else if let Some(error) = serde_json::from_str::<Value>(&row.detail)
+                .ok()
+                .and_then(|d| d["error"].as_str().map(str::to_string))
+                .filter(|e| !e.is_empty())
+            {
+                (error, Value::from("error"))
             } else {
-                body
+                (String::new(), Value::Null)
             };
-            let (tail, counts) = command_tail(&body, masker);
+            let (tail, counts) = command_tail(&text, masker);
             row_counts.merge(&counts);
-            Value::String(tail)
+            (Value::String(tail), stream)
         } else {
-            Value::Null
+            (Value::Null, Value::Null)
         };
         // RVI-1 (AC3): shown beside the tail even when the check exited 0 or
         // printed output, so a reviewer never reads it as a clean pass.
         let execution_error = match execution_error(row) {
             Some(error) => {
                 let (error, counts) = masker.mask_text(&error);
-                row_counts.merge(&counts);
+                // TESTGAP-2: a tail that came from `detail.error` is this
+                // same text and packet.md shows it once, so its masking was
+                // counted with the tail already.
+                if output_stream.as_str() != Some("error") || output_tail.as_str() != Some(error.as_str()) {
+                    row_counts.merge(&counts);
+                }
                 Value::String(error)
             }
             None => Value::Null,
@@ -355,6 +400,7 @@ fn packet_doc(
             "run_id": row.run_id,
             "label": label,
             "output_tail": output_tail,
+            "output_stream": output_stream,
             "execution_error": execution_error,
         }));
     }
@@ -365,16 +411,27 @@ fn packet_doc(
         .into_iter()
         .rev()
         .find(|e| e.event_type == event_type::RESULT_INGESTED);
-    let (claims, claims_run_id) = match ingested {
+    let (claims, claims_run_id, verification_requests) = match ingested {
         Some(e) => {
             let detail: Value = serde_json::from_str(&e.detail).unwrap_or(Value::Null);
             let claims = detail["result_json"]["claims"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            (claims, e.run_id.map(Value::String).unwrap_or(Value::Null))
+            // SMALL-16: what the worker asked to have verified, for reference
+            // only, in its order; `cwd` defaults to "." as the result parser does.
+            let requests: Vec<Value> = detail["result_json"]["verification_requests"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| {
+                    let cmd = r["cmd"].as_str()?;
+                    Some(json!({"cmd": cmd, "cwd": r["cwd"].as_str().unwrap_or(".")}))
+                })
+                .collect();
+            (claims, e.run_id.map(Value::String).unwrap_or(Value::Null), requests)
         }
-        None => (Vec::new(), Value::Null),
+        None => (Vec::new(), Value::Null, Vec::new()),
     };
     // REV-3 (AC4): the required checks that did not run on the run whose
     // claims are shown; nothing without one.
@@ -392,6 +449,21 @@ fn packet_doc(
     let test_scope = match claims_run_id.as_str() {
         Some(run_id) => test_scope_for_run(conn, task_id, run_id)?,
         None => json!([]),
+    };
+    // SMALL-17 (a): the test names the spec writes, looked up at that run's
+    // candidate and base. A report only.
+    let (spec_tests_commit, spec_tests) = match claims_run_id.as_str() {
+        Some(run_id) => match state::get_run(conn, run_id)? {
+            Some(run) => match run.candidate_commit.as_deref() {
+                Some(candidate) => (
+                    Value::String(candidate.to_string()),
+                    spec_tests_json(git_dir, &task.spec, candidate, &run.base_commit),
+                ),
+                None => (Value::Null, json!([])),
+            },
+            None => (Value::Null, json!([])),
+        },
+        None => (Value::Null, json!([])),
     };
 
     let reviews: Vec<Value> = state::list_reviews_for_task(conn, task_id)?
@@ -436,8 +508,11 @@ fn packet_doc(
         "diffs": diffs,
         "claims": claims,
         "claims_run_id": claims_run_id,
+        "verification_requests": verification_requests,
         "checks_not_run": checks_not_run,
         "test_scope": test_scope,
+        "spec_tests_commit": spec_tests_commit,
+        "spec_tests": spec_tests,
         "approvals": approvals(conn, task_id)?,
         "reviews": reviews,
     });
@@ -452,12 +527,12 @@ fn packet_doc(
 /// of `run_id` that is not a `--at-base` one, as `{"check_id", ...scope}`;
 /// `[]` without such an event or such rows.
 fn test_scope_for_run(conn: &Connection, task_id: &str, run_id: &str) -> Result<Value> {
-    let mut stmt = conn.prepare(
-        "SELECT detail FROM events WHERE task_id = ?1 AND run_id = ?2 AND type = ?3 ORDER BY seq DESC",
+    let details = crate::db::state::event_details_of_task_run_newest_first(
+        conn,
+        task_id,
+        run_id,
+        event_type::VERIFY_RAN,
     )?;
-    let details = stmt
-        .query_map(rusqlite::params![task_id, run_id, event_type::VERIFY_RAN], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
     let newest = details
         .iter()
         .map(|d| serde_json::from_str::<Value>(d).unwrap_or(Value::Null))
@@ -473,6 +548,161 @@ fn test_scope_for_run(conn: &Connection, task_id: &str, run_id: &str) -> Result<
         out.push(Value::Object(item));
     }
     Ok(Value::Array(out))
+}
+
+/// SMALL-17 (a): the file endings the spec-named tests are looked up in.
+const CODE_ENDINGS: [&str; 6] = ["rs", "ts", "tsx", "js", "mjs", "py"];
+
+/// A whole word of lowercase ASCII snake_case with at least four parts:
+/// `[a-z][a-z0-9]*(_[a-z0-9]+){3,}`.
+fn is_long_snake(word: &str) -> bool {
+    let parts: Vec<&str> = word.split('_').collect();
+    parts.len() >= 4
+        && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+        && parts[0].as_bytes()[0].is_ascii_lowercase()
+}
+
+/// SMALL-17 (a): every test-function name in `text` with its byte offset: a
+/// long snake_case word not directly after `/ . - $ % ~` and not directly
+/// before `/`, `-` or a dot and a letter (those are paths, flags and file names).
+fn function_names(text: &str) -> Vec<(usize, String)> {
+    let bytes = text.as_bytes();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && word(bytes[i]) {
+            i += 1;
+        }
+        let name = &text[start..i];
+        let before = start.checked_sub(1).map(|j| bytes[j]);
+        let after = bytes.get(i).copied();
+        let file_name = after == Some(b'.') && bytes.get(i + 1).is_some_and(u8::is_ascii_alphabetic);
+        if is_long_snake(name)
+            && !before.is_some_and(|b| matches!(b, b'/' | b'.' | b'-' | b'$' | b'%' | b'~'))
+            && !matches!(after, Some(b'/') | Some(b'-'))
+            && !file_name
+        {
+            out.push((start, name.to_string()));
+        }
+    }
+    out
+}
+
+/// One spec-named test: `form` is `function` or `filter`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpecTest {
+    name: String,
+    form: &'static str,
+    target: Option<String>,
+}
+
+/// SMALL-17 (a): the distinct (form, target, name) the spec's goal,
+/// acceptance criteria and constraints write, in order of first mention.
+fn spec_test_names(spec_json: &str) -> Vec<SpecTest> {
+    let raw: Value = serde_json::from_str(spec_json).unwrap_or(Value::Null);
+    let mut texts: Vec<String> = Vec::new();
+    texts.extend(raw["goal"].as_str().map(str::to_string));
+    for key in ["acceptance_criteria", "constraints"] {
+        texts.extend(raw[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)));
+    }
+    let mut out: Vec<SpecTest> = Vec::new();
+    for text in &texts {
+        let mut found: Vec<(usize, SpecTest)> = function_names(text)
+            .into_iter()
+            .map(|(at, name)| (at, SpecTest { name, form: "function", target: None }))
+            .collect();
+        found.extend(
+            crate::test_scope::test_filters(text)
+                .into_iter()
+                .map(|f| (f.at, SpecTest { name: f.name, form: "filter", target: f.target })),
+        );
+        found.sort_by_key(|(at, _)| *at);
+        for (_, t) in found {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// The pathspecs of the code files a lookup reads: every code file, or a
+/// filter's target (`test:NAME`: tests/NAME.rs and the folder tests/NAME/;
+/// `bin:NAME`: every .rs file under src/; none: src/ and tests/).
+fn lookup_pathspecs(t: &SpecTest) -> Vec<String> {
+    let under = |dirs: &[&str]| -> Vec<String> {
+        dirs.iter().flat_map(|d| CODE_ENDINGS.iter().map(move |e| format!("{d}*.{e}"))).collect()
+    };
+    match (t.form, t.target.as_deref()) {
+        ("function", _) => under(&[""]),
+        (_, Some(target)) if target.starts_with("test:") => {
+            let name = &target["test:".len()..];
+            let mut specs = vec![format!("tests/{name}.rs")];
+            specs.extend(under(&[&format!("tests/{name}/")]));
+            specs
+        }
+        (_, Some(target)) if target.starts_with("bin:") => vec!["src/*.rs".to_string()],
+        _ => under(&["src/", "tests/"]),
+    }
+}
+
+/// Whether `commit` has `name` in the files of `pathspecs`: as a whole word
+/// for a function, as any part of a word for a filter. `Err` when git could
+/// not tell.
+fn name_at(git_dir: &Path, commit: &str, t: &SpecTest, pathspecs: &[String]) -> Result<bool> {
+    if t.form == "filter" && t.name.contains(':') {
+        // a word is letters, digits and `_` only
+        return Ok(false);
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["grep", "-q", "-I", "-F"]);
+    if t.form == "function" {
+        cmd.arg("-w");
+    }
+    cmd.arg("-e").arg(&t.name).arg(commit).arg("--").args(pathspecs).current_dir(git_dir);
+    let out = crate::process::quiet(&mut cmd).output().context("running git grep")?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) if out.stderr.is_empty() => Ok(false),
+        code => anyhow::bail!(
+            "git grep exited {code:?} in {}: {}",
+            git_dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
+/// SMALL-17 (a): `spec_tests`: each spec-named test with its status, found
+/// (in the candidate), removed (in the base only), missing (in neither) or
+/// not_checked (a filter with `::`, or git could not tell).
+fn spec_tests_json(git_dir: &Path, spec_json: &str, candidate: &str, base: &str) -> Value {
+    let rows: Vec<Value> = spec_test_names(spec_json)
+        .into_iter()
+        .map(|t| {
+            let status = if t.form == "filter" && t.name.contains("::") {
+                "not_checked"
+            } else {
+                let specs = lookup_pathspecs(&t);
+                match name_at(git_dir, candidate, &t, &specs) {
+                    Ok(true) => "found",
+                    Ok(false) => match name_at(git_dir, base, &t, &specs) {
+                        Ok(true) => "removed",
+                        Ok(false) => "missing",
+                        Err(_) => "not_checked",
+                    },
+                    Err(_) => "not_checked",
+                }
+            };
+            json!({"name": t.name, "form": t.form, "target": t.target, "status": status})
+        })
+        .collect();
+    Value::Array(rows)
 }
 
 /// LESS-5: the approvals the reviewer should know about, oldest first: every
@@ -698,9 +928,14 @@ fn render_markdown(doc: &Value, handoff_reasons: &std::collections::HashMap<Stri
             m.push_str(&format!("  execution error: {}\n", one_line(error)));
         }
         if let Some(tail) = e["output_tail"].as_str() {
+            if e["output_stream"].as_str() == Some("stderr") {
+                m.push_str("  (stdout was empty; last lines of stderr:)\n");
+                for line in fenced("", tail).lines() {
+                    m.push_str(&format!("  {line}\n"));
+                }
             // A check with nothing stored has its error as `output_tail`
             // (see `packet_doc`); the line above already shows it.
-            if tail.is_empty() || execution_error == Some(tail) {
+            } else if tail.is_empty() || execution_error == Some(tail) {
                 m.push_str("  (no stored output)\n");
             } else {
                 for line in fenced("", tail).lines() {
@@ -779,6 +1014,24 @@ fn render_markdown(doc: &Value, handoff_reasons: &std::collections::HashMap<Stri
     }
     m.push('\n');
 
+    // SMALL-17 (a): the test names the spec writes, ahead of the diffs.
+    m.push_str("## Spec-named tests\n\n");
+    m.push_str(
+        "Test names the spec writes (snake_case words of four or more parts, and the filter of each cargo test command), looked up in the code files of the candidate commit: missing means in neither the candidate nor the run's base, removed means in the base only. A report for you, not a refusal.\n\n",
+    );
+    let spec_tests = doc["spec_tests"].as_array().cloned().unwrap_or_default();
+    if spec_tests.is_empty() {
+        m.push_str("(none)\n");
+    }
+    for t in &spec_tests {
+        let form = match t["form"].as_str() {
+            Some("filter") => format!("filter, {}", t["target"].as_str().unwrap_or("all targets")),
+            other => other.unwrap_or("").to_string(),
+        };
+        m.push_str(&format!("- {} ({form}): {}\n", s(&t["name"]), s(&t["status"])));
+    }
+    m.push('\n');
+
     // (4) diffs
     m.push_str("## Diffs\n\n");
     let diffs = doc["diffs"].as_array().cloned().unwrap_or_default();
@@ -822,6 +1075,17 @@ fn render_markdown(doc: &Value, handoff_reasons: &std::collections::HashMap<Stri
                 for src in c["sources"].as_array().into_iter().flatten() {
                     m.push_str(&format!("  - {} — \"{}\"\n", s(&src["url"]), s(&src["quote"])));
                 }
+            }
+            // SMALL-16: what the worker asked to have verified.
+            m.push_str(
+                "\nVerification requests the worker declared (for reference only; the control plane runs the approved checks):\n",
+            );
+            let requests = doc["verification_requests"].as_array().cloned().unwrap_or_default();
+            if requests.is_empty() {
+                m.push_str("- (none)\n");
+            }
+            for r in &requests {
+                m.push_str(&format!("- {} (cwd: {})\n", s(&r["cmd"]), s(&r["cwd"])));
             }
             m.push('\n');
         }

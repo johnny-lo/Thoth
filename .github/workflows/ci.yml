@@ -1,11 +1,19 @@
-# Tests and clippy on Windows and Linux for every push and pull request.
+# Tests and clippy on Windows and Linux. A push or pull request runs the jobs
+# only in the public repo johnny-lo/Thoth; a manual start (below) runs them in
+# any repository that holds this file.
 #
-# Every job is guarded by `github.repository == 'johnny-lo/Thoth'`: the
-# workflow file also lives in the private development repo, whose Actions
-# minutes are billed, and GitHub Actions has no workflow-level `if`, so the
-# condition has to sit on each job. 實測待確認: a push to the private repo
-# shows the whole run as skipped (check its Actions page after the push; if the
-# jobs ran instead, turn Actions off in that repo's Settings -> Actions).
+# Every job is guarded by `github.repository == 'johnny-lo/Thoth' ||
+# github.event_name == 'workflow_dispatch'`: the workflow file also lives in
+# the private development repo, whose Actions minutes are billed, and GitHub
+# Actions has no workflow-level `if`, so the condition has to sit on each job.
+# A push to the private repo shows the whole run as skipped (observed on
+# 2026-11-22).
+#
+# The workflow can also be started by hand in any repository that holds it:
+# the Actions page's Run workflow button, or `gh workflow run ci.yml --ref
+# BRANCH`. A manual run passes the job guard whatever the repository. In the
+# private repo that uses billed minutes (Windows minutes count double), so it
+# is done on purpose, after a merged batch, not on every push.
 #
 # Marker used below: "實測待確認" (to be confirmed on a real run) marks
 # behaviour of GitHub's runners that has not been observed in a real workflow
@@ -18,9 +26,12 @@ on:
     # Branches only: tag pushes are the release workflow's business.
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # The event name keeps a push from cancelling a manual run of the same branch
+  # (and the other way round); two pushes to one branch still cancel each other.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -32,10 +43,13 @@ env:
 
 jobs:
   windows:
-    if: github.repository == 'johnny-lo/Thoth'
+    if: github.repository == 'johnny-lo/Thoth' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     # The process tests wait on real pings and deadlines for tens of seconds.
-    timeout-minutes: 90
+    # A private repository's Windows runner has two cores: on 2026-11-23 the
+    # suite needed more than 90 minutes there, while the public repository's
+    # runner finished it in about 40.
+    timeout-minutes: 180
     defaults:
       run:
         # Git Bash: two tests read HOME and fail under PowerShell.
@@ -76,7 +90,7 @@ jobs:
         run: 'cargo test --locked --no-fail-fast --bin thoth -- process:: --test-threads=1'
 
   linux:
-    if: github.repository == 'johnny-lo/Thoth'
+    if: github.repository == 'johnny-lo/Thoth' || github.event_name == 'workflow_dispatch'
     # 24.04 ships systemd 255; Thoth needs 254+ (DelegateSubgroup=). 22.04 has
     # 249, and ubuntu-slim has no per-user runtime directory.
     runs-on: ubuntu-24.04
@@ -264,28 +278,37 @@ jobs:
       # turn a new test that starts a runner in some way the pattern misses into
       # a red that looks like a code bug. Add new test files that never start a
       # runner by hand. The list is every tests/*.rs (tests/common/ is a shared
-      # module, not a test target) of this public tree that contains none of
-      # the patterns below, sorted; re-derive it here with:
+      # module, not a test target) that contains none of the patterns below,
+      # sorted, without the files scripts/public_tree.exclude names (they are
+      # not in the public tree, e.g. tests/internal_docs.rs); re-derive it here
+      # with:
       #   grep -L -F -e '.dispatch(' -e 'review_start(' -e '"dispatch"' \
       #     -e '"run-worker"' -e '"resume"' -e '"verify"' -e '"review", "start"' \
       #     tests/*.rs | sed 's|tests/||; s|\.rs$||' | sort
       # and then left out by hand, because they start a runner in a way the
       # patterns miss:
       #   mcp  (launches through the MCP tool `thoth_dispatch`)
+      #   pipeline_new  (`thoth pipeline new` starts the pipeline's background pipeline-run, which on Linux runs in a systemd user unit; no pattern matches it)
       - name: test-without-user-manager
         if: steps.probe.outputs.ok == 'false'
         env:
           PROBE_REASON: ${{ steps.probe.outputs.reason }}
         run: |
           tests=(
+            arena
+            baseline_sweep
             checks_hint
+            child_env
+            ci_workflow
             cli_smoke
             config_registry
-            decision_table
+            config_secrets
             doctor
             extra_buckets
             guide
             init
+            install_scripts
+            line_endings
             live_quota
             live_quota_claude
             live_quota_codex
@@ -297,10 +320,19 @@ jobs:
             profile
             profile_check
             profile_login
+            profile_login_infer
             report
+            scores_refresh_backoff
             settings
             setup
+            spec_lint_claude_write
+            spec_lint_claude_write_order
+            spec_lint_document_checks
+            spec_lint_noise
+            spec_lint_targets
+            spec_secrets
             state_dir
+            suite
             task
             task_close
             transcript

@@ -437,7 +437,7 @@ fn ctrl_c_while_the_cli_is_open_does_not_kill_thoth() {
     let f = common::fixture();
     let home = f.home_path();
     let log = home.join("n-args.jsonl");
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
     // `f.cmd()`'s environment, by hand.
     for var in ["THOTH_RUN_ID", "THOTH_INBOX_DIR", "THOTH_EXE"] {
         c.env_remove(var);

@@ -176,6 +176,10 @@ pub mod event_type {
     /// Written by the runner each time it relaunched the harness after a
     /// transient failure, in the same run (FC-2).
     pub const RUN_RETRY: &str = "run_retry";
+    /// Written by the runner when agy refused the `--effort` a launch carried
+    /// and the runner relaunched it at once without one, in the same run
+    /// (AGY-1, second part).
+    pub const EFFORT_REFUSED: &str = "effort_refused";
     pub const RATE_LIMIT_WARNING: &str = "rate_limit_warning";
     pub const API_RETRY: &str = "api_retry";
     /// Written by the runner through `runner::append_usage` each time a launch

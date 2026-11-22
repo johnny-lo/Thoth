@@ -70,6 +70,60 @@ pub fn create(
     base: Option<&str>,
     json: bool,
 ) -> Result<i32> {
+    let plan = plan_create(paths, cwd, spec_path, title, base)?;
+    let created = commit_create(paths, cwd, plan)?;
+    if !json {
+        for w in &created.warnings {
+            masked_eprintln!("warning: {w}");
+        }
+    }
+    output::emit(json, &created.doc, &created.human);
+    Ok(0)
+}
+
+/// Everything `task create` checks before it writes, in its order; reads
+/// only. ONE-1: `pipeline new` runs these checks before anything is created.
+pub(crate) struct CreatePlan {
+    repo_id: String,
+    root: std::path::PathBuf,
+    conn: rusqlite::Connection,
+    raw: String,
+    parsed: spec::TaskSpec,
+    lint: spec_lint::Report,
+    task_type: Option<String>,
+    difficulty: Option<String>,
+    base_commit: String,
+    base_branch: Option<String>,
+    title: Option<String>,
+    base: Option<String>,
+}
+
+impl CreatePlan {
+    /// The spec's bytes, as `task create` stores them.
+    pub(crate) fn raw(&self) -> &str {
+        &self.raw
+    }
+    pub(crate) fn risk(&self) -> &str {
+        &self.parsed.risk
+    }
+}
+
+/// What `task create` printed: its `--json` document, its human line and
+/// its warnings.
+pub(crate) struct Created {
+    pub(crate) task_id: String,
+    pub(crate) doc: serde_json::Value,
+    pub(crate) human: String,
+    pub(crate) warnings: Vec<String>,
+}
+
+pub(crate) fn plan_create(
+    paths: &Paths,
+    cwd: &Path,
+    spec_path: &Path,
+    title: Option<&str>,
+    base: Option<&str>,
+) -> Result<CreatePlan> {
     let (repo_id, root, conn) = open_repo(paths, cwd)?;
     let raw = std::fs::read_to_string(spec_path)
         .with_context(|| format!("reading spec {}", spec_path.display()))?;
@@ -99,7 +153,41 @@ pub fn create(
     }
     let (task_type, difficulty) = spec::labels(&raw);
     let (base_commit, base_branch) = resolve_base(cwd, base)?;
+    Ok(CreatePlan {
+        repo_id,
+        root,
+        conn,
+        raw,
+        parsed,
+        lint,
+        task_type,
+        difficulty,
+        base_commit,
+        base_branch,
+        title: title.map(str::to_string),
+        base: base.map(str::to_string),
+    })
+}
 
+/// The writes of `task create` after `plan_create` passed: the task row, its
+/// `task_created` event, the finished-task worktree sweep and the warnings.
+pub(crate) fn commit_create(paths: &Paths, cwd: &Path, plan: CreatePlan) -> Result<Created> {
+    let CreatePlan {
+        repo_id,
+        root,
+        conn,
+        raw,
+        parsed,
+        lint,
+        task_type,
+        difficulty,
+        base_commit,
+        base_branch,
+        title,
+        base,
+    } = plan;
+    let title = title.as_deref();
+    let base = base.as_deref();
     let now = ids::now_rfc3339();
     let task_id = ids::new_task_id();
     let title = title
@@ -161,11 +249,6 @@ pub fn create(
     }
     warnings.extend(sweep_error);
     warnings.extend(lint.warning_lines());
-    if !json {
-        for w in &warnings {
-            masked_eprintln!("warning: {w}");
-        }
-    }
     let v = serde_json::json!({
         "ok": true,
         "task_id": task_id,
@@ -175,8 +258,7 @@ pub fn create(
         "title": title,
         "warnings": warnings,
     });
-    output::emit(json, &v, &format!("{task_id}  queued  {title}"));
-    Ok(0)
+    Ok(Created { human: format!("{task_id}  queued  {title}"), task_id, doc: v, warnings })
 }
 
 /// BASE-1: the task's start and the local branch it was taken from. `base`
@@ -406,6 +488,20 @@ const DOCUMENT_CLOSE_STATUSES: &[TaskStatus] = &[
 /// finished task, this one included (WT-1); its branch stays, and a worktree
 /// with uncommitted changes is kept and reported.
 pub fn close(paths: &Paths, cwd: &Path, needle: &str, reason: &str, json: bool) -> Result<i32> {
+    let (v, human) = close_quiet(paths, cwd, needle, reason)?;
+    output::emit(json, &v, &human);
+    Ok(0)
+}
+
+/// `close` without printing: its `--json` document and its human text.
+/// ONE-1: `pipeline new` closes the task it created this way when the
+/// pipeline start is refused after the creation.
+pub(crate) fn close_quiet(
+    paths: &Paths,
+    cwd: &Path,
+    needle: &str,
+    reason: &str,
+) -> Result<(serde_json::Value, String)> {
     let reason = reason.trim();
     if reason.is_empty() {
         bail!("task close needs a non-empty --reason");
@@ -476,8 +572,7 @@ pub fn close(paths: &Paths, cwd: &Path, needle: &str, reason: &str, json: bool) 
     });
     let mut human = format!("{task_id} closed ({} -> cancelled)", task.status);
     report_cleanup(&cleanup, &mut v, &mut human);
-    output::emit(json, &v, &human);
-    Ok(0)
+    Ok((v, human))
 }
 
 /// Adds what the sweep of `task close` / `task accept` did to its `--json`

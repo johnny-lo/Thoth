@@ -56,7 +56,7 @@ fn init_is_idempotent() {
 fn init_outside_a_git_repo_fails() {
     let f = common::fixture();
     let elsewhere = tempfile::tempdir().unwrap();
-    let mut c = assert_cmd::Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed_assert(assert_cmd::Command::new(env!("CARGO_BIN_EXE_thoth")));
     c.env("THOTH_HOME", f.home_path())
         .current_dir(elsewhere.path())
         .arg("init")

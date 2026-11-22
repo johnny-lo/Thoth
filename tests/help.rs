@@ -1,3 +1,5 @@
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::{Path, PathBuf};
@@ -14,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// alongside the command rather than discarding it.
 fn thoth() -> (Command, tempfile::TempDir) {
     let home = tempfile::tempdir().expect("tempdir");
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed_assert(Command::new(env!("CARGO_BIN_EXE_thoth")));
     // Same reason as `common::Fixture::cmd`: a suite run inside a thoth
     // worker must not inherit that worker's run id or inbox.
     for var in ["THOTH_RUN_ID", "THOTH_INBOX_DIR", "THOTH_EXE"] {
@@ -66,26 +68,176 @@ fn this_repos_real_state_dir() -> PathBuf {
         .join(repo_id_for(root))
 }
 
+/// The first word of each line of the Commands section of a top-level help
+/// text: the lines from `Commands:` to the first blank line.
+fn listed_commands(help: &str) -> Vec<String> {
+    let mut lines = help.lines().skip_while(|l| l.trim_end() != "Commands:");
+    assert!(lines.next().is_some(), "no `Commands:` section in:\n{help}");
+    lines
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| l.split_whitespace().next().unwrap().to_string())
+        .collect()
+}
+
+/// Everything after the Options section's last option line: the closing
+/// paragraph `thoth --help` prints (empty when there is none).
+fn closing_paragraph(help: &str) -> String {
+    let mut in_options = false;
+    let mut after_options = Vec::new();
+    let mut blank_after_options = false;
+    for l in help.lines() {
+        if l.trim_end() == "Options:" {
+            in_options = true;
+            continue;
+        }
+        if in_options && l.trim().is_empty() {
+            blank_after_options = true;
+            continue;
+        }
+        if blank_after_options {
+            after_options.push(l);
+        }
+    }
+    after_options.join("\n")
+}
+
+const HIDDEN_FROM_HELP: [&str; 4] = ["submit", "decision", "transcript", "records"];
+
 #[test]
 fn every_documented_command_exists_and_run_worker_stays_hidden() {
     let (mut c, _home) = thoth();
     let out = c.arg("--help").assert().success().get_output().stdout.clone();
     let help = String::from_utf8(out).unwrap();
+    let listed = listed_commands(&help);
     for cmd in [
         // Phase 1
         "init", "profile", "task", "dispatch", "status", "events", "wait", "cancel", "resume",
-        "submit",
         // Phase 2
-        "evidence", "review", "verify", "decision", "config",
+        "evidence", "review", "verify", "config",
         // P7-1a
         "checks",
     ] {
-        assert!(help.contains(cmd), "`{cmd}` missing from --help:\n{help}");
+        assert!(
+            listed.iter().any(|l| l == cmd),
+            "`{cmd}` missing from the Commands section of --help:\n{help}"
+        );
     }
     assert!(
         !help.contains("run-worker"),
         "run-worker must stay hidden:\n{help}"
     );
+}
+
+/// CLI-1: the Commands section lists exactly the main-flow commands, in
+/// order; the four commands the main flow does not use are hidden from it
+/// and named in a closing paragraph instead.
+#[test]
+fn help_lists_exactly_the_main_flow_commands_and_closes_with_the_hidden_four() {
+    let expected = [
+        "config", "init", "mcp", "guide", "doctor", "setup", "profile", "recommend", "models",
+        "report", "retro", "task", "dispatch", "status", "events", "wait", "cancel", "resume",
+        "evidence", "review", "spec", "verify", "checks", "suite", "worktrees", "pipeline",
+        "help",
+    ];
+    let (mut c, _home) = thoth();
+    let out = c.arg("--help").assert().success().get_output().stdout.clone();
+    let help = String::from_utf8(out).unwrap();
+    assert_eq!(listed_commands(&help), expected, "Commands section of:\n{help}");
+    for hidden in ["run-worker", "hook", "pipeline-run"] {
+        assert!(
+            !help.contains(hidden),
+            "{hidden} must not be named anywhere in --help:\n{help}"
+        );
+    }
+
+    let closing = closing_paragraph(&help);
+    assert!(
+        !closing.trim().is_empty() && closing.lines().count() <= 2,
+        "the closing paragraph must exist and be at most two lines, got {closing:?} in:\n{help}"
+    );
+    assert!(
+        !closing.lines().any(|l| l.starts_with(' ')),
+        "the closing paragraph must not look like a list line: {closing:?}"
+    );
+    for name in HIDDEN_FROM_HELP {
+        assert!(closing.contains(name), "closing paragraph lacks `{name}`: {closing:?}");
+    }
+    assert!(closing.contains("thoth help COMMAND"), "{closing:?}");
+    assert!(closing.contains("docs/adapter-usage.md"), "{closing:?}");
+
+    // The same closing text wherever the top-level help is printed.
+    let (mut c, _home) = thoth();
+    let short = c.arg("-h").assert().success().get_output().stdout.clone();
+    assert_eq!(closing_paragraph(&String::from_utf8(short).unwrap()), closing);
+    let (mut c, _home) = thoth();
+    let bare = c.arg("help").assert().success().get_output().stdout.clone();
+    assert_eq!(closing_paragraph(&String::from_utf8(bare).unwrap()), closing);
+    let (mut c, _home) = thoth();
+    let none = c.assert().failure().get_output().stderr.clone();
+    assert_eq!(closing_paragraph(&String::from_utf8(none).unwrap()), closing);
+}
+
+/// CLI-1: hidden is only hidden from the list. Each of the four still prints
+/// its own help the same two ways, and `records export --json` still runs.
+#[test]
+fn hidden_commands_still_print_their_own_help_and_still_run() {
+    for name in HIDDEN_FROM_HELP {
+        let (mut c, _home) = thoth();
+        let via_flag = c.args([name, "--help"]).assert().success().get_output().stdout.clone();
+        let (mut c, _home) = thoth();
+        let via_help = c.args(["help", name]).assert().success().get_output().stdout.clone();
+        let text = String::from_utf8(via_flag.clone()).unwrap();
+        // On Windows the program names itself with its suffix (`thoth.exe`).
+        let own_usage = [
+            format!("Usage: thoth {name}"),
+            format!("Usage: thoth{} {name}", std::env::consts::EXE_SUFFIX),
+        ];
+        assert!(
+            text.lines().any(|l| own_usage.iter().any(|u| l.starts_with(u.as_str()))),
+            "`{name} --help` lacks its own Usage line:\n{text}"
+        );
+        assert_eq!(via_flag, via_help, "`{name} --help` and `help {name}` differ");
+    }
+
+    // A real run with --json: a fresh THOTH_HOME needs its global store first,
+    // which `profile list` creates through the interface.
+    let (mut c, home) = thoth();
+    let records = home.path().join("shared-records");
+    std::fs::create_dir_all(&records).unwrap();
+    c.args(["config", "set", "records-dir"])
+        .arg(&records)
+        .arg("--json")
+        .assert()
+        .success();
+    let (mut c, _) = thoth_in(home.path());
+    c.args(["profile", "list", "--json"]).assert().success();
+    let (mut c, _) = thoth_in(home.path());
+    let out = c
+        .args(["records", "export", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    for key in ["path", "machine", "lines", "repos"] {
+        assert!(v.get(key).is_some(), "records export --json lacks `{key}`: {v}");
+    }
+}
+
+/// Another command over an existing `THOTH_HOME`. It returns `(Command, ())`:
+/// the `()` only gives the tuple the same shape as `thoth()`, whose second
+/// element is the `TempDir` that owns the home. There is nothing to keep alive
+/// here, because the home belongs to the caller.
+fn thoth_in(home: &Path) -> (Command, ()) {
+    let mut c = common::scrubbed_assert(Command::new(env!("CARGO_BIN_EXE_thoth")));
+    for var in ["THOTH_RUN_ID", "THOTH_INBOX_DIR", "THOTH_EXE"] {
+        c.env_remove(var);
+    }
+    c.env("THOTH_HOME", home);
+    c.env("THOTH_CLAUDE_BIN", env!("CARGO_BIN_EXE_fake-claude"));
+    (c, ())
 }
 
 /// Every Phase 2 surface an operator can type must be in the Phase 2 guide, and

@@ -20,6 +20,9 @@
 //! `FAKE_AGY_PRINT_TIMEOUT=1` prints agy's print-timeout line on stderr after init, then an
 //! empty SUCCESS result and exit 0, with no result.json and no commit.
 //! `FAKE_AGY_PRINT_TIMEOUT_BAD_BYTES=1` does the same, with a stderr line of invalid UTF-8 first.
+//! `FAKE_AGY_INDEX_WAIT_MS` (whole milliseconds above 0; unset or invalid
+//! keeps 30000) is how long the agent mode waits for `.agent/evidence-index.json`
+//! to hold one row per command it ran before it writes result.json anyway.
 //!
 //! AGY-1: the tool names are agy 1.4.4's. Files are read with `read_file`
 //! (parameter `Path`, as the hook payload of 2026-10-21 showed) and written
@@ -35,7 +38,19 @@
 //! low, medium, high, xhigh, max)` and exits 1, and a `--model` whose name
 //! ends in a level together with `--effort` prints `--model X conflicts with
 //! --effort=Y` and exits 1 (both strings are agy.exe's; how the real agy
-//! reports them is unconfirmed). `FAKE_AGY_EXTRA_TOOLS` (comma-separated
+//! reports them is unconfirmed). `FAKE_AGY_NO_EFFORT_MODELS`
+//! (comma-separated ids, unset by default): a `-p` launch of a listed model
+//! that carries `--effort` prints, right after those two checks (before the
+//! model check and before `FAKE_ATTEMPTS_FILE` counts the launch), an ERROR
+//! result with an empty `conversation_id` whose `error` (also on stderr) is
+//! agy 1.5.14's `invalid model selection (--model "MODEL" --effort "LEVEL"):
+//! --effort is not supported for model "MODEL"`, and exits 1; the same model
+//! without `--effort` runs its scenario. Scenarios `no_capacity` (init line,
+//! then an ERROR result) and `no_capacity_before_init` (no init line, an
+//! empty `conversation_id`) answer agy 1.5.14's `Our servers are experiencing
+//! high traffic right now, please try again in a minute. (UNAVAILABLE (code
+//! 503): No capacity available for model MODEL on the server)` and exit 3;
+//! MODEL and LEVEL are the launch's own. `FAKE_AGY_EXTRA_TOOLS` (comma-separated
 //! names, in order) makes every implementer flow (`ok`, `background`,
 //! `no_exit_code`, `subagent`, `resume`, `quota`, `crash`, `research_*`) try each name
 //! through the hooks before its first ordinary tool call, with an empty
@@ -58,6 +73,25 @@
 //! prompt's `Every id in "criteria" must be one of:` line and the cited code
 //! from the packet's `- E00x | ` index lines. `review_reject` marks the first
 //! criterion unmet with a REJECT; `review_bad` does too but says PASS.
+//!
+//! EVOPEN-1 switches for `review_pass`, `review_reject` and `review_bad`
+//! (unset, each behaves as before):
+//! - `FAKE_REVIEW_READS` (comma-separated codes; set, even empty): after
+//!   packet.md, read each listed code's file in order (steps 5, 6, ...)
+//!   instead of the first code's file; empty reads packet.md only. A missing
+//!   file is the usual ERROR step
+//! - `FAKE_REVIEW_CITES` (comma-separated codes): every criterion cites
+//!   these instead of the first code
+//! - `FAKE_REVIEW_READ_FORM`: how each path is written: `absolute` (the
+//!   current folder's absolute path, `/`-joined; unset keeps the path as
+//!   `read_file` always wrote it, the current folder joined by the platform),
+//!   `relative` or `dot` (`./` first)
+//! - `FAKE_REVIEW_READ_TOOL=view_file`: read with `view_file` and
+//!   `AbsolutePath` (the agy 1.2.x shape) instead of `read_file` and `Path`
+//! - `FAKE_REVIEW_EXTRA_READS` (a JSON array of strings): after those reads,
+//!   one `read_file` step per string as its `Path`, DONE with the text when
+//!   that path (relative to the current folder) can be read, else the usual
+//!   ERROR step
 //!
 //! SR-2 spec reviewer scenarios (`spec_review_approve`, `spec_review_revise`,
 //! `spec_review_no_output`) make the same two leak attempts (`write_file` of
@@ -117,7 +151,20 @@
 //!
 //! W3: `FAKE_PROMPT_COPY=<path>` writes the `-p` value of a worker or
 //! reviewer (stream-json) launch, byte for byte, to that file (overwriting);
-//! the `-p /usage` call does not write it. Unset by default.
+//! the `-p /usage` call does not write it. Unset by default. SMALL-16: when
+//! thoth put a long prompt into a file and the `-p` value is the sentence
+//! naming it ("Your full instructions are in the file PATH. Read that whole
+//! file ..."), the copy is that sentence, and the reviewer and spec reviewer
+//! scenarios read the prompt (criterion ids, categories) from the named file,
+//! as a real agy would with its file tool; the path is relative to the
+//! working directory.
+//!
+//! Environment switches, unset by default, on the same launches as
+//! `FAKE_PROMPT_COPY`: `FAKE_ENV_LOG=<path>` appends one JSON line
+//! `{"names":[...]}`, the sorted names of the launch's environment variables,
+//! never a value (as in fake-claude and fake-codex); GITENV-1's
+//! `FAKE_GIT_ENV_LOG=<path>` appends `{"git_config":{NAME: VALUE}}` with only
+//! the variables whose names start with `GIT_CONFIG_`.
 //!
 //! FC-2 switches, unset by default: `FAKE_ATTEMPTS_FILE=<path>` makes every
 //! stream-json launch (not `models`, `-p /usage`, `--version` or the
@@ -167,6 +214,37 @@ use std::path::Path;
 
 /// The file the interactive login writes; Thoth itself never knows it.
 const LOGIN_MARKER: &str = "fake-login.ok";
+
+/// RD-2, as in fake-claude: appends `{"names":[...]}` to `FAKE_ENV_LOG`, the
+/// sorted names of this stream-json launch's environment variables. Names
+/// only, never a value. Unset: writes nothing.
+fn log_env_names() {
+    let Some(path) = std::env::var_os("FAKE_ENV_LOG") else { return };
+    let mut names: Vec<String> =
+        std::env::vars_os().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+    names.sort();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", serde_json::json!({"names": names}));
+    }
+}
+
+/// GITENV-1, as in fake-claude: appends `{"git_config":{NAME: VALUE, ...}}`
+/// to `FAKE_GIT_ENV_LOG`, only this launch's variables whose names start with
+/// `GIT_CONFIG_`, with their values; no other variable is read. Unset: writes
+/// nothing.
+fn log_git_config_env() {
+    let Some(path) = std::env::var_os("FAKE_GIT_ENV_LOG") else { return };
+    let vars: serde_json::Map<String, serde_json::Value> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let name = k.into_string().ok()?;
+            name.starts_with("GIT_CONFIG_")
+                .then(|| (name, serde_json::Value::String(v.to_string_lossy().into_owned())))
+        })
+        .collect();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", serde_json::json!({"git_config": vars}));
+    }
+}
 
 /// FC-2: appends `resume <id>` or `fresh <id>` to `FAKE_ATTEMPTS_FILE` and
 /// returns how many lines it now holds (this launch's number, from 1).
@@ -265,6 +343,23 @@ fn known_models() -> Vec<String> {
     }
 }
 
+/// AGY-1 (second part): the models `FAKE_AGY_NO_EFFORT_MODELS`
+/// (comma-separated ids) lists; empty when unset.
+fn no_effort_models() -> Vec<String> {
+    std::env::var("FAKE_AGY_NO_EFFORT_MODELS")
+        .map(|list| list.split(',').map(str::trim).filter(|m| !m.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// AGY-1 (second part): agy 1.5.14's no-capacity answer of 2026-11-23, for
+/// the launch's own model.
+fn no_capacity_text(model: &str) -> String {
+    format!(
+        "Our servers are experiencing high traffic right now, please try again in a minute. \
+         (UNAVAILABLE (code 503): No capacity available for model {model} on the server)"
+    )
+}
+
 /// The built-in `/usage` answer, shaped like the real agy 1.2.2 sample.
 fn usage_json() -> serde_json::Value {
     serde_json::json!({"status":"SUCCESS","num_turns":0,"command":{"name":"usage","data":{"groups":[
@@ -300,6 +395,20 @@ fn emit(value: serde_json::Value) {
 
 fn value(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// SMALL-16: the prompt a launch is to follow. When the `-p` value is thoth's
+/// one-sentence pointer ("Your full instructions are in the file PATH. Read
+/// that whole file ..."), the text of that file; otherwise the `-p` value.
+fn prompt_text(args: &[String]) -> String {
+    let given = value(args, "-p").unwrap_or_default();
+    let path = given
+        .strip_prefix("Your full instructions are in the file ")
+        .and_then(|rest| rest.split(". Read that whole file").next());
+    match path.map(std::fs::read_to_string) {
+        Some(Ok(text)) => text,
+        _ => given,
+    }
 }
 
 fn log_args(args: &[String]) {
@@ -528,11 +637,23 @@ fn research_claims(scenario: &str) -> Vec<serde_json::Value> {
     }
 }
 
+/// TEST-7a: how long `write_result` waits for the runner's evidence index to
+/// hold one row per command: `FAKE_AGY_INDEX_WAIT_MS` (whole milliseconds
+/// above 0), else 30 s.
+fn index_wait() -> std::time::Duration {
+    let ms = std::env::var("FAKE_AGY_INDEX_WAIT_MS")
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(30_000);
+    std::time::Duration::from_millis(ms)
+}
+
 fn write_result(expected_rows: usize, scenario: &str) {
     let index = Path::new(".agent").join("evidence-index.json");
     let mut codes = Vec::new();
     if index.exists() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + index_wait();
         loop {
             if let Ok(text) = std::fs::read_to_string(&index) {
                 if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
@@ -565,21 +686,49 @@ fn write_result(expected_rows: usize, scenario: &str) {
 /// text, or ERROR naming the missing file. Returns the text when it was read.
 fn read_file(agy: &Agy<'_>, index: i64, path: &Path) -> Option<String> {
     let absolute = std::env::current_dir().unwrap().join(path).display().to_string();
-    if !agy.allowed(index, "read_file", serde_json::json!({"Path": absolute})) {
+    read_as(agy, index, "read_file", &absolute, path)
+}
+
+/// One file-reading step: `tool` (`read_file` with `Path`, or EVOPEN-1's
+/// `view_file` with `AbsolutePath`) naming `shown`, reading `real`.
+fn read_as(agy: &Agy<'_>, index: i64, tool: &str, shown: &str, real: &Path) -> Option<String> {
+    let key = if tool == "view_file" { "AbsolutePath" } else { "Path" };
+    if !agy.allowed(index, tool, serde_json::json!({ key: shown })) {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok();
-    let mut info = serde_json::json!({"name": "read_file", "parameters": {"Path": absolute}});
+    let text = std::fs::read_to_string(real).ok();
+    let mut info = serde_json::json!({"name": tool, "parameters": { key: shown }});
     match &text {
         Some(text) => info["output"] = text.as_str().into(),
         None => {
             info["result"] = "ERROR".into();
-            info["error"] = format!("file not found: {absolute}").into();
+            info["error"] = format!("file not found: {shown}").into();
         }
     }
     emit(serde_json::json!({"event":"step_update","step_update":{"conversation_id":agy.id,
-        "step_index":index,"state":"DONE","step_type":"tool","tool_name":"read_file","tool_info":info}}));
+        "step_index":index,"state":"DONE","step_type":"tool","tool_name":tool,"tool_info":info}}));
     text
+}
+
+/// EVOPEN-1: a comma-separated code list; empty is no code.
+fn code_list(list: &str) -> Vec<String> {
+    list.split(',').map(str::trim).filter(|c| !c.is_empty()).map(String::from).collect()
+}
+
+/// EVOPEN-1: `FAKE_REVIEW_READ_FORM` for one code's file: `relative`, `dot`
+/// or `absolute` (the current folder, `/`-joined); `None` is the absolute
+/// path as `read_file` always wrote it.
+fn review_read_path(code: &str, form: Option<&str>) -> Option<String> {
+    let relative = format!(".agent/review-input/evidence/{code}.txt");
+    match form {
+        Some("relative") => Some(relative),
+        Some("dot") => Some(format!("./{relative}")),
+        Some("absolute") => {
+            let cwd = std::env::current_dir().unwrap().display().to_string().replace('\\', "/");
+            Some(format!("{}/{relative}", cwd.trim_end_matches('/')))
+        }
+        _ => None,
+    }
 }
 
 /// RFIX-1: the edit reviewer and the confirmer.
@@ -673,8 +822,29 @@ fn review(agy: &Agy<'_>, scenario: &str, prompt: &str) {
         .filter(|c| c.len() > 1 && c.starts_with('E') && c[1..].chars().all(|ch| ch.is_ascii_digit()))
         .map(String::from)
         .collect();
-    if let Some(first) = codes.first() {
-        read_file(agy, 5, &input.join("evidence").join(format!("{first}.txt")));
+    // EVOPEN-1: the switches of the module doc, for three scenarios only.
+    let switched = matches!(scenario, "review_pass" | "review_reject" | "review_bad");
+    let switch = |name: &str| if switched { std::env::var(name).ok() } else { None };
+    let reads: Vec<String> = match switch("FAKE_REVIEW_READS") {
+        Some(list) => code_list(&list),
+        None => codes.first().cloned().into_iter().collect(),
+    };
+    let form = switch("FAKE_REVIEW_READ_FORM");
+    let tool = switch("FAKE_REVIEW_READ_TOOL").filter(|t| t == "view_file").unwrap_or_else(|| "read_file".into());
+    let mut index = 5;
+    for code in &reads {
+        let real = input.join("evidence").join(format!("{code}.txt"));
+        let shown = review_read_path(code, form.as_deref())
+            .unwrap_or_else(|| std::env::current_dir().unwrap().join(&real).display().to_string());
+        read_as(agy, index, &tool, &shown, &real);
+        index += 1;
+    }
+    let extra: Vec<String> = switch("FAKE_REVIEW_EXTRA_READS")
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    for path in &extra {
+        read_as(agy, index, "read_file", path, Path::new(path));
+        index += 1;
     }
     let mut ids: Vec<String> = prompt
         .lines()
@@ -684,7 +854,10 @@ fn review(agy: &Agy<'_>, scenario: &str, prompt: &str) {
     if ids.is_empty() {
         ids.push("AC1".into());
     }
-    let cite: Vec<String> = codes.first().cloned().into_iter().collect();
+    let cite: Vec<String> = match switch("FAKE_REVIEW_CITES") {
+        Some(list) => code_list(&list),
+        None => codes.first().cloned().into_iter().collect(),
+    };
     let rejecting = scenario == "review_reject";
     let unmet_first = rejecting || scenario == "review_bad";
     // `review_reject` labels its unmet criterion with the prompt's first
@@ -715,7 +888,7 @@ fn review(agy: &Agy<'_>, scenario: &str, prompt: &str) {
     // RFIX-2: `review_bad` stays as malformed as it was.
     let doc = if scenario == "review_bad" { doc } else { review_fix::with_empty_edits(doc, prompt) };
     let text = format!("{doc}\n");
-    response_step(id, 6, 120, &text);
+    response_step(id, index.max(6), 120, &text);
     let mut body = serde_json::json!({"conversation_id":id,"status":"SUCCESS","response":text,
         "duration_seconds":1,"num_turns":1,"usage":{"input_tokens":100,"output_tokens":160,
         "thinking_tokens":0,"cache_read_tokens":0,"total_tokens":260}});
@@ -951,6 +1124,8 @@ fn main() {
     if let Ok(path) = std::env::var("FAKE_PROMPT_COPY") {
         let _ = std::fs::write(path, value(&args, "-p").unwrap_or_default().as_bytes());
     }
+    log_env_names();
+    log_git_config_env();
     let model = value(&args, "--model").unwrap();
     let model_name = model.clone();
     // AGY-1: agy's own `--effort` checks, with agy.exe's strings (how the
@@ -965,6 +1140,16 @@ fn main() {
         }
         if EFFORT_LEVELS.iter().any(|level| model.ends_with(&format!("-{level}"))) {
             let error = format!("--model {model} conflicts with --effort={effort}");
+            result("", "ERROR", &error, 0);
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        // AGY-1 (second part): a model agy lists but refuses an effort for,
+        // with the text agy 1.5.14 printed on 2026-11-23.
+        if no_effort_models().contains(&model) {
+            let error = format!(
+                "invalid model selection (--model \"{model}\" --effort \"{effort}\"): --effort is not supported for model \"{model}\""
+            );
             result("", "ERROR", &error, 0);
             eprintln!("{error}");
             std::process::exit(1);
@@ -1001,6 +1186,12 @@ fn main() {
         result("", "ERROR", RECORDED_ELIGIBILITY, 0);
         eprintln!("error: {RECORDED_ELIGIBILITY}");
         std::process::exit(1);
+    }
+    // AGY-1 (second part): agy's no-capacity answer before it named the
+    // conversation: no init line, an empty conversation id, exit 3.
+    if scenario == "no_capacity_before_init" {
+        result("", "ERROR", &no_capacity_text(&model), 0);
+        std::process::exit(3);
     }
     // AGY-1 (AC3): `FAKE_AGY_INIT_TOOLS` is raw JSON for the `tools` value
     // (`[]`, `null`, a list with a non-string, a non-array), so a test can
@@ -1047,6 +1238,11 @@ fn main() {
         result(&conversation, "ERROR", "RESOURCE_EXHAUSTED: quota exceeded, try again later", 1);
         std::process::exit(1);
     }
+    // AGY-1 (second part): agy's no-capacity answer after init; exit 3.
+    if scenario == "no_capacity" {
+        result(&conversation, "ERROR", &no_capacity_text(&model), 1);
+        std::process::exit(3);
+    }
     // FC-1: the recorded network failure; agy exited 3.
     if scenario == "network" {
         result(&conversation, "ERROR", RECORDED_NETWORK_ISSUE, 1);
@@ -1082,11 +1278,11 @@ fn main() {
         return;
     }
     if scenario.starts_with("spec_review_") {
-        spec_review(&agy, &scenario, &value(&args, "-p").unwrap());
+        spec_review(&agy, &scenario, &prompt_text(&args));
         return;
     }
     if scenario.starts_with("review_") || scenario.starts_with("source_check") {
-        review(&agy, &scenario, &value(&args, "-p").unwrap());
+        review(&agy, &scenario, &prompt_text(&args));
         return;
     }
     let resume = scenario == "resume";

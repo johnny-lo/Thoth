@@ -45,7 +45,7 @@ use crate::spec_review_json::{self, SpecReviewDocument, SpecVerdict};
 use crate::spec_review_prompt;
 use crate::worktree;
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// H11: the risks whose first dispatch needs an APPROVE of the current spec.
@@ -902,13 +902,7 @@ pub fn write_confirm_input(
 
 /// The detail of the newest event of `type` written on run `run_id`.
 fn run_event_detail(conn: &Connection, run_id: &str, ty: &str) -> Result<Option<serde_json::Value>> {
-    let detail: Option<String> = conn
-        .query_row(
-            "SELECT detail FROM events WHERE run_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
-            rusqlite::params![run_id, ty],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let detail: Option<String> = state::latest_event_detail_of_run(conn, run_id, ty)?;
     Ok(detail.and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok()))
 }
 
@@ -1183,7 +1177,7 @@ fn launch(paths: &Paths, cwd: &Path, args: LaunchArgs<'_>) -> Result<i32> {
         .is_some_and(|c| c.recovered && c.profile.status == "rate_limited");
     let allowed_tools =
         adapter.reviewer_allowed_tools(crate::commands::review::REVIEWER_ALLOWED_TOOLS, false);
-    let launch = auto_pick::launch_settings(&choice, &profile);
+    let launch = auto_pick::launch_settings(&gconn, &choice, &profile);
     // SMALL-9b: the effort sent picks the limit.
     let timeout_seconds = args
         .timeout_seconds

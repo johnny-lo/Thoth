@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 fn guide_cmd(home: &std::path::Path, cwd: &std::path::Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
     c.current_dir(cwd)
         .env("THOTH_HOME", home)
         .env_remove("THOTH_RUN_ID")
@@ -77,7 +77,7 @@ fn the_guide_is_the_current_plugin_skill() {
 
 #[test]
 fn ac1_help_lists_guide() {
-    let out = Command::new(env!("CARGO_BIN_EXE_thoth"))
+    let out = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")))
         .arg("--help")
         .output()
         .unwrap();

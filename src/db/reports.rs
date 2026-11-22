@@ -180,13 +180,26 @@ pub fn account_rate_limit_warnings(conn: &Connection, profile: &str) -> Result<V
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// `usage`'s `live_runs`: how many runs of `profile` are queued or running.
+/// `usage`'s `live_runs`: how many runs of `profile` are queued or running,
+/// leaving out a `running` run whose runner is gone (SMALL-11 (4): stale
+/// heartbeat and a recorded runner pid that is no thoth process), which
+/// `thoth status` settles as `interrupted`.
 pub fn live_run_count(conn: &Connection, profile: &str) -> Result<i64> {
-    Ok(conn.query_row(
-            "SELECT COUNT(*) FROM runs WHERE account=?1 AND status IN ('queued','running')",
-            [profile],
-            |r| r.get::<_, i64>(0),
-        )?)
+    let mut stmt = conn.prepare(
+        "SELECT status, heartbeat_at, runner_pid FROM runs WHERE account=?1 AND status IN ('queued','running')",
+    )?;
+    let rows = stmt
+        .query_map([profile], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let now = crate::ids::now_rfc3339();
+    Ok(rows
+        .iter()
+        .filter(|(status, heartbeat, pid)| {
+            !crate::runner::runner_is_gone(status, heartbeat.as_deref(), *pid, &now)
+        })
+        .count() as i64)
 }
 
 /// `usage`'s `resolve_task`: every task id.
@@ -384,4 +397,242 @@ pub fn other_started_runs(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+// ------------------------------------------------------------ task history, retro
+
+/// One run as `task_history` reads it: the verdict is the newest review of
+/// the run (of the run as reviewer for role `reviewer`, as target otherwise).
+/// `attempt` reads 0 when NULL; profile, provider, model and status are empty
+/// when NULL; `spec` and `verdict` stay optional.
+pub struct NewestRun {
+    pub run_id: String,
+    pub attempt: i64,
+    pub profile: String,
+    pub provider: String,
+    pub model: String,
+    pub spec: Option<String>,
+    pub status: String,
+    pub verdict: Option<String>,
+}
+
+/// `task_history`'s `newest_run`: the newest run of `role` of the task, or
+/// `None` when there is none.
+pub fn newest_run_of_role(conn: &Connection, task_id: &str, role: &str) -> Result<Option<NewestRun>> {
+    let verdict_sql = if role == "reviewer" {
+        "SELECT verdict FROM reviews WHERE reviewer_run_id=r.run_id ORDER BY created_at DESC, review_id DESC LIMIT 1"
+    } else {
+        "SELECT verdict FROM reviews WHERE target_run_id=r.run_id ORDER BY created_at DESC, review_id DESC LIMIT 1"
+    };
+    let sql = format!(
+        "SELECT r.run_id, r.attempt, COALESCE(r.account,''), COALESCE(r.provider,''), COALESCE(r.model,''),
+                r.spec, COALESCE(r.status,''), ({verdict_sql})
+         FROM runs r WHERE r.task_id=?1 AND r.role=?2
+         ORDER BY COALESCE(r.started_at,'') DESC, r.rowid DESC LIMIT 1"
+    );
+    let row = conn
+        .query_row(&sql, [task_id, role], |r| {
+            Ok(NewestRun {
+                run_id: r.get::<_, String>(0)?,
+                attempt: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                profile: r.get::<_, String>(2)?,
+                provider: r.get::<_, String>(3)?,
+                model: r.get::<_, String>(4)?,
+                spec: r.get::<_, Option<String>>(5)?,
+                status: r.get::<_, String>(6)?,
+                verdict: r.get::<_, Option<String>>(7)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+/// One review of a target run with its task, as `retro` reads it; the text
+/// columns are empty when NULL.
+pub struct ReviewWithTask {
+    pub review_id: String,
+    pub created_at: String,
+    pub findings: String,
+    pub task_id: String,
+    pub title: String,
+}
+
+/// `retro`'s `load_reviews`: every review joined to its target run and task.
+pub fn review_rows_with_task(conn: &Connection) -> Result<Vec<ReviewWithTask>> {
+    let mut stmt = conn.prepare(
+        "SELECT v.review_id, COALESCE(v.created_at, ''), COALESCE(v.findings, ''),
+                COALESCE(r.task_id, ''), COALESCE(t.title, '')
+         FROM reviews v
+         JOIN runs r ON r.run_id = v.target_run_id
+         LEFT JOIN tasks t ON t.task_id = r.task_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ReviewWithTask {
+            review_id: r.get(0)?,
+            created_at: r.get(1)?,
+            findings: r.get(2)?,
+            task_id: r.get(3)?,
+            title: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// MEAS-1: one review with its task and the attempt of its target run, as
+/// `retro` reads them to tell which records had a REJECT to mark.
+pub struct ReviewAttempt {
+    pub review_id: String,
+    pub task_id: String,
+    /// `None` when the target run is not found.
+    pub attempt: Option<i64>,
+    pub verdict: String,
+}
+
+/// MEAS-1: every review in age order (the order `list_reviews_for_task`
+/// gives a task's reviews), with its task (through its target run, or its
+/// reviewer run when the target is empty) and its target run's attempt.
+pub fn review_attempts(conn: &Connection) -> Result<Vec<ReviewAttempt>> {
+    let mut stmt = conn.prepare(
+        "SELECT v.review_id, COALESCE(ru.task_id, ''), t.attempt, COALESCE(v.verdict, '')
+         FROM reviews v
+         JOIN runs ru ON ru.run_id = COALESCE(NULLIF(v.target_run_id, ''), v.reviewer_run_id)
+         LEFT JOIN runs t ON t.run_id = v.target_run_id
+         ORDER BY v.created_at, v.review_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ReviewAttempt {
+            review_id: r.get(0)?,
+            task_id: r.get(1)?,
+            attempt: r.get(2)?,
+            verdict: r.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// ------------------------------------------------------------ records
+
+/// `records`' `latest_event`: the detail of the run's newest event of `kind`.
+/// A missing row and a NULL detail read as `None`; a database error is an
+/// error (the caller decides to swallow it).
+pub fn latest_event(conn: &Connection, run_id: &str, kind: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT detail FROM events WHERE run_id=?1 AND type=?2 ORDER BY seq DESC LIMIT 1",
+            [run_id, kind],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// `records`' `latest_verdict`: the verdict of the newest review where the
+/// run is the reviewer (`role` is `reviewer`) or the target (any other role).
+/// A missing row and a NULL verdict read as `None`; a database error is an
+/// error. (Not `latest_verdict`: that name is the `models` read above.)
+pub fn latest_verdict_of_role(conn: &Connection, role: &str, run_id: &str) -> Result<Option<String>> {
+    let column = if role == "reviewer" { "reviewer_run_id" } else { "target_run_id" };
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT verdict FROM reviews WHERE {column}=?1 ORDER BY created_at DESC, review_id DESC LIMIT 1"
+            ),
+            [run_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// `records`' `collect_counted`: the `root_path` of a registered repository
+/// (global database); `None` for an unknown repository or a NULL path.
+pub fn repo_root_path(global: &Connection, repo_id: &str) -> Result<Option<String>> {
+    Ok(global
+        .query_row("SELECT root_path FROM repos WHERE repo_id=?1", [repo_id], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten())
+}
+
+/// One `runs` row left-joined with its task, as `records` reads it: the 23
+/// columns in the order of the statement; every one may be NULL. The token
+/// kinds a repository database from before DT-1 does not have read as `None`.
+pub struct RunWithTask {
+    pub run_id: Option<String>,
+    pub task_id: Option<String>,
+    pub attempt: Option<i64>,
+    pub role: Option<String>,
+    pub provider: Option<String>,
+    pub account: Option<String>,
+    pub model: Option<String>,
+    pub spec: Option<String>,
+    pub status: Option<String>,
+    pub interrupted_reason: Option<String>,
+    pub exit_code: Option<i64>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    /// `t.task_id`: `None` when the run has no task row.
+    pub joined_task_id: Option<String>,
+    pub task_title: Option<String>,
+    pub task_spec: Option<String>,
+    pub task_risk: Option<String>,
+}
+
+/// `records`' `collect_counted`: every run of the repository with its task.
+/// A token-kind column the database does not have yet reads as NULL (asked
+/// once per call). The rows are read before the caller processes the first.
+pub fn runs_with_tasks(conn: &Connection) -> Result<Vec<RunWithTask>> {
+    let col = |name: &str| {
+        if super::migrations::column_exists(conn, "runs", name).unwrap_or(false) {
+            format!("r.{name}")
+        } else {
+            "NULL".to_string()
+        }
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT r.run_id, r.task_id, r.attempt, r.role, r.provider, r.account, r.model,
+                    r.spec, r.status, r.interrupted_reason, r.exit_code, r.started_at, r.ended_at,
+                    r.input_tokens, {}, {}, r.output_tokens, {}, {},
+                    t.task_id, t.title, t.spec, t.risk
+             FROM runs r LEFT JOIN tasks t ON t.task_id=r.task_id",
+        col("cache_read_tokens"),
+        col("cache_write_tokens"),
+        col("reasoning_tokens"),
+        col("total_tokens"),
+    ))?;
+    let rows = stmt.query_map([], |r| {
+        Ok(RunWithTask {
+            run_id: r.get(0)?,
+            task_id: r.get(1)?,
+            attempt: r.get(2)?,
+            role: r.get(3)?,
+            provider: r.get(4)?,
+            account: r.get(5)?,
+            model: r.get(6)?,
+            spec: r.get(7)?,
+            status: r.get(8)?,
+            interrupted_reason: r.get(9)?,
+            exit_code: r.get(10)?,
+            started_at: r.get(11)?,
+            ended_at: r.get(12)?,
+            input_tokens: r.get(13)?,
+            cache_read_tokens: r.get(14)?,
+            cache_write_tokens: r.get(15)?,
+            output_tokens: r.get(16)?,
+            reasoning_tokens: r.get(17)?,
+            total_tokens: r.get(18)?,
+            joined_task_id: r.get(19)?,
+            task_title: r.get(20)?,
+            task_spec: r.get(21)?,
+            task_risk: r.get(22)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }

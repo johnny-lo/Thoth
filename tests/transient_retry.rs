@@ -223,7 +223,9 @@ fn dispatch_with(
     if !extra_args.contains(&"--model") {
         c.args(["--model", "sonnet"]);
     }
-    c.args(["--effort", "medium"]);
+    if !extra_args.iter().any(|a| *a == "--effort" || a.starts_with("--effort=")) {
+        c.args(["--effort", "medium"]);
+    }
     let out = f.run_ok(c, "dispatch");
     serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap()
 }
@@ -568,6 +570,49 @@ fn a_cancel_during_the_wait_ends_the_run_cancelled_without_a_relaunch() {
 }
 
 #[test]
+fn a_retry_wait_that_cannot_read_the_cancel_flag_gives_up_and_fails_the_run() {
+    let f = setup();
+    f.add_profile("claude-b");
+    let (task, _) = f.create_task(Fixture::SPEC);
+    let attempts = attempts_file(&f, &task);
+    let t0 = Instant::now();
+    let d = dispatch_with(
+        &f,
+        &task,
+        "claude-b",
+        &[],
+        &[
+            ("FAKE_SCENARIO", OsStr::new("overloaded")),
+            ("THOTH_RETRY_WAITS", OsStr::new("60,60")),
+            ("THOTH_TEST_RETRY_WAIT_CANCEL_READ_FAIL", OsStr::new("1")),
+            ("FAKE_ATTEMPTS_FILE", attempts.as_os_str()),
+        ],
+    );
+    let run = d["run_id"].as_str().unwrap().to_string();
+
+    // the runner gives up after 10 failed reads (about 10 s), not after the 60 s wait
+    assert_eq!(f.wait_for(&task, "50s").1, "failed");
+    assert!(t0.elapsed() < Duration::from_secs(45), "{:?}", t0.elapsed());
+
+    let status = status_json(&f, &task);
+    assert_eq!(status["status"], "failed", "{status}");
+    let row = run_of(&f, &task, &run);
+    assert_eq!(row["status"], "failed", "{row}");
+    assert!(
+        row["error_text"].as_str().unwrap_or("").contains("gave up after 10"),
+        "{row}"
+    );
+    let events: Vec<String> = f
+        .events_json(&task)
+        .iter()
+        .filter(|e| e["run_id"] == run.as_str())
+        .map(|e| e["type"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!has(&events, "run_retry"), "{events:?}");
+    assert_eq!(lines(&attempts).len(), 1, "the fake saw one launch");
+}
+
+#[test]
 fn a_codex_disconnect_is_retried_by_resuming_the_thread() {
     let f = setup();
     f.add_codex_profile("codex-a");
@@ -725,4 +770,22 @@ fn a_reviewer_run_is_retried_with_a_fresh_session_and_the_verdict_lands() {
     assert_ne!(after(&first, "--session-id").as_deref(), Some(s.as_str()), "{first:?}");
     assert_eq!(after(&second, "--session-id").as_deref(), Some(s.as_str()), "{second:?}");
     assert_eq!(f.task_status(&task), "pass");
+}
+
+#[test]
+fn dispatch_with_keeps_an_effort_its_caller_gives() {
+    let f = setup();
+    f.add_profile("claude-b");
+    let (task, _) = f.create_task(Fixture::SPEC);
+    let d = dispatch_with(
+        &f,
+        &task,
+        "claude-b",
+        &["--effort", "high"],
+        &[("FAKE_SCENARIO", OsStr::new("ok"))],
+    );
+    let run = d["run_id"].as_str().unwrap().to_string();
+    assert_eq!(f.wait_for(&task, "120s").1, "in_review");
+    let r = run_of(&f, &task, &run);
+    assert_eq!(r["effort_requested"], "high", "{r}");
 }

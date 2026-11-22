@@ -163,7 +163,7 @@ fn worktree_a1(f: &Fixture, task: &str) -> PathBuf {
 /// A `thoth` for the background, with `f.cmd()`'s environment, that pauses
 /// at the debug-build test seam `pause_var` until `pause` is deleted.
 fn paused_cmd(f: &Fixture, pause_var: &str, pause: &Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
     for var in [
         "THOTH_RUN_ID",
         "THOTH_INBOX_DIR",
@@ -683,7 +683,7 @@ impl Server {
         scenario: &str,
         task: Option<&str>,
     ) -> Self {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+        let mut c = common::scrubbed(Command::new(env!("CARGO_BIN_EXE_thoth")));
         c.arg("mcp")
             .args(extra)
             .current_dir(f.repo.path())
@@ -958,7 +958,8 @@ fn sr4_a_recorded_review_lists_no_refused_edits() {
         let mut c = f.cmd();
         for (name, _) in std::env::vars_os() {
             let upper = name.to_string_lossy().to_ascii_uppercase();
-            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) {
+            // GITENV-1: with GIT_CONFIG_KEY_n the count and values go too, so git never sees a count without its keys
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|w| upper.contains(w)) || upper == "GIT_CONFIG_COUNT" || upper.starts_with("GIT_CONFIG_VALUE_") {
                 c.env_remove(&name);
             }
         }

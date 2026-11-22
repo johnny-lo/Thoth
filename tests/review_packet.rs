@@ -116,7 +116,8 @@ fn json_packet_has_the_specified_keys_and_shapes() {
         keys,
         vec![
             "approvals", "checks_not_run", "claims", "claims_run_id", "diffs", "evidence", "protected_changes",
-            "reviews", "risk", "runs", "spec", "status", "task_id", "test_scope", "title"
+            "reviews", "risk", "runs", "spec", "spec_tests", "spec_tests_commit", "status", "task_id",
+            "test_scope", "title", "verification_requests"
         ]
     );
     // REV-3 (AC4): the spec lists no checks, so nothing is required
@@ -138,10 +139,10 @@ fn json_packet_has_the_specified_keys_and_shapes() {
         ek.sort();
         // RVI-1 (AC3): `execution_error` is additive; it is set only on a
         // verify row whose check did not complete cleanly, and this task
-        // has none
+        // has none. SMALL-11 (2): `output_stream` is additive too.
         assert_eq!(
             ek,
-            vec!["code", "execution_error", "exit_code", "kind", "label", "output_tail", "run_id"],
+            vec!["code", "execution_error", "exit_code", "kind", "label", "output_stream", "output_tail", "run_id"],
             "{e}"
         );
         assert!(e["execution_error"].is_null(), "{e}");
@@ -186,6 +187,81 @@ fn json_packet_has_the_specified_keys_and_shapes() {
     assert_eq!(reviews[0]["verdict"], "PASS");
     assert_eq!(reviews[0]["external"], true);
     assert!(reviews[0]["findings"]["criteria"].is_array());
+}
+
+/// SMALL-16 (AC4): the verification requests the worker declared, for
+/// reference: the `--json` key `verification_requests` and the Markdown
+/// lines under "Worker claims", masked like the claims.
+const REQUESTS_LINE: &str =
+    "Verification requests the worker declared (for reference only; the control plane runs the approved checks):";
+
+/// A `hooks` dispatch whose delivered result.json has `patch`'s keys set
+/// (`FAKE_RESULT_PATCH`); returns the task at `in_review`.
+fn candidate_with_patch(f: &Fixture, patch: serde_json::Value) -> String {
+    f.cmd().arg("init").assert().success();
+    f.add_profile("claude-b");
+    let (task_id, _) = f.create_task(Fixture::SPEC);
+    let file = f.home_path().join("result-patch.json");
+    std::fs::write(&file, patch.to_string()).unwrap();
+    let mut c = f.cmd();
+    c.env("FAKE_SCENARIO", "hooks")
+        .env("FAKE_TASK_ID", &task_id)
+        .env("FAKE_RESULT_PATCH", &file)
+        .args(["dispatch", &task_id, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium", "--json"]);
+    c.assert().success();
+    assert_eq!(f.wait_for(&task_id, "180s").1, "in_review");
+    task_id
+}
+
+#[test]
+fn the_packet_lists_the_workers_verification_requests() {
+    // the worker's own two requests, in its order, one with a token-shaped string
+    let token = ["ghp_", "Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Jh1Gf0EdCbA9"].concat();
+    let f = common::fixture();
+    let task_id = candidate_with_patch(
+        &f,
+        serde_json::json!({"verification_requests": [
+            {"cmd": "cargo test --test zeta", "cwd": "."},
+            {"cmd": format!("curl -H 'Authorization: {token}' example.test"), "cwd": "tools"},
+            {"cmd": "cargo test --test alpha", "cwd": "crates/a"}
+        ]}),
+    );
+    let v = packet_json(&f, &task_id);
+    assert_eq!(
+        v["verification_requests"],
+        serde_json::json!([
+            {"cmd": "cargo test --test zeta", "cwd": "."},
+            {"cmd": "curl -H 'Authorization: [redacted:github-token]' example.test", "cwd": "tools"},
+            {"cmd": "cargo test --test alpha", "cwd": "crates/a"}
+        ]),
+        "{v}"
+    );
+    assert!(!v.to_string().contains(&token), "the token reached the JSON packet");
+    let md = packet_md(&f, &task_id);
+    assert!(!md.contains(&token), "the token reached the Markdown packet");
+    let claims_at = pos(&md, "## Worker claims");
+    let line_at = pos(&md, REQUESTS_LINE);
+    let approvals_at = pos(&md, "## Approvals during this task");
+    assert!(claims_at < pos(&md, "fake suite green") && pos(&md, "fake suite green") < line_at && line_at < approvals_at, "{md}");
+    let tail = &md[line_at..approvals_at];
+    let want = format!(
+        "{REQUESTS_LINE}\n- cargo test --test zeta (cwd: .)\n- curl -H 'Authorization: [redacted:github-token]' example.test (cwd: tools)\n- cargo test --test alpha (cwd: crates/a)\n"
+    );
+    assert!(tail.starts_with(&want), "{tail}");
+
+    // a worker that declared none: an empty list and one `- (none)` line
+    let f2 = common::fixture();
+    let none = candidate_with_patch(&f2, serde_json::json!({"verification_requests": []}));
+    assert_eq!(packet_json(&f2, &none)["verification_requests"], serde_json::json!([]));
+    let md = packet_md(&f2, &none);
+    assert!(md.contains(&format!("{REQUESTS_LINE}\n- (none)\n")), "{md}");
+
+    // no result ingested: no list and no such line
+    let f3 = common::fixture();
+    f3.cmd().arg("init").assert().success();
+    let (bare, _) = f3.create_task(Fixture::SPEC);
+    assert_eq!(packet_json(&f3, &bare)["verification_requests"], serde_json::json!([]));
+    assert!(!packet_md(&f3, &bare).contains("Verification requests the worker declared"));
 }
 
 /// AC2 + AC3 + AC6: the worker's own summary is in neither format.
@@ -535,4 +611,150 @@ fn a_non_utf8_diff_is_stored_raw_and_still_displays() {
     let v = packet_json(&f, &task_id);
     assert_eq!(v["diffs"][0]["blob_verified"], true);
     packet_md(&f, &task_id);
+}
+
+/// RVI-1 (AC3): a check that was refused has its error shown as its output
+/// and as its execution error, but the packet prints it once, so the
+/// masking of it is counted once.
+#[test]
+fn a_check_error_shown_once_is_counted_once() {
+    const VALUE: &str = "dummy-packet-secret-5151";
+    let f = common::fixture();
+    std::fs::write(f.home_path().join("secrets.json"), format!("{{\"made_up_value\": \"{VALUE}\"}}\n")).unwrap();
+    let (task_id, run_id) = candidate_ready(&f, Fixture::SPEC_TWO_AC);
+
+    // a check that was never approved: verify refuses it, naming its id,
+    // which holds the made-up value
+    let check = format!("chk-{VALUE}");
+    f.cmd().args(["checks", "add", &check, "--cmd", "git --version", "--shell", "argv", "--json"]).assert().success();
+    let out = f.cmd().args(["verify", &run_id, "--json"]).output().unwrap();
+    let verify: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("verify: {e}\n{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+    let error = verify["results"][0]["error"].as_str().unwrap_or_else(|| panic!("no error on the refused row: {verify}"));
+    assert!(error.contains("is not approved") && error.contains("[redacted:thoth:secrets.json]"), "{verify}");
+
+    let md = packet_md(&f, &task_id);
+    assert!(!md.contains(VALUE), "{md}");
+    let markers = md.matches("[redacted:thoth:secrets.json]").count();
+    assert!(markers >= 1, "{md}");
+    let events = f.cmd().args(["events", "--since", "0", "--task", &task_id, "--json"]).output().unwrap();
+    let events: serde_json::Value = serde_json::from_slice(&events.stdout).unwrap();
+    let packet = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "secret_redacted" && e["detail"]["exit"] == "review_packet")
+        .unwrap_or_else(|| panic!("no secret_redacted event for review_packet: {events}"));
+    assert_eq!(packet["detail"]["kinds"]["thoth:secrets.json"], markers, "{packet}\n{md}");
+}
+
+/// SMALL-17 (AC2): the test names the spec writes, looked up in the code
+/// files of the candidate and of the run's base, in order of first mention:
+/// a function the worker wrote (found), one nobody wrote (missing), one the
+/// worker deleted (removed), and the filter of each `cargo test` command,
+/// one found in its target's files, one not, and one with `::` that is not
+/// checked. A report only: the task still reaches in_review.
+#[test]
+fn the_packet_reports_the_test_names_the_spec_writes() {
+    let f = common::fixture();
+    let repo = f.repo_path();
+    std::fs::create_dir_all(repo.join("tests")).unwrap();
+    std::fs::write(repo.join("tests").join("old_case.rs"), "#[test]\nfn an_old_case_that_goes_away() {}\n").unwrap();
+    common::git(&repo, &["add", "tests/old_case.rs"]);
+    common::git(&repo, &["commit", "-m", "an old case"]);
+    f.cmd().arg("init").assert().success();
+    f.add_profile("claude-b");
+    let spec = serde_json::json!({
+        "goal": "spec-named tests: a_spec_named_test_is_here",
+        "acceptance_criteria": [
+            "AC1: never_written_by_the_worker exists",
+            "AC2: an_old_case_that_goes_away stays"
+        ],
+        "constraints": [
+            "run `cargo test --test added_test added_is_seven`",
+            "run `cargo test --test added_test nothing_like_it`",
+            "run `cargo test --bin thoth -- process::linux::`"
+        ],
+        "non_goals": ["not_read_from_the_non_goals here"],
+        "excluded_alternatives": [],
+        "risk": "normal"
+    })
+    .to_string();
+    let (task_id, _) = f.create_task(&spec);
+    let plan = f.home_path().join("edit-plan.json");
+    std::fs::write(
+        &plan,
+        serde_json::json!({
+            "write": [{"path": "tests/spec_named.rs", "text": "#[test]\nfn a_spec_named_test_is_here() {}\n"}],
+            "delete": ["tests/old_case.rs"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut c = f.cmd();
+    c.env("FAKE_SCENARIO", "hooks")
+        .env("FAKE_TASK_ID", &task_id)
+        .env("FAKE_EDIT_PLAN", &plan)
+        .args(["dispatch", &task_id, "--profile", "claude-b", "--model", "sonnet", "--effort", "medium", "--json"]);
+    let d: serde_json::Value = serde_json::from_slice(&f.run_ok(c, "dispatch")).unwrap();
+    let run_id = d["run_id"].as_str().unwrap().to_string();
+    assert_eq!(f.wait_for(&task_id, "180s").1, "in_review");
+    let candidate = f.run_of(&task_id, &run_id)["candidate_commit"].clone();
+    assert!(candidate.is_string(), "{candidate}");
+
+    let v = packet_json(&f, &task_id);
+    assert_eq!(v["spec_tests_commit"], candidate, "{v}");
+    let function = |name: &str, status: &str| {
+        serde_json::json!({"name": name, "form": "function", "target": null, "status": status})
+    };
+    let filter = |name: &str, target: &str, status: &str| {
+        serde_json::json!({"name": name, "form": "filter", "target": target, "status": status})
+    };
+    assert_eq!(
+        v["spec_tests"],
+        serde_json::json!([
+            function("a_spec_named_test_is_here", "found"),
+            function("never_written_by_the_worker", "missing"),
+            function("an_old_case_that_goes_away", "removed"),
+            filter("added_is_seven", "test:added_test", "found"),
+            filter("nothing_like_it", "test:added_test", "missing"),
+            filter("process::linux", "bin:thoth", "not_checked"),
+        ]),
+        "{}",
+        v["spec_tests"]
+    );
+
+    let md = packet_md(&f, &task_id);
+    let scope_at = pos(&md, "## Test scope");
+    let section_at = pos(&md, "## Spec-named tests");
+    let diffs_at = pos(&md, "## Diffs");
+    assert!(scope_at < section_at && section_at < diffs_at, "{md}");
+    let section = &md[section_at..diffs_at];
+    assert!(
+        section.starts_with(
+            "## Spec-named tests\n\nTest names the spec writes (snake_case words of four or more parts, and the filter of each cargo test command), looked up in the code files of the candidate commit: missing means in neither the candidate nor the run's base, removed means in the base only. A report for you, not a refusal.\n\n"
+        ),
+        "{section}"
+    );
+    for line in [
+        "- a_spec_named_test_is_here (function): found\n",
+        "- never_written_by_the_worker (function): missing\n",
+        "- an_old_case_that_goes_away (function): removed\n",
+        "- added_is_seven (filter, test:added_test): found\n",
+        "- nothing_like_it (filter, test:added_test): missing\n",
+        "- process::linux (filter, bin:thoth): not_checked\n",
+    ] {
+        assert!(section.contains(line), "{line:?} not in:\n{section}");
+    }
+
+    // no result ingested: no commit, no names, and `(none)` in the section
+    let f2 = common::fixture();
+    f2.cmd().arg("init").assert().success();
+    let (bare, _) = f2.create_task(&spec);
+    let v2 = packet_json(&f2, &bare);
+    assert_eq!(v2["spec_tests_commit"], serde_json::Value::Null, "{v2}");
+    assert_eq!(v2["spec_tests"], serde_json::json!([]), "{v2}");
+    let md2 = packet_md(&f2, &bare);
+    let at = pos(&md2, "## Spec-named tests");
+    assert!(md2[at..pos(&md2, "## Diffs")].contains("\n(none)\n"), "{md2}");
 }

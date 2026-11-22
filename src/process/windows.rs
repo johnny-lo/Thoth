@@ -1342,6 +1342,97 @@ mod tests {
         }
     }
 
+    /// FLAKY-1: one PowerShell started *before* the race, so what has to beat
+    /// a `run_shell` deadline is one `Get-CimInstance` pass, not a PowerShell
+    /// start-up per pass (`wait_for_tagged_ping_pid`). It runs one query (the
+    /// slow first load), prints `ready`, then repeats the query for this test
+    /// process's tagged ping (`-n {count}` plus `own_loopback`) about every
+    /// 100 ms and prints the first pid it finds. Killed on drop.
+    struct PingWatcher {
+        child: std::process::Child,
+        lines: std::sync::mpsc::Receiver<String>,
+        count: u32,
+    }
+    impl PingWatcher {
+        /// Starts the watcher and waits (up to 60 s) for its `ready` line.
+        fn ready(count: u32) -> PingWatcher {
+            use std::io::BufRead;
+            let ip = own_loopback().replace('.', "\\.");
+            let script = format!(
+                "$null = Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\"; \
+                 [Console]::Out.WriteLine('ready'); [Console]::Out.Flush(); \
+                 while ($true) {{ \
+                   $p = Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | \
+                     Where-Object {{ $_.CommandLine -match '-n {count} {ip}(\\s|\"|$)' }} | \
+                     Select-Object -First 1; \
+                   if ($p) {{ [Console]::Out.WriteLine($p.ProcessId); [Console]::Out.Flush(); break }} \
+                   Start-Sleep -Milliseconds 100 \
+                 }}"
+            );
+            let mut child = Command::new("powershell")
+                .args(["-NoProfile", "-Command", &script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the PowerShell ping watcher");
+            let stdout = child.stdout.take().expect("the watcher's stdout");
+            let (tx, lines) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if tx.send(line.trim().to_string()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let watcher = PingWatcher { child, lines, count };
+            match watcher.next_line(Duration::from_secs(60)) {
+                Ok(line) if line == "ready" => watcher,
+                Ok(other) => panic!("the ping watcher printed {other:?} before 'ready'"),
+                Err(e) => panic!("the PowerShell ping watcher never became ready within 60 s: {e}"),
+            }
+        }
+
+        /// The next non-empty line, waiting at most `limit`.
+        fn next_line(&self, limit: Duration) -> Result<String, String> {
+            let deadline = Instant::now() + limit;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.lines.recv_timeout(left) {
+                    Ok(l) if l.is_empty() => continue,
+                    Ok(l) => return Ok(l),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        return Err("timed out".to_string())
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err("the watcher exited".to_string())
+                    }
+                }
+            }
+        }
+
+        /// The tagged ping's pid and creation time, waiting at most `limit`.
+        fn ping(&self, limit: Duration) -> (u32, u64) {
+            let count = self.count;
+            let line = self.next_line(limit).unwrap_or_else(|e| {
+                panic!("tagged ping '-n {count}' never appeared ({e})")
+            });
+            let pid: u32 = line
+                .parse()
+                .unwrap_or_else(|_| panic!("the ping watcher printed {line:?}, not a pid"));
+            let created = creation_time(pid).unwrap_or_else(|| {
+                panic!("no creation time for the tagged ping '-n {count}' (pid {pid})")
+            });
+            (pid, created)
+        }
+    }
+    impl Drop for PingWatcher {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
     /// A batch file `name` in `dir` holding `body` (AC14: a cmd check runs one
     /// program, so the cmd syntax under test lives in a script).
     fn batch(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
@@ -1354,27 +1445,41 @@ mod tests {
     /// leave nothing behind; a re-run whose deadline did not work would hang
     /// `thoth verify` forever and leak the child.
     ///
-    /// The numbers are relative to the ping's own ~59 s lifetime (`-n 60`,
-    /// a count no other tagged ping in this file uses): a 15 s deadline, a
-    /// window for finding the tagged ping at least that long
-    /// (`wait_for_tagged_ping_pid`; each of its `Get-CimInstance` passes
-    /// costs 0.5-1.5 s, more under load, and the ping must be found before
-    /// `run_shell` kills it), and a return bound of the deadline plus 10 s -
-    /// under half the ping's lifetime, so a `run_shell` that waited for the
-    /// ping to finish on its own would still fail.
+    /// The numbers are relative to the ping's own ~119 s lifetime (`-n 120`,
+    /// a count no other tagged ping in this file uses): a 15 s deadline, and
+    /// a return bound of the deadline plus 40 s - under half the ping's
+    /// lifetime, so a `run_shell` that waited for the ping to finish on its
+    /// own would still fail. FLAKY-1: the bound used to be the deadline plus
+    /// 10 s, with the ping at `-n 60`; after the deadline `run_shell` only
+    /// starts `taskkill` and `tasklist` and waits bounded graces that end on
+    /// their first poll, so those 10 s measured how fast a busy machine
+    /// starts processes. Both were lengthened together.
+    ///
+    /// The tagged ping must be found before `run_shell` kills it at the
+    /// deadline. FLAKY-1: a `PingWatcher` started and ready before
+    /// `run_shell` does that with one CIM query per pass, instead of a new
+    /// PowerShell per pass (0.5-1.5 s each, more under load).
     ///
     /// `run_shell` blocks synchronously, so the only way to get a pid for a
     /// `Guard` *before* any assertion below can panic is to run it on a
-    /// background thread and poll for the tagged process concurrently from
-    /// here. `-n 60` (about a minute) is also small enough that even an
+    /// background thread and watch for the tagged process concurrently from
+    /// here. `-n 120` (about two minutes) is also small enough that even an
     /// unguarded leak would self-heal, but the guard removes the need to
     /// rely on that.
     #[test]
     fn run_shell_kills_the_child_tree_on_timeout_and_reports_it() {
         const DEADLINE_SECS: u64 = 15;
+        const RETURN_MARGIN_SECS: u64 = 40;
+        const PING_COUNT: u32 = 120;
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path().to_path_buf();
-        let program = batch(dir.path(), "long.cmd", &format!("ping -n 60 {}", own_loopback()));
+        let program = batch(
+            dir.path(),
+            "long.cmd",
+            &format!("ping -n {PING_COUNT} {}", own_loopback()),
+        );
+        // ready before the clock starts, so its start-up does not race the deadline
+        let watcher = PingWatcher::ready(PING_COUNT);
         let started = Instant::now();
 
         let handle = std::thread::spawn(move || {
@@ -1386,8 +1491,9 @@ mod tests {
                 Duration::from_secs(DEADLINE_SECS),
             )
         });
-        let (pid, created) = wait_for_tagged_ping_pid(60);
+        let (pid, created) = watcher.ping(Duration::from_secs(DEADLINE_SECS + 5));
         let _guard = Guard::armed(pid, created);
+        drop(watcher);
 
         let out = handle.join().unwrap().unwrap();
         let elapsed = started.elapsed();
@@ -1395,9 +1501,10 @@ mod tests {
         assert!(out.timed_out, "expected the {DEADLINE_SECS}s deadline to trip");
         assert_eq!(out.exit_code, None, "no exit status for a killed child");
         assert!(
-            elapsed < Duration::from_secs(DEADLINE_SECS + 10),
+            elapsed < Duration::from_secs(DEADLINE_SECS + RETURN_MARGIN_SECS),
             "run_shell took {elapsed:?} to return after a {DEADLINE_SECS}s deadline; the bound is \
-             the deadline plus 10s, well under the ~59s the ping would live on its own"
+             the deadline plus {RETURN_MARGIN_SECS}s, well under the ~119s the ping would live on \
+             its own"
         );
         assert!(
             wait_until(10, || !alive_as(pid, created)),

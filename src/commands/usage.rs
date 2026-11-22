@@ -596,6 +596,8 @@ pub fn profile_usage(paths: &Paths, only: Option<&str>, refresh: bool, json_outp
             "quota_group": quota_group,
             "parked_group": parked,
             "newest_observed_at": newest,
+            // SMALL-17 (i): the codex live reading recommend's reason names.
+            "usage_not_allowed_at": usage_not_allowed_at.as_deref().map(normalize_rfc),
             "windows": ws.iter().map(Window::json).collect::<Vec<_>>(),
             "extra_buckets": extras.iter().map(ExtraBucket::json).collect::<Vec<_>>(),
             "plan": plan,
@@ -627,6 +629,9 @@ pub fn profile_usage(paths: &Paths, only: Option<&str>, refresh: bool, json_outp
                 text("status"),
                 v["live_runs"]
             );
+            if let Some(at) = v["usage_not_allowed_at"].as_str() {
+                s.push_str(&format!("  ordinary usage not allowed (codex app-server, read at {at})\n"));
+            }
             if let Some(windows) = v["windows"].as_array() {
                 for w in windows {
                     s.push_str(&window_line("", w));
@@ -742,8 +747,18 @@ pub(crate) fn ranked_candidates(
         } else {
             None
         };
+        // SMALL-17 (d): parked elsewhere only for a group a model was named
+        // for: the model matches exactly one group, and that is the selected
+        // one. Without a model the best group is only a guess at what the
+        // launch will use.
+        let model_group: Option<String> = model.and_then(|m| {
+            match super::live_quota::matching_groups(&ws, m).as_slice() {
+                [one] => Some(one.clone()),
+                _ => None,
+            }
+        });
         let parked_elsewhere = p.status == "rate_limited"
-            && is_parked_elsewhere(parked_group.as_deref(), quota_group.as_deref());
+            && is_parked_elsewhere(parked_group.as_deref(), model_group.as_deref());
         let reset = parked_at.filter(|_| !parked_elsewhere).and_then(|parked| {
             ws.iter()
                 .filter(|w| parked_group.is_none() || w.group == parked_group)
@@ -772,6 +787,12 @@ pub(crate) fn ranked_candidates(
                 ),
                 other => format!("status {other}"),
             });
+            // SMALL-17 (d): parked for one group, and no model picked another.
+            if let Some(group) = parked_group.as_deref().filter(|_| p.status == "rate_limited" && model_group.is_none()) {
+                reasons.push(format!(
+                    "parked for quota group {group}; name a model of another group with --model to use this profile"
+                ));
+            }
         }
         if let Some(reset) = reset.filter(|_| recovered) {
             reasons.push(format!(

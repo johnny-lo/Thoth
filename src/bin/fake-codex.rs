@@ -125,6 +125,23 @@
 //! `review_uncited` before the final message, as fake-claude's review
 //! scenarios do: the run stays `running` and nothing is recorded until the
 //! test creates the file.
+//!
+//! EVOPEN-1 switches for `review_pass`, `review_reject` and `review_bad`
+//! (unset, each behaves as before: it reads packet.md and the first code's
+//! file and cites that code):
+//! - `FAKE_REVIEW_READS` (comma-separated codes; set, even empty): after
+//!   packet.md, `cat` each listed code's file in order instead of the first
+//!   code's file; empty reads packet.md only. A missing file is still one
+//!   item, with cat's error text
+//! - `FAKE_REVIEW_CITES` (comma-separated codes): every criterion, and
+//!   `review_reject`'s extra finding, cites these instead of the first code
+//! - `FAKE_REVIEW_READ_FORM`: how each path is written: `relative` (the
+//!   default), `dot` (`./` first), `absolute` (the current folder's absolute
+//!   path, `/`-joined) or `backslash` (relative with `\`)
+//! - `FAKE_REVIEW_READ_TOGETHER=1`: one `cat` command naming every listed file
+//! - `FAKE_REVIEW_EXTRA_READS` (a JSON array of strings): after those reads,
+//!   one completed `command_execution` item per string with that text as
+//!   `command`, empty output and exit 0 (nothing is run)
 
 // Source-check scenarios: `source_check` checks file:// pages from the prompt;
 // `source_check_bad` returns {not json. Both require --output-schema and -o.
@@ -710,10 +727,50 @@ fn review(scenario: &str, args: &[String], prompt: &str, thread_id: &str) -> ! {
         })
         .collect();
     codes.sort();
-    if let Some(first) = codes.first() {
-        let body = std::fs::read_to_string(input.join("evidence").join(format!("{first}.txt")))
+    // EVOPEN-1: `FAKE_REVIEW_READS` (set, even empty) replaces "the first
+    // code's file" for the three scenarios that take the switches.
+    let switched = matches!(scenario, "review_pass" | "review_reject" | "review_bad");
+    let reads: Vec<String> = match std::env::var("FAKE_REVIEW_READS") {
+        Ok(list) if switched => code_list(&list),
+        _ => codes.first().cloned().into_iter().collect(),
+    };
+    let mut item = 2;
+    if !reads.is_empty() {
+        let form = if switched { std::env::var("FAKE_REVIEW_READ_FORM").ok() } else { None };
+        let named: Vec<(String, String)> = reads
+            .iter()
+            .map(|code| {
+                let body = std::fs::read_to_string(input.join("evidence").join(format!("{code}.txt"))).ok();
+                let text = body.unwrap_or_else(|| format!("cat: {code}.txt: No such file or directory\n"));
+                (review_read_path(code, form.as_deref()), text)
+            })
+            .collect();
+        let together = switched && std::env::var("FAKE_REVIEW_READ_TOGETHER").as_deref() == Ok("1");
+        if together {
+            let paths: Vec<&str> = named.iter().map(|(p, _)| p.as_str()).collect();
+            let output: String = named.iter().map(|(_, t)| t.as_str()).collect();
+            command(item, &format!("cat {}", paths.join(" ")), &output, 0);
+            item += 1;
+        } else {
+            for (path, text) in &named {
+                command(item, &format!("cat {path}"), text, 0);
+                item += 1;
+            }
+        }
+    }
+    // EVOPEN-1: `FAKE_REVIEW_EXTRA_READS`, one completed item per string,
+    // nothing run.
+    if switched {
+        let extra: Vec<String> = std::env::var("FAKE_REVIEW_EXTRA_READS")
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
-        command(2, &format!("cat .agent/review-input/evidence/{first}.txt"), &body, 0);
+        for command in extra {
+            emit(&serde_json::json!({"type": "item.completed", "item": {
+                "id": format!("item_{item}"), "type": "command_execution", "command": command,
+                "aggregated_output": "", "exit_code": 0, "status": "completed"}}));
+            item += 1;
+        }
     }
 
     let mut ids = criterion_ids(&packet);
@@ -723,7 +780,10 @@ fn review(scenario: &str, args: &[String], prompt: &str, thread_id: &str) -> ! {
     let cite: Vec<String> = if scenario == "review_uncited" {
         Vec::new()
     } else {
-        codes.first().cloned().into_iter().collect()
+        match std::env::var("FAKE_REVIEW_CITES") {
+            Ok(list) if switched => code_list(&list),
+            _ => codes.first().cloned().into_iter().collect(),
+        }
     };
     let rejecting = scenario == "review_reject";
     let category = first_category_in(prompt);
@@ -777,7 +837,7 @@ fn review(scenario: &str, args: &[String], prompt: &str, thread_id: &str) -> ! {
     // this gate; without it the review can be recorded (and a PASS task's
     // worktree swept) before the test gets to move anything.
     source_check::wait_gate();
-    emit(&agent_message(8, &last));
+    emit(&agent_message(item.max(8), &last));
     // The codex CLI itself writes the final message to -o, outside the sandbox.
     if let Err(e) = std::fs::write(&out_path, &last) {
         eprintln!("fake-codex: writing {out_path} failed: {e}");
@@ -788,6 +848,27 @@ fn review(scenario: &str, args: &[String], prompt: &str, thread_id: &str) -> ! {
     write_rollout(thread_id);
     emit(&turn_completed(326));
     std::process::exit(0);
+}
+
+/// EVOPEN-1: a comma-separated code list; empty is no code.
+fn code_list(list: &str) -> Vec<String> {
+    list.split(',').map(str::trim).filter(|c| !c.is_empty()).map(str::to_string).collect()
+}
+
+/// EVOPEN-1: how `FAKE_REVIEW_READ_FORM` writes a code's file: `relative`
+/// (the default), `dot`, `absolute` (the current folder, `/`-joined) or
+/// `backslash` (relative with `\`).
+fn review_read_path(code: &str, form: Option<&str>) -> String {
+    let relative = format!(".agent/review-input/evidence/{code}.txt");
+    match form {
+        Some("dot") => format!("./{relative}"),
+        Some("absolute") => {
+            let cwd = std::env::current_dir().unwrap().display().to_string().replace('\\', "/");
+            format!("{}/{relative}", cwd.trim_end_matches('/'))
+        }
+        Some("backslash") => relative.replace('/', "\\"),
+        _ => relative,
+    }
 }
 
 /// The acceptance-criterion ids the runner listed for the spec reviewer: only

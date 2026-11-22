@@ -1,0 +1,111 @@
+{
+  "refused": [
+    {
+      "name": "probe_en_folder_first",
+      "field": "goal",
+      "text": "In .claude/skills/x/SKILL.md, replace the first line with a new heading"
+    },
+    {
+      "name": "en_under_agents_then_delete",
+      "field": "acceptance_criteria",
+      "text": "Under ~/.claude/agents/, delete the old reviewer file"
+    },
+    {
+      "name": "en_open_then_add",
+      "field": "constraints",
+      "text": "Open .claude/skills/x/SKILL.md, then add a line at the end"
+    },
+    {
+      "name": "en_backticked_folder_then_update",
+      "field": "goal",
+      "text": "For `.claude/skills/x/SKILL.md`, update the first heading"
+    },
+    {
+      "name": "probe_zh_folder_first",
+      "field": "goal",
+      "text": "在 .claude/skills/x/SKILL.md 裡，把第一段改成新的說明"
+    },
+    {
+      "name": "zh_open_then_add",
+      "field": "acceptance_criteria",
+      "text": "打開 .claude/skills/x/SKILL.md，在最後加一行"
+    },
+    {
+      "name": "zh_agents_old_file_then_delete",
+      "field": "constraints",
+      "text": "~/.claude/agents/ 底下那個舊檔，刪掉"
+    },
+    {
+      "name": "zh_nearest_earlier_target_is_the_folder",
+      "field": "goal",
+      "text": "在 .claude/skills/x/SKILL.md 裡，第二段，改成英文"
+    },
+    {
+      "name": "en_write_first_stays_refused",
+      "field": "goal",
+      "text": "Replace the first line of .claude/skills/x/SKILL.md with a new heading"
+    },
+    {
+      "name": "zh_write_first_stays_refused",
+      "field": "goal",
+      "text": "把 .claude/skills/x/SKILL.md 的第一段改成新的說明"
+    }
+  ],
+  "accepted": [
+    {
+      "name": "speclint1_read_then_change_other",
+      "field": "acceptance_criteria",
+      "text": "read a file in .claude/x, then change src/a.rs"
+    },
+    {
+      "name": "speclint1_zh_read_then_edit_other",
+      "field": "constraints",
+      "text": "讀 .claude/skills/x，改 plugins/y"
+    },
+    {
+      "name": "speclint1_read_only_marker",
+      "field": "acceptance_criteria",
+      "text": "以 .claude/x（只讀）為準，改 a.txt"
+    },
+    {
+      "name": "speclint1_trailing_negation",
+      "field": "constraints",
+      "text": ".claude/skills/ 的私下版由指揮官之後自己改，這件不碰"
+    },
+    {
+      "name": "en_file_name_is_a_target",
+      "field": "goal",
+      "text": "Read .claude/skills/x/SKILL.md, then edit Cargo.toml"
+    },
+    {
+      "name": "zh_write_clause_has_its_own_target",
+      "field": "acceptance_criteria",
+      "text": "在 .claude/x 裡，改 docs/a.md 的第一段"
+    },
+    {
+      "name": "zh_read_only_in_the_folder_clause",
+      "field": "goal",
+      "text": "在 .claude/skills/x/SKILL.md 裡（只讀），把第一段改成新的說明"
+    },
+    {
+      "name": "en_read_only_in_the_folder_clause",
+      "field": "goal",
+      "text": "In .claude/skills/x/SKILL.md (read-only), replace the first line with a new heading"
+    },
+    {
+      "name": "zh_negation_in_the_folder_clause",
+      "field": "constraints",
+      "text": ".claude/ 不碰，把第一段改成新的說明"
+    },
+    {
+      "name": "zh_trailing_negation_clause",
+      "field": "constraints",
+      "text": "在 .claude/x 裡，把第一段改成新的說明，這件不碰"
+    },
+    {
+      "name": "zh_nearest_earlier_target_is_another_file",
+      "field": "acceptance_criteria",
+      "text": "在 .claude/x 找到範例，照著改 docs/a.md，再把第一段改短"
+    }
+  ]
+}

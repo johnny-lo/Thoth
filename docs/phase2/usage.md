@@ -14,7 +14,7 @@ covers what is new.
 
 MCP entry: `thoth mcp` exposes these commands as tools while preserving their
 JSON contract; see [the MCP guide](../mcp.md). `thoth guide` prints the
-commander guide.
+commander guide. `thoth --help` does not list `submit`, `decision`, `transcript` and `records` (it names them in its closing paragraph); they keep working with the same arguments, exit codes and `--json` output, and `thoth help COMMAND` prints their help.
 
 ## What changed underneath
 
@@ -114,6 +114,8 @@ characters; everything is masked before it is cut. The human output prints
 is (`thoth task result <task> [--run <run>]`, `thoth review show <task>` or
 `thoth spec review show <task>`). The full rules are under "Briefs" in
 `docs/adapter-usage.md`.
+
+For contributors: a debug build honours `THOTH_TEST_RESULT_PRE_BRIEF`. When it is set for the process that ingests a delivery (the runner, through `dispatch`, or `thoth submit`), the `result_ingested` event is written without `brief`, `brief_source` and `brief_truncated`, as a thoth from before BRIEF-1 wrote it, so tests/brief.rs can read an old event through the CLI. A release build ignores it.
 
 `thoth events --since <seq>` (watch for the `verdict` event) and
 `thoth review show <task> --json` remain the polling alternatives.
@@ -271,7 +273,12 @@ a reviewer just runs `thoth evidence show E004`.
 
 **Every open is recorded** as an `evidence_opened` event, with the reading run's
 id when there is one. That is what lets `thoth review show` tell you whether
-the reviewer actually read what it cited.
+the reviewer actually read what it cited. A Codex or agy reviewer cannot run
+thoth; it reads its evidence files in `.agent/review-input/evidence/` instead.
+Its openings (EVOPEN-1) are found in the reviewer's own stream when its review
+is taken in, and recorded as `evidence_opened` events too, with `found_in:
+"reviewer_stream"` in the detail (see "Codex reviewers" and "Antigravity
+reviewers"). An `evidence_opened` without `found_in` is an `evidence show` call.
 
 ### Why a task goes to `unverified`
 
@@ -327,6 +334,25 @@ a research claim is checked by opening its sources again, not by a command's
 evidence. The worker of a research task is told all this in a `## Research
 claims` section of its prompt, before the result.json shape.
 
+**Which kind a note or a finding takes (CLAIMKIND-1).** A summary, a note, a
+decision the worker took, or a finding for the commander is a `completion` or
+`behavior` claim. `research` is only for a research task, and needs sources.
+The worker of any other task is told this right after the
+result.json shape (a research task's prompt does not have it). The two rule-1
+reasons about kinds say it too, after the sentence they always had, so a
+re-dispatch that quotes the reason tells the worker what to write instead:
+
+- a kind that is not one of the six: `result.json claim kind must be one of
+  test_result/doc_reference/completion/behavior/protected_change/research, got
+  'KIND'. For a note, a decision or a finding use the kind behavior or
+  completion; research is only for a research task and needs sources.`
+- a `research` claim with no sources: `result.json claim N is kind research
+  but its 'sources' is empty. On a task that is not a research task, use the
+  kind behavior or completion instead.`
+
+The event's `rule` (1) and its other detail keys are what they were, and a
+kind that is not one of the six is still refused, never turned into another.
+
 **Protected changes need no declaration (LEAN-1).** Rule 6 used to make the
 worker say, file by file, that it changed something a check depends on, and
 refused the delivery when one file was missing. It is retired: the list is
@@ -357,7 +383,12 @@ for intent, limitations and decisions, not for file lists, command logs, exit
 codes or usage, which Thoth records itself. Separately,
 before `## Evidence`, the worker prompt says the run is a single unattended
 turn: no background commands, and checks, commit and `.agent/result.json` all
-done before the turn ends.
+done before the turn ends. The same note (SMALL-10) tells the worker to wait for
+a command that is still running by its process id (`wait PID`, or `kill -0 PID`
+in a loop) or the shell's `wait`, never with `pgrep -f` on the command's own
+text (that matches the waiting loop itself). All three implementer prompts
+(Claude Code, Antigravity/agy and codex) carry it; the reviewer, spec-review,
+research-check and confirm prompts and the resume prompt do not.
 
 A task in `unverified` is still re-dispatchable, and `thoth submit` still
 works — fix the document and file it again.
@@ -558,6 +589,47 @@ the merge: after merging, the commander collects them into the small-fixes
 list of `docs/post-phase2/backlog.md` and fixes a batch at a time; the
 reviewer is not asked to attach a fix for them.
 
+**Marks on the previous rejection (MEAS-1, additive).** When the attempt
+under review follows a REJECT, the reviewer also marks, for every finding of
+that REJECT, whether it was fixed by changing behaviour. The prompt (every
+harness, plain and edit mode) has a section `## Previous rejection to mark`
+after `## Required checks not run`: it names the rejected review and its
+attempt and lists one line per finding (each unmet criterion by id, then
+`extra_findings[N]`), with its category, size, note and evidence. The
+reviewer answers in `findings.prior_rejection`, next to `criteria` and
+`extra_findings`:
+
+```json
+"prior_rejection": [
+  {"review_id": "01M…", "ref": "AC2", "fixed_by_behaviour": "yes", "evidence": [], "diff_at": "src/retry.rs:41", "note": ""},
+  {"review_id": "01M…", "ref": "extra_findings[0]", "fixed_by_behaviour": "no", "evidence": ["E007"], "diff_at": "", "note": "only the test changed"}
+]
+```
+
+`yes` is fixed by changing what the program does; `no` is fixed without a
+behaviour change (evidence or a verify added, docs, a test-only change, or the
+finding no longer applies; the note says which); `not_fixed` is still there.
+`yes` and `no` need an evidence code or a `diff_at` (`PATH:LINE` in this
+candidate's diff); `not_fixed` needs a note or a code. The review to mark is
+the newest review of an earlier attempt; when that was a PASS or UNVERIFIED,
+or there is none, there is nothing to mark and the array stays `[]`. A
+confirm marks nothing, and a research source check is never asked.
+
+This is measurement only: the marks never make a review invalid, never change
+its verdict or the task's status, and are not part of its citations. Thoth
+checks each mark when the review arrives (one entry per finding, the right
+review id, a known value, the support it needs, codes that are this task's
+evidence, a `diff_at` path that is in the diff evidence of the run under
+review) and stores the result next to the marks as
+`findings.prior_rejection_check`: each finding marked, or unmarked with the
+reason (`missing`, `duplicate_ref`, `bad_shape`, `wrong_review_id`,
+`bad_value`, `no_support`, `foreign_evidence`, `bad_diff_at`,
+`diff_at_not_in_diff`). `review show` prints `prior rejection REVIEW: yes Y,
+no N, not_fixed F, unmarked U` and one `unmarked REF: REASON` line each; both
+keys are in `review show --json` and `review packet` under `findings`, and
+the `verdict` event has a `prior_rejection` summary. A confirm's record
+copies the edit review's marks. `thoth review record` is checked the same way.
+
 **Required checks (REV-3).** A check the task's current spec lists under
 `checks` is required (a spec without `checks`, or with `[]`, requires none,
 even though `verify` then runs every approved check). It ran when a `verify`
@@ -659,6 +731,24 @@ cited, the codes it actually opened, and a `unopened_citation` warning for the
 difference. That is a warning, not a failure — the reviewer may have read the
 same bytes out of the diff it was handed — but a review that cites five codes and
 opened none is worth a second look.
+
+`opened` is every code the reviewer run opened, in event order: through
+`evidence show`, or (EVOPEN-1) for a Codex or agy reviewer, read from its own
+evidence file as its stream shows (those come after any opened through
+`evidence show`). `unopened_citation` is every cited code not in `opened`.
+Additive key `opened_in_stream`: the codes of `opened` found in the reviewer's
+stream, e.g. `["E001","E003"]`; `[]` for a reviewer run with none (every
+Claude reviewer run) and for no review; `null` for an external review, like
+`opened`. The human output adds `  found in the reviewer's stream: E001,E003`
+after `  opened: ...` when that list is not empty, and for a Codex or agy
+reviewer the warning reads `  WARNING unopened_citation: E002 (cited but its
+file in .agent/review-input/evidence/ was never read)`; a Claude reviewer's
+keeps `(cited but never read through `evidence show`)`, and so does the
+source check of a research task, whatever its reviewer's harness (SMALL-18:
+the runner looks for no stream reads in a source check). The `verdict` event's
+detail carries `opened_in_stream` too, next to the same `opened` and
+`unopened_citation`. The runner's `the review cites codes it never opened: ...`
+line in `runner-error.log` lists only the codes still unopened.
 
 It leads with `brief` (BRIEF-1): the newest review's short conclusion, by the
 same rule as `wait --run` on a reviewer (null without a review, and for a
@@ -912,7 +1002,14 @@ Sections, in order:
 2. the spec's goal, acceptance criteria, constraints, non-goals and excluded
    alternatives, verbatim;
 3. the evidence index: code, kind, exit code, run id, label, and for `command`
-   rows the last 15 lines of the stored output; (RVI-1) a `verify` row whose
+   rows the last 15 lines of the stored output; (SMALL-11, additive) when a
+   command row's stored stdout is empty and its stderr is not, the tail is
+   taken from the stderr instead (masked first, like stdout), under one line
+   `(stdout was empty; last lines of stderr:)` instead of `(no stored
+   output)`; each `--json` evidence entry has `output_stream` (`stdout`,
+   `stderr`, `error` or null); a row with output on stdout is shown as before
+   and a row with nothing on either stream still reads `(no stored output)`;
+   (RVI-1) a `verify` row whose
    check did not complete cleanly (refused, failed to run, timed out, output
    left incomplete, no exit code) has an `execution error: TEXT` line right
    under its index line, even when it exited 0 or printed output (`--json`:
@@ -941,6 +1038,20 @@ Sections, in order:
    what was dropped, or `(none)`; `--json` has the top-level `test_scope`
    (`[{"check_id","mode","targets","all_tests_because","dropped",
    "appended_args"}]`, `[]` when there is no claims run or no scoped row);
+   then (SMALL-17) `## Spec-named tests`: the test names the spec's goal,
+   criteria and constraints write, looked up in the code files (`.rs`, `.ts`,
+   `.tsx`, `.js`, `.mjs`, `.py`) of the candidate commit of the run the claims
+   came from and of that run's base. A name is a lowercase snake_case word of
+   four or more parts (`a_spec_named_test_is_here`; not a path, flag or file
+   name), or the filter of a `cargo test` command (its first word that is no
+   flag or flag value; `--test NAME` or `--bin NAME` says which files it is
+   looked up in). One line each, `- NAME (function): STATUS` or `- NAME
+   (filter, TARGET): STATUS`: `found` (at the candidate), `removed` (only at
+   the base: the worker deleted it), `missing` (in neither: never written, or
+   a stale name in the spec), or `not_checked` (a filter with `::`); `(none)`
+   when there is nothing. `--json` has `spec_tests_commit` (that candidate,
+   or null) and `spec_tests` (`[{"name","form","target","status"}]`). A
+   report for the reviewer only: nothing is refused because of it;
 4. every `diff` row in full (all attempts, not cut at `evidence show`'s
    4000-byte default), each headed by its code, run id and `blob_verified`;
    (SMALL-9c) under each heading one line gives the start and end commits as
@@ -955,7 +1066,10 @@ Sections, in order:
    `.agent/review-input/packet.md` a codex or Antigravity reviewer reads
    carries the same line;
 5. the `claims` of the newest `result_ingested` event, with the run they came
-   from;
+   from, then the line `Verification requests the worker declared (for
+   reference only; the control plane runs the approved checks):` and one
+   `- CMD (cwd: CWD)` line per request in the worker's order, or `- (none)`
+   (SMALL-16; with no result ingested the section has no such line);
    then `## Approvals during this task`: every `check_approved` event since
    the task's `task_created` (a check approval names no task, from the main
    tree or any run) and every `protected_change_approved` event of this task,
@@ -981,7 +1095,8 @@ empty section saying so. An unknown task id exits `1` with an error naming it.
 
 `--json` prints the same content as one document (keys `task_id`, `title`,
 `status`, `risk`, `spec`, `evidence`, `protected_changes`, `diffs`, `claims`,
-`claims_run_id`, `approvals`, `reviews`; see `docs/adapter-usage.md`). `--out FILE` writes the
+`claims_run_id`, `verification_requests`, `approvals`, `reviews`; see
+`docs/adapter-usage.md`). `--out FILE` writes the
 exact bytes that would have gone to stdout to FILE as UTF-8 without a BOM,
 leaves stdout empty, and prints `wrote FILE (N bytes)` to stderr.
 
@@ -1041,6 +1156,19 @@ three parts add up to the totals. `--json` has them under `provider_split`;
 when there is at least one review, the human output ends with a line `by
 provider (reviewer vs implementer):` and one line per part, for example
 `  cross_provider: 2 reviews (PASS 1 REJECT 1 UNVERIFIED 0), 3 findings`.
+(MEAS-1) `fixed_by_behaviour` counts the marks reviewers put on the previous
+rejection's findings (see "Marks on the previous rejection" under "Starting
+and reading a review"): over the same reviews (a confirmer's record left
+out, so a chain counts once), how many reviews stored a check, and how many
+findings were marked `yes`, `no` or `not_fixed` or left unmarked, by the
+rejected finding's category (classed blocking or advisory as above) and by
+whether the review that rejected them was same-provider, cross-provider or
+unknown (the rule above, applied to the rejecting review). Reviews of a
+rework recorded before MEAS-1 had nothing marked; they are counted as `not
+recorded`, and their findings in none of the buckets, never as `no`. The
+human output adds, after the provider lines, `fixed by behaviour (marks on
+the previous rejection): R reviews, N not recorded (before MEAS-1)`, the four
+totals, one line per category and one `rejected by SIDE:` line per side.
 
 ## Spec lint
 
@@ -1071,26 +1199,96 @@ Only `goal`, `acceptance_criteria` and `constraints` are read; `non_goals` and
 | `ac_blank` | `"  "` as an acceptance criterion |
 | `ac_duplicate` | `"AC1:  x"` after `"AC1: x"` (ends trimmed, spaces collapsed) |
 | `unknown_check` | `"checks": ["ghost"]` when the catalogue has checks but no `ghost` (an empty catalogue is not checked) |
-| `claude_write` | `改 .claude/skills/x/SKILL.md`, `delete ~/.claude/agents/y.md` |
+| `claude_write` | `改 .claude/skills/x/SKILL.md`, `delete ~/.claude/agents/y.md`, a list that goes on to the folder after a write clause (SPECLINT-1), and (REVFIX-1) the folder in one clause with the write in a later clause that has no target of its own: `In .claude/skills/x/SKILL.md, replace the first line with a new heading`, `在 .claude/skills/x/SKILL.md 裡，把第一段改成新的說明` |
+| `unknown_test_target` (SMALL-10) | a `cargo test` command in the spec whose `--test` word is followed by a name that is no integration test target of the main work tree: neither `tests/NAME.rs` nor `tests/NAME/main.rs` is a file there (the `--test=` form counts too). Verify appends each such name to the approved test command and cargo exits 101 at once, before any test ran, so it is an error. One per name, at its first mention, in that order. Not reported when the spec names the path of such a file anywhere in the scanned fields (the task creates it and verify takes it from the diff), and not at all when the main work tree has no `Cargo.toml` at its top or that file holds `[workspace]` or `[[test]]` (targets may live elsewhere; the lint cannot tell). Only `goal`, `acceptance_criteria` and `constraints` are read, so a name in `non_goals` is not reported. A new rule name in `errors`; the keys of `--json` are unchanged |
 
-`claude_write` looks at one sentence at a time (split at `。`, `；`, `;`, a new
-line, `. `). The sentence must name a `.claude` folder (not `.claude-plugin/`,
-`~/.claude.json` or `CLAUDE.md`), have a write word outside backticks (改, 加,
-寫入, 新增, 建立, 刪, 移除, 搬, 覆蓋, 編輯, write, edit, update, create, add,
-delete, remove, move, rename, replace, …) and no negation outside backticks (不,
-別, 勿, 禁, 免, 無, 沒, not, never, no, don't, without). So
-`plugins/、.claude/、scripts/ 不碰` and `讀 .claude/skills/x` pass.
+`claude_write` looks at one clause at a time. A sentence is split at `。`, `；`,
+`;`, a new line and `. `, and then into clauses at `，` and at an ASCII `,` that
+is followed by a space or the end of the field (`、` does not split; nothing
+splits inside a pair of backticks). The clause must name a `.claude` folder
+(not `.claude-plugin/`, `~/.claude.json` or `CLAUDE.md`), have a write word
+outside backticks (改, 加, 寫入, 新增, 建立, 刪, 移除, 搬, 覆蓋, 編輯, write,
+edit, update, create, add, delete, remove, move, rename, replace, …) and no
+negation outside backticks (不, 別, 勿, 禁, 免, 無, 沒, not, never, no, don't,
+without, and the read-only markers 只讀, 唯讀, 取自, read-only, readonly, read
+only). So `plugins/、.claude/、scripts/ 不碰`, `讀 .claude/skills/x，改
+plugins/y` and `以 .claude/x（只讀）為準，改 a.txt` pass. The message quotes the
+clause that was refused. A negation in one clause does not cover a write in
+another, with two exceptions. The clauses of one parenthetical aside (from the
+clause that opens `（` or `(` to the one that closes it) share their negations.
+A trailing negation clause, the last clause of the sentence when it has a
+negation word other than a read-only marker (those count only in their own
+clause), no name and no write word of its own, covers the clauses before
+it: `.claude/skills/ 的私下版由指揮官之後自己改，這件不碰` passes, and
+`改 .claude/x，不改 src/a.rs` is still refused.
+
+Three more rules came with SPECLINT-1, and together they loosen the lint (it
+refuses fewer specs; the rule name, the keys of `--json` and the message prefix
+`asks to write under a .claude folder` are unchanged):
+
+- **Continuation.** A clause that names the folder at its very start (after
+  spaces, a backtick, and one of `和`, `與`, `及`, `and`, `or`) and has no write
+  word of its own takes the verdict of the clause before it in the sentence:
+  the list is refused when that clause writes without a negation, and passes
+  otherwise (`read src/a.rs, .claude/x` passes). A clause that names the folder
+  later in its text is not a continuation.
+- **Quoted ban.** A name inside a backtick fragment that has whitespace and a
+  negation word is quoted text that bans the folder, not a write target. A
+  fragment without whitespace is a path and a fragment with whitespace but no
+  negation word is a command, so both still count as targets.
+- **List entry.** A clause whose only write word is an adding word directly
+  followed by a colon (`新增：`, `加入：`, `add:`) does not refuse a bare
+  `.claude` or `.claude/` that has another entry beside it in the list (a `、`,
+  `，` or `,` before or after it): `排除清單新增：docs/、.claude/、scripts/x.py`
+  passes. An entry that goes on into the folder, a lone entry, another write
+  word in the clause, or a list that deletes stays refused.
+
+**Folder first, write later (REVFIX-1).** This tightens the rule again: it
+refuses some specs that passed after SPECLINT-1 (the rule name, the `location`
+values, one finding per field, the keys of `--json` and the message prefix are
+unchanged; `non_goals` and `excluded_alternatives` are still not scanned). A
+clause with a write word, no negation and no target of its own writes to the
+target of the nearest clause before it in the same sentence that has a target.
+When that clause names a `.claude` folder and has no write word and no
+negation of its own (a read-only marker in it counts as a negation), the
+sentence is refused exactly as if the write stood in that clause. A target is
+a `.claude` name that is not inside a quoted ban, or a path or file name: a
+word, inside or outside backticks, that holds a `/` or a backslash, or that
+ends (after trailing `.`, `:`, `!`, `?`) in a dot followed by letters or digits
+(`a.txt`, `Cargo.toml`, `SKILL.md`). A word is a run of ASCII characters other
+than spaces, backticks, quotes, brackets, `,` and `;`, so a CJK character ends
+it. The trailing negation clause and the shared negation of a parenthetical
+aside work as above. The message quotes the text from the start of the folder
+clause to the end of the write clause. So these are refused:
+`In .claude/skills/x/SKILL.md, replace the first line with a new heading`,
+`Under ~/.claude/agents/, delete the old reviewer file`,
+`在 .claude/skills/x/SKILL.md 裡，把第一段改成新的說明` and
+`在 .claude/skills/x/SKILL.md 裡，第二段，改成英文`; and these pass:
+`Read .claude/skills/x/SKILL.md, then edit Cargo.toml` (the write clause has a
+file name), `在 .claude/x 裡（只讀），把第一段改成新的說明` (read-only marker in the
+folder clause), `在 .claude/x 裡，把第一段改成新的說明，這件不碰` (trailing
+negation) and `在 .claude/x 找到範例，照著改 docs/a.md，再把第一段改短` (the
+nearest earlier target is `docs/a.md`). Known limits: a bare file name counts
+as a target, so `In .claude/skills/x/, edit SKILL.md` is not refused (the lint
+would rather miss than block); and a write clause that comes before the folder
+clause is judged as before (`edit it, the file in .claude/x` is not refused).
+A write clause without a path of its own also takes an earlier clause that
+only mentions the folder, so
+`Read .claude/x, update the changelog, then run cargo test` and
+`The skill lives in .claude/skills/x, so add a test for it` are refused; name
+the file to change (`update CHANGELOG.md`) and they pass.
 
 Warnings:
 
 | rule | example |
 |---|---|
 | `large` | the file is over 20480 bytes (and at most 40960) at `important` or `high` risk |
-| `missing_path` | `src/gone.rs` is not in the main work tree (`新檔 src/new_one.rs`, `johnny-lo/x`, `$THOTH_HOME/x`, URLs are left alone) |
+| `missing_path` | `src/gone.rs` is not in the main work tree (`新檔 src/new_one.rs`, `johnny-lo/x`, `$THOTH_HOME/x`, URLs are left alone). SMALL-17: a glob such as `src/bin/fake-*.rs` is checked as a glob (reported only when nothing matches); a path with no dot in its last part and no trailing `/` (`plan/log`) is checked only when it is a whole backtick fragment; `new test files src/a.rs and src/b.rs` and `新檔 a.rs、b.rs` mark every path of the list as new |
 | `missing_name` | ``src/present.rs 的 `absent_fn` `` or `src/present.rs:absent_fn`, when the file has no `absent_fn` |
 | `line_number` | `src/a.rs:12`, `` `name`:12 ``, `第 12 行` (not `10:30`, `host:8888` or `第 3 節`) |
-| `two_dot_diff` | `git diff master..HEAD`: compares the two tips, so use `master...HEAD` |
+| `two_dot_diff` | `git diff master..HEAD`: compares the two tips, so use `master...HEAD` (SMALL-17: only `diff` as a whole word, so not `record_diff` or `different`; and Rust's `(..` or `..,` is no range) |
 | `powershell_in_bash` | `` `$env:FOO = 1` `` or `` `Get-ChildItem` `` in a field that never says PowerShell or pwsh |
+| `no_checks_for_document_task` (SMALL-11, additive; `WHERE` is `checks`) | a spec with `task_type` `docs` or `research` and no `checks` (absent or `[]`) while the repository's check catalogue is not empty: `verify` will then run every approved check of the repository, so list the checks the task needs. A warning only: `ok` stays true, the exit code is `0`, and `task create`, `dispatch` and `pipeline new` show it in their `warnings` |
 
 **Why `large` depends on the risk (LEAN-1).** `low` and `normal` tasks already
 skip the mandatory spec review before their first dispatch (only `important`
@@ -1412,6 +1610,8 @@ thoth pipeline show 01J... --wait 30m
   a middle model and effort first; when a same-provider stand-in is needed,
   claude-a or claude-c, never claude-b (decision 2026-10-27). Repeat an
   entry to allow it to be used again.
+- (LIGHT-1) Store your usual lists once per machine and leave the flags
+  out on a low or normal risk task; see "Stored default lists" below.
 - `--reason` is required even with `require-reason` off. Each launch says
   `pipeline ID step N: REASON` (a rework, hand-over or retry also names its
   cause and the entry position), so `launch_choice` shows both.
@@ -1426,6 +1626,91 @@ thoth pipeline show 01J... --wait 30m
   `CARGO_BUILD_JOBS=2` and `RUST_TEST_THREADS=2` in the shell that starts it
   (Thoth does not look at the machine). On Windows verify runs at
   below-normal priority.
+
+### Stored default lists
+
+New (LIGHT-1). Most low and normal risk code tasks use the same
+implementers and reviewers, so you (the commander) can store one default
+implementer list and one default reviewer list on this machine and start
+without lists:
+
+```
+thoth pipeline defaults set \
+  --implementer claude-b:sonnet:medium --implementer claude-a:sonnet:high \
+  --reviewer codex-a:gpt-5.6-luna:medium --reviewer claude-a:opus:high \
+  --reason "usual light path: sonnet implements; codex reviews across providers first" --json
+thoth pipeline defaults show            # the lists, and any entry no longer valid here
+thoth pipeline start 01J... --reason "routine normal-risk change; stored defaults fit" --json
+thoth pipeline start 01J... --implementer codex-a:gpt-5.6-luna:high \
+  --reason "codex knows this module better; reviewers from the defaults" --json
+thoth pipeline defaults clear --only reviewer
+```
+
+- The lists live in `THOTH_HOME/pipeline-defaults.json`, one file per
+  machine shared by every repository (profiles differ between machines).
+  `set` replaces only the list whose flag you give, whole, in the order
+  given with duplicates kept, and stores your `--reason` and the time with
+  it. Entries are checked like `pipeline start`'s.
+- `pipeline start` decides each list on its own: a flag you give wins and
+  the stored list is not read; a flag you leave out takes the stored list
+  exactly as stored. Thoth never picks, ranks, reorders or shortens it.
+- Only at low or normal risk. An important or high risk task takes the
+  heavy path: a start without a list flag is refused, give both lists for
+  that task.
+- A stored entry that no longer passes here (its profile is not registered
+  on this machine, its model is no longer accepted) refuses the start, and
+  `defaults show` lists it under `invalid`. Store a new list or give the
+  flag.
+- Nothing stored and a flag left out is refused, naming the flag and
+  `thoth pipeline defaults set`. `--reason` stays required on every start.
+- `settings` in `pipeline start` and `pipeline show` says where each list
+  came from: `implementers_source` and `reviewers_source` (`flag` or
+  `default`), and `implementers_default` and `reviewers_default` (the stored
+  list's `reason` and `set_at`, or null). The human `pipeline show` marks a
+  list from a stored default.
+- The defaults are yours as commander, not a `thoth config` setting.
+
+### One command for a new task
+
+New (ONE-1). For a new low or normal risk code task, `thoth pipeline new`
+creates the task from the spec file and starts its pipeline in one command,
+then returns at once with the task id and pipeline id:
+
+```
+thoth pipeline new -f spec.json --title "short title" \
+  --reason "routine normal-risk change; stored defaults fit" --json
+thoth pipeline show TASK --wait 9m --json
+```
+
+- It takes `task create`'s `-f`, `--title` and `--base` and `pipeline
+  start`'s flags (the two lists, `--reason`, `--max-attempts`, the four
+  durations, `--quota-threshold`, `--fold-on-reject`), each with the same
+  meaning; a list flag left out uses your stored default. `--wait D` waits
+  as `pipeline show --wait D` does: exit `0` once the pipeline has stopped
+  (read the stop reason), `3` while it still runs; the pipeline keeps going
+  either way.
+- Everything `task create` or `pipeline start` would refuse is refused
+  before anything is created: a spec lint error, a docs, research or review
+  task, a list with nothing given or stored, an invalid entry, a missing
+  `--reason`, and the rest. No task, event or cleanup comes of it.
+- An important or high risk spec is refused as well: a new task has no
+  APPROVE spec review, so the pipeline's first dispatch would be refused.
+  The error lists the heavy-path commands in order: `thoth task create`,
+  `thoth spec review start TASK --edit ...`, `thoth wait --run RUN`,
+  `thoth spec review confirm TASK ...` when the review proposed edits, and
+  once it is approved `thoth pipeline start TASK` with your flags. There is
+  no `--skip-spec-review` here.
+- `--json` has `task_id`, `pipeline_id`, the two commands' own documents
+  (`task_create`, `pipeline_start`), their `warnings` together, and
+  `pipeline_show` (with `--wait`, the `pipeline show` document; else null).
+  The events are the ones the two commands and the pipeline write.
+- Rarely, the start fails after the task was created: if `pipeline start`
+  refuses after all (for example a profile changed in between), the new
+  task is closed (`cancelled`, with a `task_closed` event saying why); if
+  the pipeline was recorded but its background process could not start,
+  the task stays `queued` and the error says to run `thoth pipeline start
+  TASK ...` again.
+- For a task that already exists, keep using `thoth pipeline start TASK`.
 
 The steps: dispatch (from `queued`), wait for the run, the protected-change
 gate, verify (queued behind other pipelines' verify by the `verify-slots`
@@ -1457,7 +1742,11 @@ What comes back to you:
   `edit`. Run `thoth verify EDIT_RUN`,
   then `thoth review confirm TASK --profile P --model M --effort E --reason
   TEXT`. Nothing is confirmed, discarded or adopted automatically.
-- `run_interrupted` (for example a quota stop), `run_failed`, `runner_lost`,
+- `run_interrupted` (for example a quota stop), `run_failed`, `runner_lost`
+  (reached only when a run is still `running` with a stale heartbeat that
+  `thoth status` could not settle; behaviour change, SMALL-11: a dead runner's
+  run is normally settled first as interrupted with reason `crash`, and the
+  pipeline then resumes it once as for any crash),
   `dispatch_refused`, `review_start_refused`, `verify_blocked`,
   `verify_failed`, `verify_wait_timeout`, `unverified_twice`,
   `review_unverified`, `review_interrupted`, `protected_unreadable`,
@@ -1811,6 +2100,13 @@ ones whose work is already in the task's base branch (the `base_branch` of
   every commit `-`, already applied (a cherry-pick or a rebase onto the base):
   deleted with `git branch -D` (`merged_by` `cherry`).
 
+(SMALL-11: behaviour change of `worktrees prune` and `task create`; the keys
+are unchanged.) The same two rules apply to the reviewer fix branch
+`thoth/TASK/aN-fix` (N digits) of a finished task: deleted when merged,
+listed in `removed_branches` and recorded as `branch_deleted`; kept, with the
+reasons below, in `kept_branches` and `branch_kept` otherwise. Any other name
+under `thoth/TASK/` (`a1-fix2`, `a1-fixed`) is never deleted or listed.
+
 Everything else is kept and listed: `branch_checked_out` (a worktree still
 has it, such as a kept dirty one), `no_base_branch` (the task was started on
 a detached HEAD, or the base branch is gone), `branch_unmerged` (work the
@@ -1844,7 +2140,60 @@ worktrees when the task is `pass`, `cancelled` or `accepted`; until then each
   listing what it removed and kept (`--json`: `removed`, `kept`,
   `removed_branches`, `kept_branches`). It exits `1` when a worktree was kept
   for `remove_failed` or `git_error`; kept branches never change the exit
-  code.
+  code. (SWEEP-1.) Every prune, also when no task is finished, first sweeps
+  the leftover baseline checkouts (below) and lists them after its other
+  lines (`--json`: `baseline_sweep`); they never change `ok` or the exit code.
+
+**Leftover baseline checkouts** (SWEEP-1). `thoth verify RUN --at-base` and
+`thoth suite run` check out a commit in
+`<THOTH_HOME>/repos/<repo>/baseline-worktrees/NAME` (`RUN-ULID` or
+`suite-ULID`) and remove it when they return. A command that is killed
+(SIGKILL, Ctrl-C, a closed terminal, a reboot) cannot, so each checkout has an
+owner record, `baseline-holds/NAME.hold` beside that folder, locked by its
+command while it runs; the system lets go of the lock when the process ends,
+however it ends. The start of `verify --at-base`, the start of `suite run` and
+every `worktrees prune` look at each entry of the folder and keep it, with a
+reason, or remove it:
+
+- the record's lock is free: the command is gone, so the checkout and its
+  `git worktree` registration are removed (listed in `removed`, with
+  `made_by` `suite_run` or `verify_at_base` and its `run_id`). A killed
+  command's checkout goes at the next of these sweeps. A checkout already
+  gone by the time the sweep has taken the lock (its own command removed it
+  just then) is reported nowhere, and its record is deleted.
+- `in_use`: another process holds the lock (its command is still running), or
+  the record cannot be opened. Never touched.
+- `remove_failed`: a leftover that is still there after the attempt (a file
+  held open on Windows, a directory the user cannot delete from); `detail`
+  says why. Its record stays, so the next sweep tries again. The human line
+  of `worktrees prune` carries the whole `detail` after ` - `, each line
+  break (with the white space around it) written as `; `.
+- `no_owner_record`: a Thoth-shaped checkout git lists that has no record,
+  made by a Thoth before SWEEP-1 (or one whose record could not be made).
+  Never touched: an older thoth may still be running in it. Once none is, run
+  `git worktree remove --force PATH` yourself.
+- `not_thoth_checkout`: anything else in the folder (a file, a directory
+  Thoth did not make). Never touched.
+
+Records left with no checkout are deleted when nobody holds them. No event is
+written for any of this.
+
+(SMALL-11, additive.) A worktree that a running `thoth verify RUN` (not
+`--at-base`, not `--dry-run`) is using is kept by every one of these sweeps,
+with the new reason `verify_running` (in `kept` of `worktrees prune` and
+`task close --json`, and one `worktree_kept` event, once per path and reason).
+When that verify exits, whatever its result and if no other verify is running
+there, it removes its task's worktrees by the same checks when the task is now
+`pass`, `cancelled` or `accepted`, recording `worktree_removed` (or
+`worktree_kept`) with `source` `verify`; `verify --json` and its exit code do
+not change. A verify that was killed holds nothing (the hold is a file lock the
+system releases with the process), so the next sweep removes the worktree.
+On Windows the check the killed verify started is not ended with it and can
+still be running with the worktree as its working directory, and Windows does
+not delete such a folder: that sweep keeps it as `remove_failed`, after git
+has already emptied it and dropped it from its worktree list, so later sweeps
+keep the empty folder as `git_error` until you delete it yourself (see
+"Windows file locks").
 
 None of these sweeps runs when `THOTH_RUN_ID` is set (a worker or reviewer
 must not remove other tasks' worktrees; `worktrees prune` refuses), or when
@@ -2188,7 +2537,17 @@ approval that no longer matches its own record. The row's `detail.inputs_checked
 evidence whose label starts `verify@base: ` and whose `detail` also carries
 `at_commit` (the base sha); the `verify_ran` event and the `--json` output gain
 the same `at_commit` key. The temporary worktree is removed afterwards, also
-when a check fails or times out. `--at-base --dry-run` lists the checks and the
+when a check fails or times out. (SWEEP-1, additive.) Before it makes that
+worktree, `--at-base` removes the checkouts earlier commands left in that
+folder when they were killed (see "Leftover baseline checkouts" under
+"Worktree cleanup"), then gives its own an owner record:
+`<THOTH_HOME>/repos/<repo>/baseline-holds/NAME.hold`, a file it holds an
+operating-system lock on until it returns, so a kill leaves a checkout the next
+sweep can tell is no longer in use. `--json` then gains `baseline_sweep`
+(what that sweep removed and kept; its stderr has one line per removed
+leftover and per failure); the `verify_ran` event does not carry it. A plain
+`verify`, `--at-base --dry-run` and the `no_approved_checks` result neither
+sweep nor have the key. `--at-base --dry-run` lists the checks and the
 path they would run in, and executes and records nothing (its `fingerprint_ok`
 is `false`: there is no checkout to compare yet). Use it when a reviewer must
 judge "this failure was already there before the worker started": cite the
@@ -2397,7 +2756,9 @@ Tests must check behaviour through the interface, not by opening the
 database. `scripts/check_tests_no_db.py` makes a machine catch the usual
 slip (TESTS-1): it scans every `.rs` file under `tests/` (subdirectories
 included) and counts, per file, the lines that are not a `//` comment and
-contain `rusqlite`, `Connection::open`, `state.db` or `global.db` as a plain,
+contain `rusqlite`, `Connection::open`, `state.db`, `global.db`, `state_conn`
+or `global_conn` (the two Fixture methods that return a connection, counted
+since TESTGAP-2) as a plain,
 case-sensitive substring (one hit per line at most; a path string or an
 assertion that quotes a token counts too). `scripts/tests_db_allowlist.txt`
 lists, one `path count` per line (`#` comments and blank lines skipped,
@@ -2595,7 +2956,8 @@ and record the diff again when the newest one has no readable
 `protected_changes`; when the diff still cannot be recorded they refuse (`run
 RUN has no diff evidence for its candidate, so its protected file changes
 cannot be checked`, or `... has no readable protected_changes, and recording it
-again failed`). An approval belongs to its run: a rework run with the same
+again failed`; when the row recorded again still has no readable list, the
+message stops after `has no readable protected_changes`). An approval belongs to its run: a rework run with the same
 change needs its own. REJECT and UNVERIFIED records need no approval.
 A diff evidence row with a `protected_changes` list but no
 `inline_test_errors` list was written by a thoth before inline tests were
@@ -2622,7 +2984,13 @@ job. A list Thoth cannot read is never taken for an empty one.
 `reason` (or `null`) and `live_runs` besides the check's fingerprint),
 `protected_change_approved` (written by `checks approve --run RUN` on RUN's
 task and run; detail: `run_id`, `diff_code`, `changes` (each `path`, `status`,
-`kind`), `approved_by`, `reason`, `live_runs`), `evidence_added`, `evidence_opened`, `review_started`, `verdict`,
+`kind`), `approved_by`, `reason`, `live_runs`), `evidence_added`, `evidence_opened` (written by
+`evidence show`, detail `code`, `kind`, `bytes_shown`, `bytes_total`,
+`blob_verified`; or, EVOPEN-1, found in a Codex or agy reviewer's stream when
+its review is taken in, detail `code`, `kind` (the evidence row's), `found_in`
+(`reviewer_stream`), `harness` (`codex` or `antigravity`), `path` (always
+`.agent/review-input/evidence/CODE.txt` with `/`) and `item_id` (Codex) or
+`step_index` (agy), on the reviewer run), `review_started`, `verdict`,
 `review_invalid`, `spec_updated`, `decision_added`, `verify_ran`,
 `task_closed` (detail: `from`, `reason`; written by `task close`),
 `task_accepted` (detail: `from` (`in_review`), `reason`, `task_type`, and
@@ -2685,8 +3053,9 @@ removing it does not delete its branch; detail: `task_id`, `path`, `kind` (`work
 `task_create` or `worktrees_prune`); see "Worktree cleanup"),
 `worktree_kept` (WT-1: a finished task's worktree directory was kept; detail:
 `task_id`, `path`, `kind`, `reason` (`outside_worktrees_dir`,
-`uncommitted_changes`, `unreachable_head`, `git_error`, `remove_failed` or
-`link_unremovable`), `detail`, `task_status`, `source`; written once per path
+`uncommitted_changes`, `unreachable_head`, `git_error`, `remove_failed`,
+`link_unremovable` or, SMALL-11, `verify_running`), `detail`, `task_status`,
+`source` (also, SMALL-11, `verify`); written once per path
 and reason, not on every sweep),
 `branch_deleted` (a finished task's merged local branch was deleted by
 `worktrees prune` or `task create`; detail: `task_id`, `branch`, `tip`,
@@ -2810,7 +3179,14 @@ say `head_green: true`: the newest whole-suite run (no `--check`, no
 stops is not pushing the main line and needs no suite. Thoth does not block
 the push itself; the commander checks. Runs follow the usual rule: one whole
 suite at a time, scheduled by the commander; `suite run` takes no pipeline
-verify slot and never starts by itself.
+verify slot and never starts by itself. (SWEEP-1, additive.) After its
+argument refusals and just before it makes its checkout, `suite run` removes
+the checkouts earlier commands left in `baseline-worktrees` when they were
+killed (see "Leftover baseline checkouts" under "Worktree cleanup"), and gives
+its own an owner record (`baseline-holds/NAME.hold`, locked until it
+returns). `--json`, and so the `suite_ran` event's detail, gains
+`baseline_sweep`; stderr has one line per removed leftover and per failure.
+The sweep never changes the exit code.
 
 **Red: finding the task.** Read the failing row's output (`blob_path` in
 `suite run --json`, or `last.results[]` of `suite show --json`) and note the
@@ -2871,11 +3247,12 @@ gets recorded is the command that actually ran, rewrites included.
 
 **A run failed with `command line too long:`.** Claude and codex get the
 prompt on stdin, so their command lines stay short (`prompt.txt` in the run
-dir is still the full text that was sent). Agy still takes the prompt on the
-command line. Any harness whose command line is over 30,000 UTF-16 units is
-not started: the run is settled `failed` and its `error_text` starts with
-`command line too long:` and gives the length. For a long agy prompt, dispatch
-the task to a claude or codex profile instead (W3, 2026-10-06).
+dir is still the full text that was sent). Agy takes the prompt on the
+command line, unless that would push the command line past the cap: then the
+runner writes the prompt to a file and agy gets a short sentence that names it
+(see "Antigravity workers"; SMALL-16). Any other command line over 30,000
+UTF-16 units is not started: the run is settled `failed` and its `error_text`
+starts with `command line too long:` and gives the length (W3, 2026-10-06).
 
 **The evidence index is empty and the worker says so.** The hook appends to
 `inbox\hooks.jsonl` and the runner drains it once a second, so the index can lag
@@ -3016,7 +3393,7 @@ the runner writes the third as an implementer run settles:
 
 | event `type` | when | `detail` |
 |---|---|---|
-| `run_usage` | once per run, when the result event arrives | `models`: object model id → output tokens (null when the harness gave no `modelUsage`); `subagents_spawned`: integer (null when the harness gave no `subagent_stats`) |
+| `run_usage` | once per launch that reaches a result line (a run retried after a transient failure or continued by `thoth resume` has one per such launch; readers take each run's newest) | `models`: object model id → output tokens (null when the harness gave no `modelUsage`); `subagents_spawned`: integer (null when the harness gave no `subagent_stats`) |
 | `subagents_spawned` | additionally, only when `subagents_spawned` > 0 | `spawned`: the count; `note`: a fixed sentence |
 | `run_quota` | written by the runner for every implementer and every reviewer run (since DT-1) of a claude-code or codex profile, after the stream ends and before the run's final `status_change`, whatever the outcome (completed, failed or interrupted; a resumed run writes another, and readers take each run's newest). Never for an antigravity run | `window`: always `five_hour`; `start_percent`, `end_percent`: the first and last reading of that window during the run, in percent; `points`: `end_percent` minus `start_percent`, in percentage points; all three are numbers rounded to two decimals, or all three null when either end has no reading or the two readings have different reset times (the window reset mid-run; reset times up to 600 seconds apart count as the same window, because codex shifts the reset time by a few seconds at the start of a window, and only one end having a reset time counts as different); one reading counts as both ends, so `points` is 0. `source`: `claude_stream` (the `five_hour` entry of `windows` in the run's own `rate_limit_warning` events, `utilization` × 100) or `codex_rollout` (the `used_percent` of the 300-minute window of the general bucket - `limit_id` `codex` or absent - in the `token_count` lines of the rollout file under `<config_dir>/sessions/` whose name contains the run's thread id). Since DT-1 three more keys, none of the five above changed: `seven_day`: an object with `start_percent`, `end_percent` and `points`, the same numbers for the weekly window (the `seven_day` entry of `windows` for Claude, the 10080-minute window of the general bucket for codex; judged on its own, so a five-hour reset mid-run does not null the weekly numbers); `reliable`: a boolean; `unreliable_reasons`: an array of strings, `[]` when `reliable` is true, in this order: `shared` (the operator marked the run's profile with `thoth profile set-shared`), `shared-check-failed` (the mark could not be read), `overlap:<run_id>` (once for each other Thoth run of the same account, in any registered repo, any role and any status, whose time interval overlaps this run's; a run with no end time counts as still running; ordered by run id), `overlap-check-failed:<repo_id>` (that repo's state database exists but could not be looked at, opened or queried - a repo whose state database does not exist is skipped - or, for the run's own repo, the run's own row could not be re-read for its start time; counted against the run). A run with `reliable: false` keeps its numbers; readers decide. A rough estimate, see below |
 
@@ -3095,8 +3472,21 @@ run (`status`, the `run_started` event and the review packet show them):
   a `--effort` that differs is lowered to it with the usual note (`max is not
   supported by gemini-3.8-flash-high; using high`). Any other name
   (`claude-sonnet-4-6`) sends the flag and, like every other model, needs
-  `--effort` on the first launch. Whether agy accepts the flag for such a
-  name is still to be confirmed on a real run.
+  `--effort` on the first launch. Some of those names refuse it (agy 1.5.14
+  answers `claude-sonnet-4-6 --effort medium` with `--effort is not
+  supported for model "claude-sonnet-4-6"` before any model turn). Thoth
+  learns this from agy's own answer, not from the name: the runner relaunches
+  that launch at once without `--effort`, in the same run (no wait, not
+  counted as a retry), writes an `effort_refused` event, stores the run's
+  `effort` as null with the note `agy refused --effort medium for
+  claude-sonnet-4-6; sent without an effort`, and records the refusal on the
+  profile. From then on that model, on that profile only, takes no effort:
+  every launch (dispatch, resume, reviews, spec reviews, the pipeline) sends
+  none, `--effort` may be left out, and one that is given is recorded as
+  requested and not sent, with the note `claude-sonnet-4-6 takes no effort on
+  profile agy-a: agy refused --effort at TIME (run RUN)`. `thoth models` and
+  `thoth recommend` show it (`no effort since TIME`); `thoth profile
+  forget-model agy-a claude-sonnet-4-6` clears it.
 
 The note can be non-null even when the level sent equals the level requested: that means Thoth could not confirm the model supports it (for example no `models_cache.json` for codex, or a Claude model not in Thoth's table). A `launch` key written into a task's own spec is ignored: every run's spec gets its own `launch` from Thoth, and an invalid level stored there is treated as absent.
 
@@ -3107,7 +3497,7 @@ Thoth cannot see that.
 Breaking change (RJ-1): `--effort` left out is no longer worked out by a rule.
 The first launch of an attempt is refused without it (unless the model has no
 effort setting, haiku, or (AGY-1) is an agy model whose name ends in its
-level); a reroute in the same
+level or one agy refused `--effort` for on this profile); a reroute in the same
 attempt keeps the `effort_requested` of the newest run of that role and
 attempt (see "Automatic dispatch"). `--effort auto` is refused. `--effort
 LEVEL` is used as written. `resume` is unchanged.
@@ -3277,7 +3667,11 @@ writes its input into the review worktree:
   TASK` prints;
 - `.agent/review-input/evidence/<CODE>.txt`: the whole stored blob of every
   evidence row the packet lists (non-UTF-8 bytes shown as U+FFFD; masked when
-  it holds a secret, see "Secret masking"). (RVI-1) The file of a `verify`
+  it holds a secret, see "Secret masking"). (SMALL-11, additive) The file of
+  a command row whose stdout was empty and whose stderr was not begins with
+  one line, `[thoth: this command printed nothing on stdout; its stderr
+  follows]`, and then holds the whole masked stderr (after the execution
+  error line when one is recorded). (RVI-1) The file of a `verify`
   check that did not complete cleanly (refused, failed to run, timed out,
   output left incomplete by a descendant still holding the pipe, no exit
   code) begins with one line, `[thoth: this check recorded an execution
@@ -3355,11 +3749,51 @@ The schema only shapes the document: a malformed or uncited report still
 settles the task `unverified` with `review_invalid`.
 
 A codex reviewer's own commands (its `cat`s) are not recorded as evidence,
-the same as a Claude reviewer's. Because it reads files instead of running
-`evidence show`, it records no `evidence_opened` events, so `review show`
-reports every code it cited under `unopened_citation`; for a codex review that
-warning says nothing about whether it read them. A reviewer run cannot be
-resumed, on either harness.
+the same as a Claude reviewer's. It reads files instead of running `evidence
+show`, so (EVOPEN-1) when its review is taken in — a plain review, an
+edit-mode review and the confirmation of its fix alike, before the review is
+judged, and also when the review is refused as `review_invalid` — Thoth reads
+the run's own `stream.jsonl` and records which of its evidence files it read:
+
+- A code C is opened when an `item.completed` item of type
+  `command_execution` has a `command` naming C's own file,
+  `.agent/review-input/evidence/C.txt` in the run's own worktree, where C is
+  an evidence code of the task. The exit code does not matter (a `grep` that
+  finds nothing still read the file); an `item.started` line alone does not
+  count. The name counts written relative to the worktree
+  (`.agent/review-input/evidence/E001.txt` or
+  `./.agent/review-input/evidence/E001.txt`) or as the worktree's absolute path
+  followed by that; on Windows `\` and `/` are alike and the worktree part
+  ignores letter case, elsewhere only `/` separates. It must end at `.txt`
+  followed by the end of the text, white space, a quote, `;`, `&`, `|`, `)` or
+  `,` (so `E0011.txt` and `E001.txt.bak` are not E001), and it may stand
+  inside quotes and codex's shell wrapper (`/bin/bash -lc '...'`). One command
+  naming several files (`cat A B`, `cat A && cat B`, PowerShell
+  `Get-Content A, B`) opens each of them.
+- Reading `packet.md` or `result.json` opens nothing, although the packet
+  holds each command's last lines and every diff: a packet is not a reviewer
+  opening a code (`thoth review packet` records no opening either).
+- Each code found gets one `evidence_opened` event on the reviewer run, in the
+  order of its first read, detail
+  `{"code":"E001","kind":"command","found_in":"reviewer_stream","harness":"codex","path":".agent/review-input/evidence/E001.txt","item_id":"item_2"}`
+  (`kind` is the evidence row's; `path` is always this relative form with
+  `/`). At most one per code and run: a code read twice, or already opened by
+  the run through `evidence show`, gets no second event. A stream with no such
+  read records nothing. No evidence row is added.
+
+Known limits — a read is far more often missed than wrongly claimed: a path
+outside the run's own review input folder (another task's or run's worktree, any other absolute
+path, a file named `E001.txt` in another folder), a code that is not evidence
+of the task, a listing (`ls .agent/review-input/evidence`), a glob or pattern
+(`evidence/*.txt`, `E00?.txt`), a bare file name after a change of directory
+(`cd .agent/review-input/evidence && cat E001.txt`) and a path built from a
+variable never count. Codex rollout files are not read. So a code under
+`unopened_citation` of a codex review is one its stream shows no read of.
+Reviews taken in before EVOPEN-1 are not reworked. A reviewer run cannot be
+resumed, on either harness. One case is claimed: codex's `command_execution`
+has no working directory, so a relative path after a change of directory
+(`cd /tmp && cat .agent/review-input/evidence/E001.txt`) counts as a read of
+the run's own `E001.txt`.
 
 Cross-harness works both ways: a claude-code implementer can be reviewed by a
 codex reviewer and a codex implementer by a claude-code reviewer.
@@ -3381,9 +3815,17 @@ agy -p <prompt> --output-format stream-json --model <model> [--effort <level>] -
 with the worktree as cwd and stdin `/dev/null`. `--effort <level>` is there
 only for a model name that does not end in its level (AGY-1; see "Effort").
 Unlike claude and codex, agy's
-prompt is still on the command line (agy's `-p` always takes the next token);
-when the command line is over 30,000 UTF-16 units the run is settled `failed`
-at once, before agy is started. No environment variable is set
+prompt is on the command line (agy's `-p` always takes the next token). SMALL-16:
+when that would put the command line over 30,000 UTF-16 units, the runner
+writes the full prompt, byte for byte what `prompt.txt` holds, to
+`.agent/prompt.md` in the run's working directory (an implementer) or to
+`.agent/review-input/prompt.md` (a reviewer or spec reviewer), and `-p` carries
+one sentence instead: `Your full instructions are in the file PATH. Read that
+whole file with your file tool before anything else, then do what it says. It
+is your complete task.` A shorter prompt stays on the command line and writes no
+file; the file is not in the candidate commit; any other argument that makes
+the line too long still settles the run `failed` at once, before agy is
+started. No environment variable is set
 for agy and `HOME` is left untouched: agy keeps its login in the system keyring
 and has no variable that moves its data directory. The profile's `config_dir`
 (normally `~/.gemini/antigravity-cli`) is used only to find the transcript
@@ -3604,11 +4046,17 @@ connecting to the server, please try again.` (agy exit 3), `Eligibility check
 failed: ... TLS handshake timeout` (exit 1, no `init`, so nothing to resume:
 dispatch again), and `The stream was interrupted. Please continue the task you
 were working on.` (exit 0, with a partial `response`); the recorded lines are
-in `tests/fixtures/antigravity/fc1-*`. The runner retries these in the same
+in `tests/fixtures/antigravity/fc1-*`. So is agy's no-capacity answer (agy
+1.5.14, exit 3): `Our servers are experiencing high traffic right now, please
+try again in a minute. (UNAVAILABLE (code 503): No capacity available for
+model M on the server)`; the profile is not parked. The runner retries these in the same
 run - `--conversation <id>` when `init` had named the conversation (the network
 issue, the interrupted stream), the same prompt afresh when it had not (the
 eligibility failure) - and the run is `interrupted` / `transient` only after
-two failed retries. The runner's login check for agy is
+two failed retries. A refused `--effort` (`--effort is not supported for model
+"M"`, exit 1, no `init`) is not a failure of the run either: the runner
+relaunches that launch once at once without the effort (see "Effort"), and
+the run ends by that relaunch's outcome. The runner's login check for agy is
 `agy models`: only `Please sign in to use Antigravity` makes a run
 `interrupted` / `auth`; a check that fails for another reason (the network)
 changes nothing. The runner's check stores no model list; the five commands
@@ -3726,11 +4174,20 @@ result without `structured_output` writes nothing, and the ingest records
 `review_invalid` with `stage: "read"`; the task settles `unverified`, as for
 any malformed report.
 
-Its `read_file` steps are not evidence. Because it reads files instead of
-running `evidence show`, it records no `evidence_opened` events, so `review
-show` reports every code it cited under `unopened_citation`, which (as for
-codex) says nothing about whether it read them. `wait --run` reports its
-`verdict` and `task_status`. A reviewer run cannot be resumed.
+Its `read_file` steps are not evidence. It reads files instead of running
+`evidence show`, so (EVOPEN-1), as for a codex reviewer (see "Codex
+reviewers": when, the name rules, the events and the known limits), Thoth
+finds in the run's own `stream.jsonl` which of its evidence files it read when
+its review is taken in. Here a read is a `step_update` with `state` `DONE` and
+`step_type` `tool`, tool `read_file` with `tool_info.parameters.Path`, or
+`view_file` with `tool_info.parameters.AbsolutePath` (the agy 1.2.x shape),
+naming the file, and no `tool_info.result` `ERROR`. Its event detail has
+`"harness":"antigravity"` and `"step_index":5` in place of `item_id`. A
+listing or search tool (`list_dir`, `find_by_name`, `grep_search`) opens
+nothing, and the agy transcript in the account's data folder is not read: the
+run's own stream carries the call and its path for both tool generations.
+`wait --run` reports its `verdict` and `task_status`. A reviewer run cannot be
+resumed.
 
 Cross-harness works both ways: a claude-code implementer can be reviewed by an
 agy reviewer and an agy implementer by a claude-code reviewer.
@@ -4032,7 +4489,10 @@ the automatic refresh asks only agy and codex; Thoth stores the readings). A win
     when it is `false`, at most 24 hours old and newer than the newest
     rollout reading, the profile is `exhausted` and `recommend` says
     `ordinary usage not allowed` (such a reply is stored even with no
-    windows); `true` or `null` leave the state to the window percentages. A
+    windows); so does `profile usage` (SMALL-17): `--json` has
+    `usage_not_allowed_at`, the time of that reading (null otherwise), and
+    the human block has the line `ordinary usage not allowed (codex
+    app-server, read at T)` after its first line; `true` or `null` leave the state to the window percentages. A
     codex profile with no reading at all ranks with the reason "no quota
     reading yet; run `thoth profile usage --refresh`".
   - Claude Code refresh, under the same switch, happens only on a manual
@@ -4182,11 +4642,18 @@ the automatic refresh asks only agy and codex; Thoth stores the readings). A win
   Once `$THOTH_HOME/report.html` exists, it is rewritten automatically at
   the end of every command that changes a task or run status (`task create`,
   `task update-spec`, `task close`, `dispatch`, `resume`, `cancel`, `submit`,
-  `review start`, `review record`) and by the runner after it settles a run.
-  The rewrite is best effort: it never creates the file, prints nothing, and
-  cannot change the command's exit code or output. `thoth hook` never does
-  it (the hook opens no database), and neither do read-only commands. A page
-  written elsewhere with `--out` is not rewritten.
+  `review start`, `review record`, and (REVFIX-1) `thoth status` when it
+  settles the run of a dead runner, with or without a TASK, in human or
+  `--json` output, and so the MCP tool `thoth_status` too) and by the runner
+  after it settles a run. A `thoth status` that settles nothing (no running
+  run, a runner that is alive, a run an earlier status already settled, or
+  status outside a repository) leaves the page alone: same bytes, same
+  modification time. The rewrite is best effort: it never creates the file,
+  prints nothing, and cannot change the command's exit code or output.
+  `thoth hook` never does it (the hook opens no database), and neither do
+  read-only commands (`profile usage`, `recommend` and the live quota refresh
+  only count a dead run out, they do not settle it). A page written
+  elsewhere with `--out` is not rewritten.
 
 **Quota groups on a parked antigravity profile.** agy's quota comes in groups
 (for example `Gemini Models` and `Claude and GPT models`). When an antigravity
@@ -4198,7 +4665,13 @@ that group as `parked_group` on the profile (null for a profile that is not
 parked, or when no group was recorded), and a profile parked for one group
 stays eligible for a model of another group (reason `parked for quota group G;
 the selected group H is unaffected`), so a dispatch with such a model runs
-without the `rate_limited` warning and leaves the status as it is. Whether the
+without the `rate_limited` warning and leaves the status as it is. That needs
+a named model (SMALL-17): `recommend --model M` with a model that matches
+exactly one group, the one selected. Without `--model` (and in `thoth status`),
+or with a model that matches no group or more than one, the profile is not
+eligible unless recovered, and its reasons keep `status rate_limited; run
+`thoth profile check ID`` and add `parked for quota group G; name a model of
+another group with --model to use this profile`. Whether the
 parked group has reset is judged from that group's windows only. Without a
 `live_quota` reading (nobody ran `profile usage --refresh`), `quota_group` is
 null and the whole profile is parked, as before.
@@ -4238,7 +4711,8 @@ reserved: `thoth profile add` refuses it in any letter case (`auto`, `Auto`,
 `--model` and `--effort`; `--effort` can be left out only when the model has
 no effort setting (haiku; then nothing is sent) or (AGY-1) when it is an agy
 model whose name ends in its level (`gemini-3.8-flash-high`; then that level
-is recorded and no flag is sent, see "Effort"). A reroute in the same attempt keeps the previous run's model and
+is recorded and no flag is sent, see "Effort"), or one agy refused `--effort`
+for on this profile (nothing is sent, see "Effort"). A reroute in the same attempt keeps the previous run's model and
 requested effort for whatever is left out: for `dispatch` the newest
 implementer run of this attempt (a rework after a REJECT is a new attempt, so
 it keeps nothing), for `review start` the newest reviewer run of the attempt
@@ -4384,7 +4858,12 @@ Two kinds of secret are recognised:
   `thoth:aistupidlevel-api-key`, `thoth:artificialanalysis-api-key`, or
   `thoth:secrets.json` for any other key), each also in its JSON-escaped form.
   A value shorter than 8 characters after trimming, or made only of digits, is
-  not matched: it would mask ordinary text.
+  not matched: it would mask ordinary text. (GITENV-1) git's configuration
+  group, `GIT_CONFIG_COUNT` whose value is a decimal number N with
+  `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` for every n from 0 to N-1, is
+  one unit, and the values of its `GIT_CONFIG_KEY_n` are git setting names,
+  not exact values; a `GIT_CONFIG_KEY_` variable outside a group is matched
+  as before.
 
 Each secret becomes `[redacted:KIND]`. KIND says which kind of secret it was
 and nothing about the value: no piece of it, no length.
@@ -4453,7 +4932,10 @@ and without any other variable the masking takes for a secret: a name with
 holding one of the seven formats. (RD-4) Nor does it get a variable, whatever
 its name, whose whole value is a known exact value (an environment value the
 masking takes by its name, or a value in `secrets.json`); a variable that only
-contains one, such as PATH, still reaches it. Every other variable still
+contains one, such as PATH, still reaches it. (GITENV-1) git's group (see the
+exact values above) reaches it whole, or not at all when any of its values is
+a known exact value or holds one of the seven formats: never a count without
+its keys, which makes every git command fail. Every other variable still
 reaches it, and the runner itself keeps them all, so it can mask with them.
 
 Specs (RD-3). `thoth task create` and `thoth task update-spec` refuse a spec
@@ -4504,7 +4986,7 @@ Known limits:
 
 ## Settings
 
-`thoth config list [--json]`, `thoth config get KEY [--json]`, `thoth config set KEY VALUE [--json]` and `thoth config unset KEY [--json]` manage 18 settings (additive, AUTO-1a: `verify-slots`, last in the list): the three switches `live-quota`, `scores-auto-refresh` and `require-reason` (default off; Breaking change (RJ-1): `same-provider-rotation` is gone: a `same_provider_rotation` left in config.json has no effect and is not reported as unknown, and `config get`, `set` or `unset` of it exits 1 saying it was removed), the screen `language`, the three CLI paths `claude-bin`, `codex-bin` and `agy-bin`, `live-quota-timeout-ms`, (SMALL-9a) `quota-reserve-percent` (a whole number 0 to 99, default `0`, off; no environment variable), the three score addresses `scores-url`, `aa-url` and (RJ-2) `arena-url` (`THOTH_ARENA_URL`, default `https://huggingface.co`: the Hugging Face Hub the Agent Arena dataset is fetched from), the two shared-records settings `machine-name` (default: this computer's host name, sanitised to `A-Z a-z 0-9 . _ -`) and `records-dir` (an absolute path; default `unset`), one that can only be read, `home` (`THOTH_HOME`), and the two API keys, stored with `thoth config set-secret KEY` (the value is typed at a hidden prompt or piped on stdin, never given on the command line) into `$THOTH_HOME/secrets.json`, removed with `thoth config unset-secret KEY`, and shown everywhere only as set or unset. The environment variables of the shared-records settings are `THOTH_MACHINE_NAME` and `THOTH_RECORDS_DIR`. Stored values live in `$THOTH_HOME/config.json`; an environment variable beats config.json, which beats the default, and `config list` shows each value's source and, at the end, what is kept elsewhere (profiles, checks). Setting a switch on prints its behavior and the relevant terms reminder. `config list` and `config get` are read-only. Agents must not change these settings themselves; ask the human operator to run `thoth config set` or `thoth config unset` (`thoth config set-secret` or `thoth config unset-secret` for the API keys).
+`thoth config list [--json]`, `thoth config get KEY [--json]`, `thoth config set KEY VALUE [--json]` and `thoth config unset KEY [--json]` manage 18 settings (additive, AUTO-1a: `verify-slots`, last in the list): the three switches `live-quota`, `scores-auto-refresh` and `require-reason` (default off; Breaking change (RJ-1): `same-provider-rotation` is gone: a `same_provider_rotation` left in config.json has no effect and is not reported as unknown, and `config get`, `set` or `unset` of it exits 1 saying it was removed), the screen `language`, the three CLI paths `claude-bin`, `codex-bin` and `agy-bin`, `live-quota-timeout-ms`, (SMALL-9a) `quota-reserve-percent` (a whole number 0 to 99, default `0`, off; no environment variable), the three score addresses `scores-url`, `aa-url` and (RJ-2) `arena-url` (`THOTH_ARENA_URL`, default `https://huggingface.co`: the Hugging Face Hub the Agent Arena dataset is fetched from), the two shared-records settings `machine-name` (default: this computer's host name, sanitised to `A-Z a-z 0-9 . _ -`) and `records-dir` (an absolute path; default `unset`), one that can only be read, `home` (`THOTH_HOME`), and the two API keys, stored with `thoth config set-secret KEY` (the value is typed at a hidden prompt or piped on stdin, never given on the command line) into `$THOTH_HOME/secrets.json`, removed with `thoth config unset-secret KEY`, and shown everywhere only as set or unset. The environment variables of the shared-records settings are `THOTH_MACHINE_NAME` and `THOTH_RECORDS_DIR`. Stored values live in `$THOTH_HOME/config.json`; an environment variable beats config.json, which beats the default, and `config list` shows each value's source and, at the end, what is kept elsewhere (profiles, checks). Setting a switch on prints its behavior and the relevant terms reminder. `config list` and `config get` are read-only. Agents must not change these settings themselves; ask the human operator to run `thoth config set` or `thoth config unset` (`thoth config set-secret` or `thoth config unset-secret` for the API keys). The pipeline's stored default lists (`thoth pipeline defaults`, `THOTH_HOME/pipeline-defaults.json`, LIGHT-1) are not a setting: the commander stores them, and `config list` does not show them.
 `live-quota` permits Thoth to query official Antigravity agy and the official
 codex CLI's app-server at two times: `profile usage --refresh` calls, which
 also ask Claude Code's own `/usage` command, and the automatic refresh that
@@ -4728,11 +5210,14 @@ recommend`, with or without `--task` (`dispatch`, `review start` and `spec
 review start` read no scores, so they never fetch). Each keyed request gives
 up after 8 seconds (the manual `--refresh` allows 20); Agent Arena's whole
 fetch shares 20 seconds. A lock file `.model-scores.refresh.lock` in
-`$THOTH_HOME` keeps two processes from fetching at once; a lock whose
-modification time is more than 120 seconds old is replaced (its content is never
-read), and a process that finds a fresh lock skips the refresh. The lock is best
-effort: if two processes reclaim the same expired lock at the same moment, both
-may fetch, and the second may get a rate-limit warning. When a refresh fails, the old cache is used unchanged and exactly one line,
+`$THOTH_HOME` keeps two processes from fetching at once. It holds the id of the
+process that took it, then the time. A lock whose process is gone is replaced at
+once, any other lock when its modification time is more than 120 seconds old (an
+empty lock, or one without a process id, only by its age), and a process that
+finds a lock that is neither skips the refresh. The lock is best effort: if two
+processes reclaim the same lock at the same moment, both may fetch, and the
+second may get a rate-limit warning. When a refresh fails, the old cache is
+used unchanged and exactly one line,
 `warning: automatic score refresh failed: ...`, goes to stderr; the exit code
 and the JSON on stdout do not change. Nothing is fetched inside a worker
 (`THOTH_RUN_ID` set), in the runner, or when a status change rewrites the
@@ -4743,16 +5228,33 @@ read `auto_refresh` and `cache.stale` in the `thoth_models` result instead.
 
 **Staleness.** `thoth models --json` adds `age_hours` (whole hours since
 `fetched_at`, or null with no cache) and `stale` to `cache`, to
-`external.artificial_analysis.cache` and to `external.agent_arena.cache`. `stale` is true when there is no cache or
-it is 48 hours old or more. The top-level `auto_refresh` object has `enabled`,
+`external.artificial_analysis.cache` and to `external.agent_arena.cache`.
+`stale` is true when there is no cache or it is 48 hours old or more. The
+top-level `auto_refresh` object has `enabled`,
 `skipped` (null, or `off`, `worker`, `busy`, `manual`), `attempted` and
-`refreshed` (source names), and `failed` (`source`, `error`). Plain output
+`refreshed` (source names), and `failed` (`source`, `error`). (SMALL-11,
+additive) `backed_off` lists `{source, failed_at, retry_after}` (RFC 3339):
+when the automatic refresh of a source fails, that time is kept in
+`model-scores-retry.json` under `THOTH_HOME` (the cache files and their
+`fetched_at` stay as they were) and for one hour `models`, `report` and
+`recommend` do not try that source again (it leaves `attempted`) and print no
+new warning; the warning is printed once, on the call that failed. Other
+sources are not affected, `thoth models --refresh` still fetches every source
+and its success ends that source's back-off. Only `models`' `auto_refresh` and
+`recommend`'s `score_refresh` list `backed_off`; `report --json` has `path` and
+`generated_at` only (SMALL-12: documentation correction; output unchanged). A
+debug build reads `THOTH_TEST_SCORE_RETRY_SECS` to shorten the hour for tests.
+Plain output
 prints one `stale:` line per stale source with the fix, and an `auto-refresh:`
 line naming the sources refreshed by this call.
 
 Caches without `schema: "aistupidlevel-v1"` are treated as unavailable: scores
-are null and plain output names the stale file and asks for `--refresh`. The
-HTML report's 派工決策表 section shows each source's fetch date and staleness; the scores themselves are in `thoth models`.
+are null and plain output names the stale file and asks for `--refresh`. That
+one line is all it prints for the source: there is no second `stale: no AI
+Stupid Level scores cached` line (a missing cache still gets that line, and the
+other sources' `stale:` lines do not change; `--json` is unchanged). The HTML
+report's 派工決策表 section shows each source's fetch date and staleness; the
+scores themselves are in `thoth models`.
 
 ## Shared records folder (DT-3)
 

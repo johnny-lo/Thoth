@@ -1,6 +1,7 @@
 pub mod checks;
 pub mod global;
 pub mod migrations;
+pub mod pipelines;
 pub mod reports;
 pub mod state;
 
@@ -17,10 +18,43 @@ use std::time::Duration;
 /// vendored build flag, not a documented guarantee, so real enforcement
 /// should not ride on it silently.
 fn tune(conn: &Connection) -> Result<()> {
-    conn.busy_timeout(Duration::from_millis(5000))?;
+    conn.busy_timeout(busy_timeout())?;
     let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     conn.execute("PRAGMA foreign_keys = ON", [])?;
     Ok(())
+}
+
+/// The busy timeout every thoth connection waits for another writer's lock.
+const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// TEST-7b: the busy timeout a raw value of the test switch asks for. A
+/// decimal integer from 1 to 5000 (surrounding blanks ignored) is that many
+/// milliseconds; anything else - no value, empty, not a decimal integer, 0,
+/// above 5000 - is `BUSY_TIMEOUT`. The switch can only shorten the wait.
+fn parse_busy_timeout(raw: Option<&str>) -> Duration {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| (1..=5000).contains(ms))
+        .map(Duration::from_millis)
+        .unwrap_or(BUSY_TIMEOUT)
+}
+
+/// TEST-7b: the busy timeout `tune` sets. Debug builds read the test-only
+/// switch `THOTH_TEST_BUSY_TIMEOUT_MS`, which a test sets on one command
+/// that only waits for a lock it can never get; release builds never read
+/// it and always wait `BUSY_TIMEOUT`. For tests only; deliberately left out
+/// of the user documentation.
+fn busy_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    {
+        let raw = std::env::var("THOTH_TEST_BUSY_TIMEOUT_MS").ok();
+        parse_busy_timeout(raw.as_deref())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        parse_busy_timeout(None)
+    }
 }
 
 fn open_tuned(path: &Path) -> Result<Connection> {
@@ -90,4 +124,24 @@ pub fn write_tx(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
 fn hold_write_lock_for_test() {
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::commands::spec_review::test_pause("THOTH_TEST_WRITE_TX_PAUSE_FILE"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TEST-7b: with no value (always so in a release build) the busy
+    /// timeout is five seconds, as before; only 1..=5000 ms shortens it.
+    #[test]
+    fn busy_timeout_is_five_seconds_unless_the_switch_shortens_it() {
+        let five = Duration::from_secs(5);
+        assert_eq!(parse_busy_timeout(None), five);
+        for raw in ["", "abc", "0", "-1", "1.5", "5001"] {
+            assert_eq!(parse_busy_timeout(Some(raw)), five, "{raw:?}");
+        }
+        assert_eq!(parse_busy_timeout(Some("1")), Duration::from_millis(1));
+        assert_eq!(parse_busy_timeout(Some("300")), Duration::from_millis(300));
+        assert_eq!(parse_busy_timeout(Some(" 300 ")), Duration::from_millis(300));
+        assert_eq!(parse_busy_timeout(Some("5000")), five);
+    }
 }

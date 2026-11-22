@@ -237,16 +237,20 @@ fn antigravity_profile_registers_and_checks_without_harness_env_vars() {
     let cfg = f.home.path().join("agy-data");
     std::fs::create_dir_all(&cfg).unwrap();
     let log = f.home.path().join("agy-args.jsonl");
+    // FLAKY-1: the HOME agy must see is the one this test hands `profile
+    // check`, not whatever the suite was started with (it may have none).
+    let home = f.home.path().join("caller-home");
+    std::fs::create_dir_all(&home).unwrap();
     f.cmd().args(["profile", "add", "agy-a", "--provider", "google", "--harness",
         "antigravity", "--config-dir"]).arg(&cfg).assert().success();
     f.cmd().args(["profile", "check", "agy-a", "--json"])
-        .env("FAKE_AGY_ARGS_LOG", &log).assert().success()
+        .env("FAKE_AGY_ARGS_LOG", &log).env("HOME", &home).assert().success()
         .stdout(predicate::str::contains("\"logged_in\":true"));
     let row: Value = serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
     assert_eq!(row["args"], serde_json::json!(["models"]));
     assert!(row["env"]["CLAUDE_CONFIG_DIR"].is_null());
     assert!(row["env"]["CODEX_HOME"].is_null());
-    assert_eq!(row["env"]["HOME"], std::env::var("HOME").unwrap());
+    assert_eq!(row["env"]["HOME"], home.to_str().unwrap(), "{row}");
 }
 
 #[test]
@@ -379,6 +383,27 @@ fn agy_dispatch_with(
     serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap()
 }
 
+/// TEST-7a: `agy_dispatch`, with fake-agy's wait for one index row per
+/// command (`FAKE_AGY_INDEX_WAIT_MS`, 30 s by default) set to `index_wait_ms`.
+fn agy_dispatch_index_wait(
+    f: &common::Fixture,
+    cfg: &std::path::Path,
+    task_id: &str,
+    scenario: &str,
+    model: &str,
+    index_wait_ms: u64,
+) -> Value {
+    let out = agy_env(f, cfg, task_id, scenario)
+        .env("FAKE_AGY_INDEX_WAIT_MS", index_wait_ms.to_string())
+        .args(["dispatch", task_id, "--profile", "agy-a", "--model", model, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap()
+}
+
 /// Every event of `ty` for `run_id` as (seq, detail), oldest first.
 fn events(f: &common::Fixture, run_id: &str, ty: &str) -> Vec<(i64, Value)> {
     let conn = f.state_conn();
@@ -449,7 +474,21 @@ fn index(worktree: &std::path::Path) -> Vec<Value> {
 #[test]
 fn a_good_agy_run_reaches_in_review_with_exit_codes_from_the_transcript() {
     let (f, cfg, task_id) = agy_setup();
-    let d = agy_dispatch(&f, &cfg, &task_id, "ok", MODEL);
+    // FLAKY-1: this dispatch is given its own HOME, so the HOME agy must see
+    // does not depend on the environment the suite was started in (it may
+    // have none). Built here, not through `agy_dispatch`, so the other tests'
+    // dispatches stay as they are.
+    let home = f.home_path().join("caller-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = agy_env(&f, &cfg, &task_id, "ok")
+        .env("HOME", &home)
+        .args(["dispatch", &task_id, "--profile", "agy-a", "--model", MODEL, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let d: Value = serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
     let run_id = d["run_id"].as_str().unwrap().to_string();
     let wt = std::path::PathBuf::from(d["worktree"].as_str().unwrap());
     let run_dir = std::path::PathBuf::from(d["run_dir"].as_str().unwrap());
@@ -473,7 +512,7 @@ fn a_good_agy_run_reaches_in_review_with_exit_codes_from_the_transcript() {
     );
     assert!(calls[0]["env"]["CLAUDE_CONFIG_DIR"].is_null(), "{}", calls[0]);
     assert!(calls[0]["env"]["CODEX_HOME"].is_null(), "{}", calls[0]);
-    assert_eq!(calls[0]["env"]["HOME"], std::env::var("HOME").unwrap());
+    assert_eq!(calls[0]["env"]["HOME"], home.to_str().unwrap(), "{}", calls[0]);
     assert!(!run_dir.join("hooks-settings.json").exists());
     assert!(!run_dir.join("inbox").exists());
     let (harness_bin, worktree_col): (String, String) = f
@@ -596,7 +635,10 @@ fn a_background_command_gets_its_exit_code_from_the_task_message() {
 #[test]
 fn a_command_whose_exit_code_never_appears_is_recorded_null_with_a_warning() {
     let (f, cfg, task_id) = agy_setup();
-    let d = agy_dispatch(&f, &cfg, &task_id, "no_exit_code", MODEL);
+    // The command with no exit code is only indexed after the stream ends, so
+    // the fake waits out its whole index wait; 8 s still leaves the runner
+    // room to index the two commands whose exit codes it knows.
+    let d = agy_dispatch_index_wait(&f, &cfg, &task_id, "no_exit_code", MODEL, 8000);
     let run_id = d["run_id"].as_str().unwrap().to_string();
     let wt = std::path::PathBuf::from(d["worktree"].as_str().unwrap());
     assert_eq!(f.wait_for(&task_id, "120s").1, "in_review");
@@ -912,7 +954,9 @@ fn cancel_stops_a_slow_agy_run() {
 fn a_missing_transcript_settles_every_command_null_without_failing_the_run() {
     let (f, _cfg, task_id) = agy_setup();
     let elsewhere = tempfile::tempdir().unwrap();
-    let d = agy_dispatch(&f, elsewhere.path(), &task_id, "ok", MODEL);
+    // No row can be indexed before the stream ends, so the fake gives up
+    // with the same empty list after 500 ms as after its default 30 s.
+    let d = agy_dispatch_index_wait(&f, elsewhere.path(), &task_id, "ok", MODEL, 500);
     let run_id = d["run_id"].as_str().unwrap().to_string();
     let run_dir = std::path::PathBuf::from(d["run_dir"].as_str().unwrap());
     f.wait_for(&task_id, "120s");
@@ -943,7 +987,7 @@ const AGY_IMPLEMENTER_TOOLS: &[&str] = &[
 /// `thoth hook --agy-pre` with `stdin`, under an empty THOTH_HOME.
 /// Returns (exit code, stdout, stderr).
 fn agy_pre(home: &std::path::Path, stdin: &str) -> (Option<i32>, String, String) {
-    let mut c = assert_cmd::Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed_assert(assert_cmd::Command::new(env!("CARGO_BIN_EXE_thoth")));
     for var in ["THOTH_RUN_ID", "THOTH_INBOX_DIR", "THOTH_EXE"] {
         c.env_remove(var);
     }
@@ -2413,8 +2457,10 @@ fn agy_reviewer_wait_show_and_resume_behave_like_codexs() {
     let v: Value = serde_json::from_slice(&out).unwrap();
     let cited = v["cited"].as_array().unwrap();
     assert!(!cited.is_empty(), "{v}");
-    assert_eq!(v["opened"], serde_json::json!([]), "{v}");
-    assert_eq!(&v["unopened_citation"], &v["cited"], "{v}");
+    // EVOPEN-1: fake-agy's `review_pass` reads the file of the code it
+    // cites, and Thoth now finds that read in its stream.
+    assert_eq!(&v["opened"], &v["cited"], "{v}");
+    assert_eq!(v["unopened_citation"], serde_json::json!([]), "{v}");
 
     f.cmd()
         .args(["resume", &reviewer_run])

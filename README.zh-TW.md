@@ -61,7 +61,8 @@ flowchart LR
    `PASS` → `pass`，`REJECT` → `reject`，`UNVERIFIED` → `unverified`。
 6. 被 `reject` 之後，下一次 `thoth dispatch` 會從被退件的 commit 開一個新的
    attempt，審查意見自動併進 worker 的提示。
-7. 過關的分支由你自己合併。Thoth 不會幫你合併，也不會刪 worktree。
+7. 過關的分支由你自己合併。Thoth 不會幫你合併；worktree 只有在任務已結束（pass、cancelled 或 accepted）
+   而且裡面沒有未提交的修改時才會移除（`thoth worktrees prune`）。
 
 ## 為什麼可信
 
@@ -207,7 +208,7 @@ claude plugin install thoth@thoth
 
 它會加入 skill `thoth-dispatch`，教你的 Claude Code session 走完整個流程：寫規格、
 派工、等待、讀審查資料包、只根據證據判斷、記下判決，以及處理退件重做、中斷與
-`unverified`。它也會加入一個 MCP server（`thoth mcp`），用 32 個工具提供同樣的指令。
+`unverified`。它也會加入一個 MCP server（`thoth mcp`），用 MCP 工具提供同樣的指令。
 `thoth` 執行檔要在 `PATH` 上。細節見 [docs/mcp.md](docs/mcp.md)。
 
 安裝後打 `/thoth` 就有面板：這個 repo 的任務、每個帳號的額度，以及通知；也能點開看每件任務的 worker 正在做什麼。
@@ -220,7 +221,7 @@ skill 依賴的所有東西（指令、參數、結束碼、`--json` 欄位）�
 ## 運作方式
 
 **主張不是事實。** worker 最後寫出 `.agent/result.json`，裡面是它的主張
-（`test_result`、`doc_reference`、`behavior`、`completion`、`protected_change`），每一條引用 `E004`
+（`test_result`、`doc_reference`、`behavior`、`completion`、`protected_change`，研究任務還有 `research`），每一條引用 `E004`
 這類證據代碼。主張和證據是分開的紀錄；沒有證據撐腰的主張只是說法，不是發現。
 
 **證據在 worker 旁邊採集，不由 worker 提供。** Claude Code 由 hook 記下每條指令和
@@ -229,7 +230,7 @@ transcript 取得指令結束碼。diff 和候選
 commit 也會記下。輸出以 SHA-256 存放、只增不改，每次讀取都重新驗證雜湊。worker
 拿到的是 Thoth 產生的代碼索引，只能引用、不能修改。
 
-**5 個自動判成 `unverified` 的條件**，在寫入任何東西之前檢查：
+**6 個自動判成 `unverified` 的條件**，在寫入任何東西之前檢查（編號就是 `result_invalid` 事件的 `rule`；規則 6 已經取消）：
 
 | 規則 | 符合時任務變成 `unverified` |
 |---|---|
@@ -238,6 +239,7 @@ commit 也會記下。輸出以 SHA-256 存放、只增不改，每次讀取都�
 | 3 | 主張引用的代碼不是這件任務的證據 |
 | 4 | 引用的證據不見了，或雜湊和當初記錄的不一致 |
 | 5 | 任務是 `risk: high`，而主張沒有引用任何由 Thoth 記錄的證據 |
+| 7 | 任務是研究任務，worker 回報 `completed`，卻沒有任何 `research` 類的主張 |
 
 **受保護的變更由 Thoth 記下，再由指揮官核准。** Thoth 從候選 diff 自己列出 worker 改到或刪掉的
 既有測試檔與檢查輸入檔、inline 測試區（`#[cfg(test)]`、`#[test]`）被改動的既有 Rust 檔，以及和
@@ -305,7 +307,9 @@ Thoth 從不打開憑證。worker 做到一半帳號額度用完時，run 會標
 還會顯示這些模型的公開跑分；AI Stupid Level 的分數還會標出可能退化的模型。跑分一律
 標示來源。`models --refresh` 是 Thoth 自己唯一會連網路的指令（`profile usage --refresh`
 是由 agy、codex 與 claude 各自去連；打開 `live-quota` 時的 `recommend`
-只由 agy 與 codex 去連）。
+只由 agy 與 codex 去連）；但如果你打開 `thoth config set scores-auto-refresh on`，
+`models`、`report` 與 `recommend` 也會在跑分快取不存在或已滿 24 小時時先更新它，
+需要金鑰的兩個來源只在設了金鑰時才連（Agent Arena 排行榜不需要金鑰）。
 
 **狀態頁。** `thoth report` 產生一頁自足、唯讀的 HTML：各帳號的額度與工作量、
 派工決策表（哪個模型用什麼 effort 做了什麼、通過率、花了多少額度）和每次的選擇、理由與結果、各
@@ -339,7 +343,7 @@ repo 的所有任務，以及 `REJECT` 和 `unverified` 的審查抓到了什麼
 | `thoth decision add` | 在 repo 的決策紀錄加一筆 |
 | `thoth report [--open]` | 產生 HTML 狀態頁 |
 | `thoth models [--refresh]` | 各帳號的模型、Thoth 的紀錄、公開跑分 |
-| `thoth config list / get / set / unset / set-secret` | 所有設定與來源：三個開關、語言、三個 CLI 位置、查額度等待時間、兩個跑分網址、兩把跑分金鑰（只存不顯示） |
+| `thoth config list / get / set / unset / set-secret / unset-secret` | 每個設定的值與來源（預設、`config.json` 或環境變數），其中包括開關、語言、CLI 位置、跑分網址與跑分金鑰（只存不顯示） |
 | `thoth guide` / `thoth mcp` | 印出指揮官指南；以 MCP 工具提供這些指令 |
 
 完整說明（英文）：[docs/phase1/usage.md](docs/phase1/usage.md)（設定、派工、額度中斷、

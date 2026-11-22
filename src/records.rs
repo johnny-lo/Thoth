@@ -8,7 +8,7 @@ use crate::commands::{settings, usage};
 use crate::config::Paths;
 use crate::output;
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -191,32 +191,12 @@ pub(crate) fn line_from_parts(
 }
 
 fn latest_event(conn: &Connection, run_id: &str, kind: &str) -> Option<Value> {
-    let detail: Option<String> = conn
-        .query_row(
-            "SELECT detail FROM events WHERE run_id=?1 AND type=?2 ORDER BY seq DESC LIMIT 1",
-            [run_id, kind],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .flatten();
+    let detail = crate::db::reports::latest_event(conn, run_id, kind).ok().flatten();
     serde_json::from_str(&detail?).ok()
 }
 
 fn latest_verdict(conn: &Connection, role: &str, run_id: &str) -> Option<String> {
-    let column = if role == "reviewer" { "reviewer_run_id" } else { "target_run_id" };
-    conn.query_row(
-        &format!(
-            "SELECT verdict FROM reviews WHERE {column}=?1 ORDER BY created_at DESC, review_id DESC LIMIT 1"
-        ),
-        [run_id],
-        |r| r.get::<_, Option<String>>(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
-    .flatten()
+    crate::db::reports::latest_verdict_of_role(conn, role, run_id).ok().flatten()
 }
 
 /// Every run of this computer, from every registered repository, as lines.
@@ -249,63 +229,40 @@ fn collect_counted(paths: &Paths) -> Result<(Vec<LineWithPrevious>, usize)> {
             continue;
         }
         read_repos += 1;
-        let root_path: Option<String> = global
-            .query_row("SELECT root_path FROM repos WHERE repo_id=?1", [repo_id], |r| {
-                r.get::<_, Option<String>>(0)
-            })
-            .optional()?
-            .flatten();
+        let root_path = crate::db::reports::repo_root_path(&global, repo_id)?;
         let conn = usage::read_only(&state)?;
         // A repository not yet opened by a version with DT-1 has no token-kind
-        // columns; they read as NULL. Asked once per connection.
-        let col = |name: &str| {
-            if crate::db::migrations::column_exists(&conn, "runs", name).unwrap_or(false) {
-                format!("r.{name}")
-            } else {
-                "NULL".to_string()
-            }
-        };
-        let mut stmt = conn.prepare(&format!(
-            "SELECT r.run_id, r.task_id, r.attempt, r.role, r.provider, r.account, r.model,
-                    r.spec, r.status, r.interrupted_reason, r.exit_code, r.started_at, r.ended_at,
-                    r.input_tokens, {}, {}, r.output_tokens, {}, {},
-                    t.task_id, t.title, t.spec, t.risk
-             FROM runs r LEFT JOIN tasks t ON t.task_id=r.task_id",
-            col("cache_read_tokens"),
-            col("cache_write_tokens"),
-            col("reasoning_tokens"),
-            col("total_tokens"),
-        ))?;
-        let rows = stmt.query_map([], |r| {
+        // columns; they read as NULL (`runs_with_tasks` asks once per call).
+        let rows = crate::db::reports::runs_with_tasks(&conn)?;
+        for row in rows {
             let run = RunRow {
-                run_id: r.get(0)?,
-                task_id: r.get(1)?,
-                attempt: r.get(2)?,
-                role: r.get(3)?,
-                provider: r.get(4)?,
-                account: r.get(5)?,
-                model: r.get(6)?,
-                spec: r.get(7)?,
-                status: r.get(8)?,
-                interrupted_reason: r.get(9)?,
-                exit_code: r.get(10)?,
-                started_at: r.get(11)?,
-                ended_at: r.get(12)?,
+                run_id: row.run_id,
+                task_id: row.task_id,
+                attempt: row.attempt,
+                role: row.role,
+                provider: row.provider,
+                account: row.account,
+                model: row.model,
+                spec: row.spec,
+                status: row.status,
+                interrupted_reason: row.interrupted_reason,
+                exit_code: row.exit_code,
+                started_at: row.started_at,
+                ended_at: row.ended_at,
             };
             let tokens = Tokens {
-                input: r.get(13)?,
-                cache_read: r.get(14)?,
-                cache_write: r.get(15)?,
-                output: r.get(16)?,
-                reasoning: r.get(17)?,
-                total: r.get(18)?,
+                input: row.input_tokens,
+                cache_read: row.cache_read_tokens,
+                cache_write: row.cache_write_tokens,
+                output: row.output_tokens,
+                reasoning: row.reasoning_tokens,
+                total: row.total_tokens,
             };
-            let has_task = r.get::<_, Option<String>>(19)?.is_some();
-            let task = TaskRow { title: r.get(20)?, spec: r.get(21)?, risk: r.get(22)? };
-            Ok((run, tokens, has_task.then_some(task)))
-        })?;
-        for row in rows {
-            let (run, tokens, task) = row?;
+            let task = row.joined_task_id.is_some().then_some(TaskRow {
+                title: row.task_title,
+                spec: row.task_spec,
+                risk: row.task_risk,
+            });
             let run_id = run.run_id.clone().unwrap_or_default();
             let role = run.role.clone().unwrap_or_default();
             let account = run.account.clone().unwrap_or_default();

@@ -1,8 +1,10 @@
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn thoth(home: &std::path::Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thoth"));
+    let mut c = common::scrubbed_assert(Command::new(env!("CARGO_BIN_EXE_thoth")));
     c.env("THOTH_HOME", home);
     c
 }
